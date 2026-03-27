@@ -114,6 +114,31 @@ def score_with_tolerance(best_score: float, cand_score: float, rel_tol: float) -
 
 
 
+def rel_gap(best_score: float, runner_score: float) -> float:
+    denom = max(abs(best_score), 1e-12)
+    return (runner_score - best_score) / denom
+
+
+
+def row_score(row, prefer_key: str, fallback_key: str = 'final_val') -> float:
+    prefer = row.get(prefer_key, float('nan'))
+    if math.isfinite(prefer):
+        return prefer
+    return row.get(fallback_key, float('nan'))
+
+
+
+def score_key(score: float, support: float, exp2_lr: float):
+    return (score, support, -exp2_lr)
+
+
+
+def decay_start_step(decay_frac: float, total_steps: int) -> int:
+    decay_steps = max(1, round(decay_frac * total_steps))
+    return total_steps - decay_steps
+
+
+
 def clone_state_dict(state_dict, device: torch.device | None = None):
     out = {}
     for k, v in state_dict.items():
@@ -134,6 +159,7 @@ def clone_state_dict(state_dict, device: torch.device | None = None):
     return out
 
 
+
 def optimizer_to_device(opt: torch.optim.Optimizer, device: torch.device):
     for state in opt.state.values():
         for k, v in state.items():
@@ -149,9 +175,8 @@ def set_seed(seed: int):
 
 
 
-
-
 _SOURCE_CACHE = {}
+
 
 
 def get_batch_source(dataset, args, device):
@@ -161,6 +186,7 @@ def get_batch_source(dataset, args, device):
         source = BatchSource(dataset.train, dataset.val, args.block_size, args.batch_size, device)
         _SOURCE_CACHE[key] = source
     return source
+
 
 
 def prepare_runtime(base_args):
@@ -200,6 +226,7 @@ def build_run_objects(args, dataset, device):
 # -----------------------------
 # low-level training loops
 # -----------------------------
+
 
 
 def run_loop(
@@ -336,8 +363,9 @@ def run_loop(
 
 
 # -----------------------------
-# screen stage
+# stage-specific args
 # -----------------------------
+
 
 
 def make_screen_args(base_args, prenorm: str, steps: int, eval_interval: int, eval_iters: int, compile_flag: bool):
@@ -357,8 +385,28 @@ def make_screen_args(base_args, prenorm: str, steps: int, eval_interval: int, ev
 
 
 
+def make_branch_args(base_args, prenorm: str, steps: int, eval_interval: int, eval_iters: int, compile_flag: bool):
+    args = copy.deepcopy(base_args)
+    args.prenorm = prenorm
+    args.max_iters = steps
+    args.eval_interval = eval_interval
+    args.eval_iters = eval_iters
+    args.compile = compile_flag
+    args.skip_sample = True
+    args.no_save = True
+    args.warmup_frac = 0.0
+    args.warmup_iters = 0
+    return args
+
+
+# -----------------------------
+# screen stage
+# -----------------------------
+
+
+
 def screen_candidate(exp2_lr, args, dataset, device, amp_dtype, seed):
-    lr = 2.0**exp2_lr
+    lr = 2.0 ** exp2_lr
     set_seed(seed)
     run_args = copy.deepcopy(args)
     run_args.lr = lr
@@ -381,14 +429,13 @@ def screen_candidate(exp2_lr, args, dataset, device, amp_dtype, seed):
         diverge_mult=run_args.diverge_mult,
         mode='constant',
     )
-    stable = (not metrics['diverged']) and math.isfinite(metrics['final_val'])
     row = {
         'stage': 'screen',
         'prenorm': run_args.prenorm,
         'seed': seed,
         'exp2_lr': exp2_lr,
         'lr': lr,
-        'stable': stable,
+        'stable': (not metrics['diverged']) and math.isfinite(metrics['final_val']),
         'diverged': metrics['diverged'],
         'diverge_reason': metrics['diverge_reason'],
         'initial_val': metrics['initial_val'],
@@ -397,18 +444,8 @@ def screen_candidate(exp2_lr, args, dataset, device, amp_dtype, seed):
         'tail_avg_val': metrics['tail_avg_val'],
         'max_val': metrics['max_val'],
     }
+    row['screen_score'] = row_score(row, 'tail_avg_val')
     return row
-
-
-
-def choose_screen_center(rows):
-    stable = [r for r in rows if r['stable'] and math.isfinite(r['final_val'])]
-    if stable:
-        stable.sort(key=lambda r: (r['final_val'], r['exp2_lr']))
-        return stable[0]['exp2_lr']
-    finite = [r for r in rows if math.isfinite(r['final_val'])]
-    finite.sort(key=lambda r: (r['final_val'], r['exp2_lr']))
-    return finite[0]['exp2_lr'] if finite else rows[0]['exp2_lr']
 
 
 
@@ -423,63 +460,210 @@ def auto_expand_screen(screen_args, dataset, device, amp_dtype, screen_seed, arg
                 cache[exp2_lr] = screen_candidate(exp2_lr, screen_args, dataset, device, amp_dtype, screen_seed)
 
         rows = [cache[k] for k in sorted(cache)]
-        stable = [r for r in rows if r['stable']]
+        stable = [r for r in rows if r['stable'] and math.isfinite(r['screen_score'])]
         if stable:
-            best = min(stable, key=lambda r: r['final_val'])
+            best = min(stable, key=lambda r: score_key(r['screen_score'], r['final_val'], r['exp2_lr']))
             top = max(stable, key=lambda r: r['exp2_lr'])
             low = min(stable, key=lambda r: r['exp2_lr'])
             expanded = False
-            if round(top['exp2_lr'], 10) == round(exp2_max, 10) and score_with_tolerance(best['final_val'], top['final_val'], args.edge_tol):
-                exp2_min, exp2_max = exp2_min, exp2_max + args.coarse_step * args.expand_points
+            if round(top['exp2_lr'], 10) == round(exp2_max, 10) and score_with_tolerance(best['screen_score'], top['screen_score'], args.edge_tol):
+                exp2_max += args.coarse_step * args.expand_points
                 expanded = True
-            elif round(low['exp2_lr'], 10) == round(exp2_min, 10) and score_with_tolerance(best['final_val'], low['final_val'], args.edge_tol):
-                exp2_min, exp2_max = exp2_min - args.coarse_step * args.expand_points, exp2_max
+            elif round(low['exp2_lr'], 10) == round(exp2_min, 10) and score_with_tolerance(best['screen_score'], low['screen_score'], args.edge_tol):
+                exp2_min -= args.coarse_step * args.expand_points
                 expanded = True
             if not expanded:
-                return rows
+                return cache
         else:
             exp2_min -= args.coarse_step * args.expand_points
             exp2_max += args.coarse_step * args.expand_points
+    return cache
+
+
+
+def adaptive_zoom_screen(cache, screen_args, dataset, device, amp_dtype, screen_seed, args):
+    for _ in range(args.zoom_max_rounds):
+        exps = sorted(cache)
+        rows = [cache[x] for x in exps]
+        stable = [r for r in rows if r['stable'] and math.isfinite(r['screen_score'])]
+        if not stable:
+            break
+        best = min(stable, key=lambda r: score_key(r['screen_score'], r['final_val'], r['exp2_lr']))
+        best_idx = exps.index(best['exp2_lr'])
+        candidates = []
+        if best_idx > 0:
+            left = exps[best_idx - 1]
+            if best['exp2_lr'] - left > args.zoom_stop_width + 1e-12:
+                candidates.append(round(0.5 * (best['exp2_lr'] + left), 10))
+        if best_idx + 1 < len(exps):
+            right = exps[best_idx + 1]
+            if right - best['exp2_lr'] > args.zoom_stop_width + 1e-12:
+                candidates.append(round(0.5 * (best['exp2_lr'] + right), 10))
+        candidates = [x for x in dedupe_sorted(candidates) if x not in cache]
+        if not candidates:
+            break
+        for exp2_lr in candidates:
+            cache[exp2_lr] = screen_candidate(exp2_lr, screen_args, dataset, device, amp_dtype, screen_seed)
     return [cache[k] for k in sorted(cache)]
 
 
 
-def shortlist_from_screen(rows, shortlist_k: int, keep_highest_k: int):
-    stable = [r for r in rows if r['stable'] and math.isfinite(r['final_val'])]
+def shortlist_from_screen(rows, shortlist_k: int, keep_highest_k: int, aggressive_tol: float):
+    stable = [r for r in rows if r['stable'] and math.isfinite(r['screen_score'])]
     if not stable:
-        stable = [r for r in rows if math.isfinite(r['final_val'])]
-    by_quality = sorted(stable, key=lambda r: (r['final_val'], r['exp2_lr']))[:shortlist_k]
-    by_aggressive = sorted(stable, key=lambda r: (-r['exp2_lr'], r['final_val']))[:keep_highest_k]
-    chosen = {round(r['exp2_lr'], 10): r for r in by_quality + by_aggressive}
+        stable = [r for r in rows if math.isfinite(r['screen_score'])]
+    stable.sort(key=lambda r: score_key(r['screen_score'], r['final_val'], r['exp2_lr']))
+    chosen = {round(r['exp2_lr'], 10): r for r in stable[:shortlist_k]}
+    if keep_highest_k > 0 and stable:
+        best_score = stable[0]['screen_score']
+        aggressive = [r for r in stable if score_with_tolerance(best_score, r['screen_score'], aggressive_tol)]
+        aggressive.sort(key=lambda r: (-r['exp2_lr'], r['screen_score'], r['final_val']))
+        for r in aggressive[:keep_highest_k]:
+            chosen[round(r['exp2_lr'], 10)] = r
     return [chosen[k] for k in sorted(chosen)]
 
 
 # -----------------------------
-# branch stage
+# medium trunk race
 # -----------------------------
 
 
-def make_branch_args(base_args, prenorm: str, steps: int, eval_interval: int, eval_iters: int, compile_flag: bool):
-    args = copy.deepcopy(base_args)
-    args.prenorm = prenorm
-    args.max_iters = steps
-    args.eval_interval = eval_interval
-    args.eval_iters = eval_iters
-    args.compile = compile_flag
-    args.skip_sample = True
-    args.no_save = True
-    args.warmup_frac = 0.0
-    args.warmup_iters = 0
-    return args
+
+def run_constant_candidate(stage, exp2_lr, run_args, dataset, device, amp_dtype, seed):
+    lr = 2.0 ** exp2_lr
+    set_seed(seed)
+    args = copy.deepcopy(run_args)
+    args.lr = lr
+    raw_model, model, opt, source = build_run_objects(args, dataset, device)
+    print(f'=== {stage} | {args.prenorm} | seed {seed} | 2**{exp2_lr:.2f} = {lr:.3e} ===')
+    metrics = run_loop(
+        model=model,
+        raw_model=raw_model,
+        opt=opt,
+        source=source,
+        amp_dtype=amp_dtype,
+        device=device,
+        steps=args.max_iters,
+        peak_lr=lr,
+        min_lr=lr,
+        eval_interval=args.eval_interval,
+        eval_iters=args.eval_iters,
+        grad_accum=args.grad_accum,
+        grad_clip=args.grad_clip,
+        diverge_mult=args.diverge_mult,
+        mode='constant',
+    )
+    row = {
+        'stage': stage,
+        'prenorm': args.prenorm,
+        'seed': seed,
+        'exp2_lr': exp2_lr,
+        'lr': lr,
+        'stable': (not metrics['diverged']) and math.isfinite(metrics['final_val']),
+        'diverged': metrics['diverged'],
+        'diverge_reason': metrics['diverge_reason'],
+        'initial_val': metrics['initial_val'],
+        'best_val': metrics['best_val'],
+        'final_val': metrics['final_val'],
+        'tail_avg_val': metrics['tail_avg_val'],
+        'max_val': metrics['max_val'],
+    }
+    row['race_score'] = row_score(row, 'tail_avg_val')
+    return row
 
 
 
-def run_branch_family(exp2_lr, branch_args, dataset, device, amp_dtype, seed, decay_fracs):
-    lr = 2.0**exp2_lr
+def choose_branch_finalists(rows, final_lr_k: int, aggressive_tol: float):
+    stable = [r for r in rows if r['stable'] and math.isfinite(r['race_score'])]
+    if not stable:
+        stable = [r for r in rows if math.isfinite(r['race_score'])]
+    stable.sort(key=lambda r: score_key(r['race_score'], r['final_val'], r['exp2_lr']))
+    if not stable:
+        return []
+    chosen = {round(stable[0]['exp2_lr'], 10): stable[0]}
+    if final_lr_k > 1:
+        best_score = stable[0]['race_score']
+        aggressive = [r for r in stable if score_with_tolerance(best_score, r['race_score'], aggressive_tol)]
+        aggressive.sort(key=lambda r: (-r['exp2_lr'], r['race_score'], r['final_val']))
+        for r in aggressive:
+            chosen.setdefault(round(r['exp2_lr'], 10), r)
+            if len(chosen) >= final_lr_k:
+                break
+        if len(chosen) < final_lr_k:
+            for r in stable[1:]:
+                chosen.setdefault(round(r['exp2_lr'], 10), r)
+                if len(chosen) >= final_lr_k:
+                    break
+    return [chosen[k] for k in sorted(chosen)]
+
+
+# -----------------------------
+# adaptive branch stage
+# -----------------------------
+
+
+
+def normalize_anchor_fracs(decay_fracs, anchor_fracs):
+    decay_fracs = dedupe_sorted(decay_fracs)
+    if not anchor_fracs:
+        if len(decay_fracs) <= 2:
+            return decay_fracs
+        mid_lo = decay_fracs[(len(decay_fracs) - 1) // 2]
+        mid_hi = decay_fracs[len(decay_fracs) // 2]
+        return dedupe_sorted([mid_lo, mid_hi])
+    chosen = []
+    used = set()
+    for target in anchor_fracs:
+        best = None
+        for cand in decay_fracs:
+            if cand in used:
+                continue
+            key = abs(cand - target)
+            if best is None or key < best[0]:
+                best = (key, cand)
+        if best is not None:
+            used.add(best[1])
+            chosen.append(best[1])
+    return dedupe_sorted(chosen)
+
+
+
+def pick_extra_decay_frac(decay_fracs, evaluated_rows, close_rel_tol):
+    decay_fracs = dedupe_sorted(decay_fracs)
+    if len(evaluated_rows) >= len(decay_fracs):
+        return None
+    index_of = {round(df, 10): i for i, df in enumerate(decay_fracs)}
+    rows = sorted(evaluated_rows.values(), key=lambda r: score_key(r['score_final'], r['score_avg'], r['exp2_lr']))
+    best = rows[0]
+    best_idx = index_of[round(best['decay_frac'], 10)]
+    eval_indices = sorted(index_of[round(df, 10)] for df in evaluated_rows)
+
+    if best_idx == eval_indices[0]:
+        for i in range(best_idx - 1, -1, -1):
+            df = decay_fracs[i]
+            if round(df, 10) not in evaluated_rows:
+                return df
+    if best_idx == eval_indices[-1]:
+        for i in range(best_idx + 1, len(decay_fracs)):
+            df = decay_fracs[i]
+            if round(df, 10) not in evaluated_rows:
+                return df
+
+    if len(rows) >= 2 and score_with_tolerance(rows[0]['score_final'], rows[1]['score_final'], close_rel_tol):
+        remaining = [i for i, df in enumerate(decay_fracs) if round(df, 10) not in evaluated_rows]
+        if remaining:
+            remaining.sort(key=lambda i: (abs(i - best_idx), abs(decay_fracs[i] - decay_fracs[best_idx])))
+            return decay_fracs[remaining[0]]
+    return None
+
+
+
+def run_branch_family_adaptive(exp2_lr, branch_args, dataset, device, amp_dtype, seed, decay_fracs, anchor_fracs, args):
+    lr = 2.0 ** exp2_lr
     total_steps = branch_args.max_iters
-    decay_steps_map = {df: max(1, round(df * total_steps)) for df in decay_fracs}
-    branch_start_steps = {df: total_steps - ds for df, ds in decay_steps_map.items()}
-    snapshot_steps = set(branch_start_steps.values())
+    decay_fracs = dedupe_sorted(decay_fracs)
+    anchor_fracs = normalize_anchor_fracs(decay_fracs, anchor_fracs)
+    snapshot_steps = {decay_start_step(df, total_steps) for df in decay_fracs}
 
     set_seed(seed)
     trunk_args = copy.deepcopy(branch_args)
@@ -507,42 +691,50 @@ def run_branch_family(exp2_lr, branch_args, dataset, device, amp_dtype, seed, de
 
     rows = []
     if trunk_metrics['diverged']:
-        for df in decay_fracs:
-            rows.append(
-                {
-                    'stage': 'branch',
-                    'prenorm': trunk_args.prenorm,
-                    'seed': seed,
-                    'exp2_lr': exp2_lr,
-                    'lr': lr,
-                    'decay_frac': df,
-                    'branch_start_step': branch_start_steps[df],
-                    'tail_steps': decay_steps_map[df],
-                    'stable': False,
-                    'diverged': True,
-                    'diverge_reason': f"trunk_{trunk_metrics['diverge_reason']}",
-                    'trunk_final_val': trunk_metrics['final_val'],
-                    'trunk_best_val': trunk_metrics['best_val'],
-                    'tail_final_val': float('nan'),
-                    'tail_best_val': float('nan'),
-                    'tail_avg_val': float('nan'),
-                }
-            )
+        rows.append(
+            {
+                'stage': 'branch',
+                'prenorm': trunk_args.prenorm,
+                'seed': seed,
+                'exp2_lr': exp2_lr,
+                'lr': lr,
+                'decay_frac': float('nan'),
+                'decay_role': 'trunk_diverged',
+                'branch_start_step': float('nan'),
+                'tail_steps': float('nan'),
+                'stable': False,
+                'diverged': True,
+                'diverge_reason': f"trunk_{trunk_metrics['diverge_reason']}",
+                'trunk_final_val': trunk_metrics['final_val'],
+                'trunk_best_val': trunk_metrics['best_val'],
+                'tail_final_val': float('nan'),
+                'tail_best_val': float('nan'),
+                'tail_avg_val': float('nan'),
+                'score_final': float('nan'),
+                'score_avg': float('nan'),
+            }
+        )
         return rows
 
     tail_args = copy.deepcopy(branch_args)
     tail_args.lr = lr
     raw_tail, tail_model, tail_opt, tail_source = build_run_objects(tail_args, dataset, device)
+    evaluated = {}
 
-    for df in decay_fracs:
-        snap = trunk_metrics['snapshots'][branch_start_steps[df]]
+    def evaluate_tail(df, decay_role):
+        key = round(df, 10)
+        if key in evaluated:
+            return evaluated[key]
+        start_step = decay_start_step(df, total_steps)
+        tail_steps = max(1, round(df * total_steps))
+        snap = trunk_metrics['snapshots'][start_step]
         raw_tail.load_state_dict(snap['model'])
         tail_opt.load_state_dict(snap['opt'])
         if getattr(tail_opt, '_cpu_snapshots', False):
             optimizer_to_device(tail_opt, device)
         print(
             f'=== branch tail | {tail_args.prenorm} | seed {seed} | 2**{exp2_lr:.2f} = {lr:.3e} | '
-            f'decay_frac {df:.3f} | start_step {branch_start_steps[df]} ==='
+            f'decay_frac {df:.3f} | start_step {start_step} | role {decay_role} ==='
         )
         tail_metrics = run_loop(
             model=tail_model,
@@ -551,37 +743,50 @@ def run_branch_family(exp2_lr, branch_args, dataset, device, amp_dtype, seed, de
             source=tail_source,
             amp_dtype=amp_dtype,
             device=device,
-            steps=decay_steps_map[df],
+            steps=tail_steps,
             peak_lr=lr,
             min_lr=tail_args.min_lr,
-            eval_interval=max(1, min(tail_args.eval_interval, decay_steps_map[df] // 3 if decay_steps_map[df] >= 3 else 1)),
+            eval_interval=max(1, min(tail_args.eval_interval, tail_steps // 3 if tail_steps >= 3 else 1)),
             eval_iters=tail_args.eval_iters,
             grad_accum=tail_args.grad_accum,
             grad_clip=tail_args.grad_clip,
             diverge_mult=tail_args.diverge_mult,
             mode='decay',
         )
-        stable = (not tail_metrics['diverged']) and math.isfinite(tail_metrics['final_val'])
-        rows.append(
-            {
-                'stage': 'branch',
-                'prenorm': tail_args.prenorm,
-                'seed': seed,
-                'exp2_lr': exp2_lr,
-                'lr': lr,
-                'decay_frac': df,
-                'branch_start_step': branch_start_steps[df],
-                'tail_steps': decay_steps_map[df],
-                'stable': stable,
-                'diverged': tail_metrics['diverged'],
-                'diverge_reason': tail_metrics['diverge_reason'],
-                'trunk_final_val': trunk_metrics['final_val'],
-                'trunk_best_val': trunk_metrics['best_val'],
-                'tail_final_val': tail_metrics['final_val'],
-                'tail_best_val': tail_metrics['best_val'],
-                'tail_avg_val': tail_metrics['tail_avg_val'],
-            }
-        )
+        row = {
+            'stage': 'branch',
+            'prenorm': tail_args.prenorm,
+            'seed': seed,
+            'exp2_lr': exp2_lr,
+            'lr': lr,
+            'decay_frac': df,
+            'decay_role': decay_role,
+            'branch_start_step': start_step,
+            'tail_steps': tail_steps,
+            'stable': (not tail_metrics['diverged']) and math.isfinite(tail_metrics['final_val']),
+            'diverged': tail_metrics['diverged'],
+            'diverge_reason': tail_metrics['diverge_reason'],
+            'trunk_final_val': trunk_metrics['final_val'],
+            'trunk_best_val': trunk_metrics['best_val'],
+            'tail_final_val': tail_metrics['final_val'],
+            'tail_best_val': tail_metrics['best_val'],
+            'tail_avg_val': tail_metrics['tail_avg_val'],
+            'score_final': tail_metrics['final_val'],
+            'score_avg': tail_metrics['tail_avg_val'],
+        }
+        evaluated[key] = row
+        rows.append(row)
+        return row
+
+    for df in anchor_fracs:
+        evaluate_tail(df, 'anchor')
+
+    for _ in range(max(0, args.max_extra_decay_evals)):
+        next_df = pick_extra_decay_frac(decay_fracs, evaluated, args.decay_refine_rel_tol)
+        if next_df is None:
+            break
+        evaluate_tail(next_df, 'refine')
+
     return rows
 
 
@@ -592,6 +797,8 @@ def summarize_branch_rows(rows):
 
     by_pair = {}
     for row in rows:
+        if not math.isfinite(row.get('decay_frac', float('nan'))):
+            continue
         key = (round(row['exp2_lr'], 10), round(row['decay_frac'], 10))
         by_pair.setdefault(key, []).append(row)
 
@@ -607,6 +814,7 @@ def summarize_branch_rows(rows):
                 'median_tail_final_val': median(finals),
                 'median_tail_avg_val': median(avgs),
                 'score': median(finals),
+                'support_score': median(avgs),
             }
         )
         pair_rows[key] = rep
@@ -616,18 +824,22 @@ def summarize_branch_rows(rows):
         by_lr.setdefault(round(pair['exp2_lr'], 10), []).append(pair)
 
     for lr_key, group in by_lr.items():
-        scores = [g['score'] for g in group if math.isfinite(g['score'])]
-        robust = median(scores)
-        best_pair = min(group, key=lambda g: (g['score'], g['decay_frac']))
+        scored = [g for g in group if math.isfinite(g['score'])]
+        if not scored:
+            continue
+        scored.sort(key=lambda g: score_key(g['score'], g['support_score'], g['exp2_lr']))
+        best_pair = scored[0]
         rep = dict(best_pair)
         rep.update(
             {
                 'pair_count': len(group),
                 'potential_score': best_pair['score'],
-                'robust_score': robust,
+                'potential_support_score': best_pair['support_score'],
+                'robust_score': median([g['score'] for g in scored]),
                 'best_decay_frac': best_pair['decay_frac'],
                 'best_pair_score': best_pair['score'],
-                'min_stable_rate_across_pairs': min(g['stable_rate'] for g in group),
+                'best_pair_support_score': best_pair['support_score'],
+                'min_stable_rate_across_pairs': min(g['stable_rate'] for g in scored),
             }
         )
         lr_rows[lr_key] = rep
@@ -636,17 +848,17 @@ def summarize_branch_rows(rows):
 
 
 
-def choose_recommendations(lr_summaries, pair_summaries, promote_tol: float, robust_tol: float):
-    finite_pairs = [r for r in pair_summaries if math.isfinite(r['score'])]
-    finite_lrs = [r for r in lr_summaries if math.isfinite(r['potential_score'])]
-    best_pair = min(finite_pairs, key=lambda r: (r['score'], r['lr'], r['decay_frac']))
-    best_lr_score = min(r['potential_score'] for r in finite_lrs)
-    promote_frontier = [r for r in finite_lrs if score_with_tolerance(best_lr_score, r['potential_score'], promote_tol)]
-    promoted_lr = max(promote_frontier, key=lambda r: (r['lr'], -r['robust_score']))
-    best_robust = min(r['robust_score'] for r in finite_lrs)
-    robust_frontier = [r for r in finite_lrs if score_with_tolerance(best_robust, r['robust_score'], robust_tol)]
-    robust_lr = max(robust_frontier, key=lambda r: (r['lr'], -r['potential_score']))
-    return best_pair, promoted_lr, robust_lr
+def choose_top_lrs(lr_summaries, k: int):
+    finite = [r for r in lr_summaries if math.isfinite(r['potential_score'])]
+    finite.sort(key=lambda r: score_key(r['potential_score'], r['potential_support_score'], r['exp2_lr']))
+    return finite[:k]
+
+
+
+def choose_top_pairs(pair_summaries, k: int):
+    finite = [r for r in pair_summaries if math.isfinite(r['score'])]
+    finite.sort(key=lambda r: score_key(r['score'], r['support_score'], r['exp2_lr']))
+    return finite[:k]
 
 
 
@@ -665,6 +877,7 @@ def write_csv(path: Path, rows):
 # -----------------------------
 
 
+
 def run_for_prenorm(prenorm, target_cfg, args, rest):
     device, amp_dtype, dataset = prepare_runtime(target_cfg)
 
@@ -672,6 +885,7 @@ def run_for_prenorm(prenorm, target_cfg, args, rest):
     apply_proxy_defaults(proxy_cfg, rest, args)
     proxy_cfg.prenorm = prenorm
     proxy_cfg.compile = False if not args.compile_tuning else proxy_cfg.compile
+    proxy_cfg.cpu_snapshots = args.cpu_snapshots
 
     screen_args = make_screen_args(
         proxy_cfg,
@@ -682,17 +896,22 @@ def run_for_prenorm(prenorm, target_cfg, args, rest):
         compile_flag=args.compile_tuning,
     )
     screen_seed = proxy_cfg.seed
-    coarse_rows = auto_expand_screen(screen_args, dataset, device, amp_dtype, screen_seed, args)
-    center = choose_screen_center(coarse_rows)
-    fine_exp2s = [
-        x for x in exp2_grid(center - args.fine_radius, center + args.fine_radius, args.fine_step)
-        if round(x, 10) not in {round(r['exp2_lr'], 10) for r in coarse_rows}
-    ]
-    fine_rows = [screen_candidate(x, screen_args, dataset, device, amp_dtype, screen_seed) for x in fine_exp2s]
-    screen_rows = sorted(coarse_rows + fine_rows, key=lambda r: r['exp2_lr'])
-
-    shortlist = shortlist_from_screen(screen_rows, args.shortlist_k, args.keep_highest_k)
+    screen_cache = auto_expand_screen(screen_args, dataset, device, amp_dtype, screen_seed, args)
+    screen_rows = adaptive_zoom_screen(screen_cache, screen_args, dataset, device, amp_dtype, screen_seed, args)
+    shortlist = shortlist_from_screen(screen_rows, args.shortlist_k, args.keep_highest_k, args.aggressive_lr_tol)
     shortlist_exp2s = [r['exp2_lr'] for r in shortlist]
+
+    race_args = make_branch_args(
+        proxy_cfg,
+        prenorm,
+        steps=args.trunk_race_steps,
+        eval_interval=args.trunk_race_eval_interval,
+        eval_iters=args.trunk_race_eval_iters,
+        compile_flag=args.compile_tuning,
+    )
+    race_rows = [run_constant_candidate('trunk_race', exp2_lr, race_args, dataset, device, amp_dtype, race_args.seed) for exp2_lr in shortlist_exp2s]
+    finalists = choose_branch_finalists(race_rows, args.final_lr_k, args.aggressive_lr_tol)
+    finalist_exp2s = [r['exp2_lr'] for r in finalists]
 
     branch_args = make_branch_args(
         proxy_cfg,
@@ -703,63 +922,88 @@ def run_for_prenorm(prenorm, target_cfg, args, rest):
         compile_flag=args.compile_tuning,
     )
     decay_fracs = dedupe_sorted(parse_float_list(args.decay_fracs))
+    anchor_fracs = parse_float_list(args.decay_anchor_fracs) if args.decay_anchor_fracs else []
 
     branch_raw = []
-    for exp2_lr in shortlist_exp2s:
-        branch_raw.extend(run_branch_family(exp2_lr, branch_args, dataset, device, amp_dtype, branch_args.seed, decay_fracs))
+    seeds_used = 0
+    if finalist_exp2s:
+        seed = branch_args.seed
+        for exp2_lr in finalist_exp2s:
+            branch_raw.extend(
+                run_branch_family_adaptive(
+                    exp2_lr,
+                    branch_args,
+                    dataset,
+                    device,
+                    amp_dtype,
+                    seed,
+                    decay_fracs,
+                    anchor_fracs,
+                    args,
+                )
+            )
+        seeds_used = 1
 
-    pair_summaries, lr_summaries = summarize_branch_rows(branch_raw)
-    best_pair, promoted_lr, robust_lr = choose_recommendations(lr_summaries, pair_summaries, args.promote_tol, args.robust_tol)
+    while seeds_used < args.confirm_max_seeds:
+        pair_summaries, lr_summaries = summarize_branch_rows(branch_raw)
+        top_lrs = choose_top_lrs(lr_summaries, 2)
+        if len(top_lrs) < 2:
+            break
+        winner, runner = top_lrs[0], top_lrs[1]
+        if rel_gap(winner['potential_score'], runner['potential_score']) > args.confirm_rel_tol:
+            break
+        seed = branch_args.seed + seeds_used * args.seed_stride
+        for exp2_lr in [winner['exp2_lr'], runner['exp2_lr']]:
+            branch_raw.extend(
+                run_branch_family_adaptive(
+                    exp2_lr,
+                    branch_args,
+                    dataset,
+                    device,
+                    amp_dtype,
+                    seed,
+                    decay_fracs,
+                    anchor_fracs,
+                    args,
+                )
+            )
+        seeds_used += 1
 
-    candidate_pool = sorted(lr_summaries, key=lambda r: (r['potential_score'], -r['lr']))
-    confirm_candidates = [round(best_pair['exp2_lr'], 10), round(promoted_lr['exp2_lr'], 10), round(robust_lr['exp2_lr'], 10)]
-    for row in candidate_pool[: args.confirm_top_k]:
-        confirm_candidates.append(round(row['exp2_lr'], 10))
-    confirm_candidates = dedupe_sorted(confirm_candidates)
+    final_pair_summaries, final_lr_summaries = summarize_branch_rows(branch_raw)
+    top_pairs = choose_top_pairs(final_pair_summaries, 2)
+    top_lrs = choose_top_lrs(final_lr_summaries, 2)
 
-    confirm_raw = []
-    if args.confirm_num_seeds > 0:
-        for exp2_lr in confirm_candidates:
-            for seed_idx in range(args.confirm_num_seeds):
-                seed = branch_args.seed + seed_idx * args.seed_stride
-                confirm_raw.extend(run_branch_family(exp2_lr, branch_args, dataset, device, amp_dtype, seed, decay_fracs))
-        final_pair_summaries, final_lr_summaries = summarize_branch_rows(confirm_raw)
-        final_best_pair, final_promoted_lr, final_robust_lr = choose_recommendations(
-            final_lr_summaries, final_pair_summaries, args.promote_tol, args.robust_tol
+    summary_rows = []
+    for rank, row in enumerate(top_pairs, start=1):
+        summary_rows.append(
+            {
+                'prenorm': prenorm,
+                'recommendation_type': 'best_pair' if rank == 1 else 'runner_up_pair',
+                'rank': rank,
+                'exp2_lr': row['exp2_lr'],
+                'lr': row['lr'],
+                'decay_frac': row['decay_frac'],
+                'score': row['score'],
+                'support_score': row['support_score'],
+                'score_kind': 'median_tail_final_val',
+                'seeds_used': seeds_used,
+            }
         )
-    else:
-        final_pair_summaries, final_lr_summaries = pair_summaries, lr_summaries
-        final_best_pair, final_promoted_lr, final_robust_lr = best_pair, promoted_lr, robust_lr
-
-    summary_rows = [
-        {
-            'prenorm': prenorm,
-            'recommendation_type': 'best_pair',
-            'exp2_lr': final_best_pair['exp2_lr'],
-            'lr': final_best_pair['lr'],
-            'decay_frac': final_best_pair['decay_frac'],
-            'score': final_best_pair['score'],
-            'score_kind': 'median_tail_final_val',
-        },
-        {
-            'prenorm': prenorm,
-            'recommendation_type': 'promoted_lr',
-            'exp2_lr': final_promoted_lr['exp2_lr'],
-            'lr': final_promoted_lr['lr'],
-            'decay_frac': final_promoted_lr['best_decay_frac'],
-            'score': final_promoted_lr['potential_score'],
-            'score_kind': 'best_pair_score_per_lr',
-        },
-        {
-            'prenorm': prenorm,
-            'recommendation_type': 'robust_lr',
-            'exp2_lr': final_robust_lr['exp2_lr'],
-            'lr': final_robust_lr['lr'],
-            'decay_frac': final_robust_lr['best_decay_frac'],
-            'score': final_robust_lr['robust_score'],
-            'score_kind': 'median_pair_score_per_lr',
-        },
-    ]
+    for rank, row in enumerate(top_lrs, start=1):
+        summary_rows.append(
+            {
+                'prenorm': prenorm,
+                'recommendation_type': 'best_lr' if rank == 1 else 'runner_up_lr',
+                'rank': rank,
+                'exp2_lr': row['exp2_lr'],
+                'lr': row['lr'],
+                'decay_frac': row['best_decay_frac'],
+                'score': row['potential_score'],
+                'support_score': row['potential_support_score'],
+                'score_kind': 'best_pair_score_per_lr',
+                'seeds_used': seeds_used,
+            }
+        )
 
     for row in summary_rows:
         mT, mL, per_group = transfer_lrs(row['lr'], proxy_cfg, target_cfg, args.alpha_transfer)
@@ -771,10 +1015,8 @@ def run_for_prenorm(prenorm, target_cfg, args, rest):
 
     return {
         'screen_rows': screen_rows,
+        'race_rows': race_rows,
         'branch_raw': branch_raw,
-        'pair_summaries': pair_summaries,
-        'lr_summaries': lr_summaries,
-        'confirm_raw': confirm_raw,
         'final_pair_summaries': final_pair_summaries,
         'final_lr_summaries': final_lr_summaries,
         'summary_rows': summary_rows,
@@ -787,29 +1029,35 @@ def main():
     p.add_argument('--exp2-min', type=float, default=-14.0)
     p.add_argument('--exp2-max', type=float, default=-8.0)
     p.add_argument('--coarse-step', type=float, default=1.0)
-    p.add_argument('--fine-step', type=float, default=0.25)
-    p.add_argument('--fine-radius', type=float, default=1.0)
     p.add_argument('--expand-points', type=int, default=2)
     p.add_argument('--screen-max-expansions', type=int, default=3)
     p.add_argument('--edge-tol', type=float, default=0.03)
+    p.add_argument('--zoom-stop-width', type=float, default=0.25)
+    p.add_argument('--zoom-max-rounds', type=int, default=8)
 
-    p.add_argument('--screen-steps', type=int, default=200)
-    p.add_argument('--screen-eval-interval', type=int, default=50)
-    p.add_argument('--screen-eval-iters', type=int, default=10)
+    p.add_argument('--screen-steps', type=int, default=128)
+    p.add_argument('--screen-eval-interval', type=int, default=32)
+    p.add_argument('--screen-eval-iters', type=int, default=8)
     p.add_argument('--shortlist-k', type=int, default=4)
     p.add_argument('--keep-highest-k', type=int, default=1)
+    p.add_argument('--aggressive-lr-tol', type=float, default=0.02)
+
+    p.add_argument('--trunk-race-steps', type=int, default=256)
+    p.add_argument('--trunk-race-eval-interval', type=int, default=64)
+    p.add_argument('--trunk-race-eval-iters', type=int, default=12)
+    p.add_argument('--final-lr-k', type=int, default=2)
 
     p.add_argument('--branch-steps', type=int, default=600)
     p.add_argument('--branch-eval-interval', type=int, default=50)
     p.add_argument('--branch-eval-iters', type=int, default=20)
     p.add_argument('--decay-fracs', default='0.10,0.20,0.285,0.40')
+    p.add_argument('--decay-anchor-fracs', default='0.20,0.285')
+    p.add_argument('--max-extra-decay-evals', type=int, default=1)
+    p.add_argument('--decay-refine-rel-tol', type=float, default=0.01)
 
-    p.add_argument('--confirm-top-k', type=int, default=3)
-    p.add_argument('--confirm-num-seeds', type=int, default=3)
+    p.add_argument('--confirm-max-seeds', type=int, default=3)
+    p.add_argument('--confirm-rel-tol', type=float, default=0.015)
     p.add_argument('--seed-stride', type=int, default=1000)
-
-    p.add_argument('--promote-tol', type=float, default=0.02)
-    p.add_argument('--robust-tol', type=float, default=0.02)
 
     p.add_argument('--csv-prefix', default='out/wsd_tune')
     p.add_argument('--no-proxy', action='store_true')
@@ -840,10 +1088,8 @@ def main():
 
     prenorms = ['rmsnorm', 'rmsball'] if args.prenorm == 'both' else [args.prenorm]
     all_screen_rows = []
+    all_race_rows = []
     all_branch_raw = []
-    all_pair_summaries = []
-    all_lr_summaries = []
-    all_confirm_raw = []
     all_final_pair_summaries = []
     all_final_lr_summaries = []
     all_summary_rows = []
@@ -852,20 +1098,16 @@ def main():
         print(f'\n===== tuning prenorm={prenorm} =====')
         out = run_for_prenorm(prenorm, target_cfg, args, rest)
         all_screen_rows.extend(out['screen_rows'])
+        all_race_rows.extend(out['race_rows'])
         all_branch_raw.extend(out['branch_raw'])
-        all_pair_summaries.extend(out['pair_summaries'])
-        all_lr_summaries.extend(out['lr_summaries'])
-        all_confirm_raw.extend(out['confirm_raw'])
         all_final_pair_summaries.extend(out['final_pair_summaries'])
         all_final_lr_summaries.extend(out['final_lr_summaries'])
         all_summary_rows.extend(out['summary_rows'])
 
     prefix = Path(args.csv_prefix)
     write_csv(prefix.with_name(prefix.name + '_screen.csv'), all_screen_rows)
+    write_csv(prefix.with_name(prefix.name + '_trunk_race.csv'), all_race_rows)
     write_csv(prefix.with_name(prefix.name + '_branch_raw.csv'), all_branch_raw)
-    write_csv(prefix.with_name(prefix.name + '_pair_summary.csv'), all_pair_summaries)
-    write_csv(prefix.with_name(prefix.name + '_lr_summary.csv'), all_lr_summaries)
-    write_csv(prefix.with_name(prefix.name + '_confirm_raw.csv'), all_confirm_raw)
     write_csv(prefix.with_name(prefix.name + '_final_pair_summary.csv'), all_final_pair_summaries)
     write_csv(prefix.with_name(prefix.name + '_final_lr_summary.csv'), all_final_lr_summaries)
     write_csv(prefix.with_name(prefix.name + '_recommendations.csv'), all_summary_rows)
@@ -873,8 +1115,8 @@ def main():
     print('\n=== final recommendations ===')
     for row in all_summary_rows:
         print(
-            f"{row['prenorm']:>7s} | {row['recommendation_type']:>11s} | 2**{row['exp2_lr']:.2f} = {row['lr']:.3e} | "
-            f"decay_frac {row['decay_frac']:.3f} | score {row['score']:.4f} | "
+            f"{row['prenorm']:>7s} | {row['recommendation_type']:>13s} | 2**{row['exp2_lr']:.2f} = {row['lr']:.3e} | "
+            f"decay_frac {row['decay_frac']:.3f} | score {row['score']:.4f} | seeds {row['seeds_used']} | "
             f"target_hidden_lr {row['target_hidden_lr']:.3e}"
         )
 

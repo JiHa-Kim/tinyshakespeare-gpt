@@ -18,6 +18,7 @@ Default optimizer and tuning regime:
 - min LR: `0`
 - peak LR tuned on a proxy model first
 - decay start tuned separately from the peak LR
+- optional cheap screen-only spectral proxy via `--screen-pe-steps`, while branch and confirmation stay full-fidelity
 
 Keep these fixed while tuning LR:
 
@@ -199,3 +200,21 @@ python tune_lr.py \
 - The tuner assumes warmup is zero during LR tuning unless you override it.
 - If the top screen candidate stays stable and keeps improving, the screen range expands automatically.
 - The trainer uses one global LR, so the practical transfer recommendation is still the **transferred hidden LR**.
+
+
+## Adaptive WSD LR tuner
+
+`tune_lr.py` now uses an adaptive racing strategy instead of a fixed coarse/fine sweep plus blanket multi-seed confirmation:
+
+- Adaptive bracket-and-zoom for log-LR screening.
+- A medium-budget constant-LR trunk race before full branching.
+- Adaptive decay search that starts from anchor decay fractions and adds at most one local refinement tail per LR.
+- Sequential paired confirmation: start with 1 seed, add more seeds only when the top-2 LRs are still too close.
+- Val-only evaluation during tuning.
+
+Useful flags:
+
+- `--screen-steps`, `--zoom-stop-width`
+- `--trunk-race-steps`, `--final-lr-k`
+- `--decay-fracs`, `--decay-anchor-fracs`, `--max-extra-decay-evals`
+- `--confirm-rel-tol`, `--confirm-max-seeds`
