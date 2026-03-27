@@ -1,117 +1,57 @@
-# Minimal Lion-K / ScionC repo
+# Minimal Scion LR-tuning repo
 
-A tiny reference implementation with four pieces:
+A small reference repo for vanilla Scion on tiny Shakespeare, with a tuning path that is much closer to the Scion paper:
 
-- `lionk_ccwd.py`: general Lion-K with corrected cautious weight decay and primal averaging
-- `scion.py`: Scion specialization, LMOs, init helpers, and transfer helper
-- `gpt.py` + `train_shakespeare.py`: modern minimal GPT for tiny Shakespeare
-- `tune_lr.py`: minimal LR sweep script
+- `lionk_ccwd.py`: Lion-K core with corrected decoupled decay support
+- `scion.py`: Scion specialization, LMOs, geometry-matched initialization, and LR transfer helper
+- `gpt.py` + `train_shakespeare.py`: a minimal GPT training loop
+- `tune_lr.py`: proxy-model LR sweep with optional multi-seed aggregation
 
-Model choices:
+## What changed
 
-- no bias
-- gainless pre-norm blocks with an explicit ablation: `rmsnorm` or `rmsball`
-- RoPE attention
-- RMS-ball projection on `q` and `k`
-- SwiGLU MLP
-- untied embeddings / output head
-- output head always uses row norm
-- ScionC defaults to primal averaging OFF (`phi = 0.0`)
-- ScionC defaults to no gradient clipping (`--grad-clip 0.0`)
+The important fixes are:
 
-## Tuning policy
+1. `scion_transfer_lr(...)` is implemented and used by the sweep script.
+2. Vanilla `scion` is the default everywhere.
+3. Initialization now matches the optimizer geometry instead of using generic orthogonal or unit-norm init.
+   - embeddings: ColNorm with transpose semantics and radius scaling
+   - hidden matrices: spectral init with the same shape-dependent scaling used by the spectral LMO
+   - output head: RowNorm with radius scaling
+4. The stable-decay scheduler is now exact:
+   - no accidental one-step decay when `decay_frac = 0`
+   - the last decay step reaches `min_lr` exactly
+5. LR tuning is more robust:
+   - same seed across LR candidates by default
+   - optional multi-seed confirmation with aggregated median metrics
+   - recommendation uses the largest stable LR within a small final-loss tolerance, instead of blindly taking the largest stable point
 
-Tune a single global learning rate first, but tune it **separately** for:
+## Scion-first tuning policy
 
-- `--prenorm rmsnorm`
-- `--prenorm rmsball`
+Start with plain Scion:
 
-Keep the Scion radii fixed while tuning LR:
+- `--optimizer scion`
+- `--warmup-frac 0.0`
+- `--min-lr 0.0`
+- `--phi 0.0`
+- `--grad-clip 0.0`
+
+Keep the radii fixed while tuning LR:
 
 - `--rho-embed 1`
 - `--rho-hidden 3`
 - `--rho-out 10`
 
-Keep the rest fixed while tuning LR:
+Tune `--prenorm rmsnorm` and `--prenorm rmsball` separately.
 
-- `--phi 0.0`
-- `--grad-clip 0.0`
+## Default schedule
 
-## WSD schedule
+The default schedule is stable-decay, which is just WSD with zero warmup:
 
-The repo uses warmup-stable-decay learning rate schedule.
+- `warmup_frac = 0.0`
+- `decay_frac = 0.285`
+- `min_lr = 0.0`
 
-The LR at step `t` is:
-
-- linear warmup for the first `warmup_steps`
-- constant plateau at the peak LR
-- linear decay over the last `decay_steps`
-
-Main knobs:
-
-- `--warmup-frac`
-- `--warmup-iters`
-- `--decay-frac`
-- `--min-lr`
-
-Recommended default for LR tuning:
-
-- `--warmup-frac 0.0`
-- `--decay-frac 0.2`
-- `--min-lr 0.0`
-
-That means:
-
-- no warmup by default
-- hold the peak LR for the first `80%` of training
-- linearly decay to zero over the last `20%`
-
-## Proxy-model LR tuning
-
-By default, `tune_lr.py` tunes on a proxy model unless you explicitly override the model size or pass `--no-proxy`.
-
-Default proxy settings:
-
-- `--n-layer 4`
-- `--n-head 4`
-- `--d-model 256`
-- `--max-iters 600`
-- `--eval-interval 50`
-- `--eval-iters 20`
-
-## LR strategy with WSD
-
-The sweep is two-stage in base-2 space:
-
-1. coarse sweep over `log2(lr)`
-2. fine sweep around the best coarse exponent
-
-Selection rule:
-
-- choose the **largest LR that stays stable**
-- stability means no non-finite train/eval losses and no evaluation loss blow-up beyond `--diverge-mult x initial_val`
-- only if no candidate is stable, fall back to best validation loss among finite runs
-
-This is more aggressive than choosing pure best validation loss, which tends to bias conservative on short proxy WSD runs.
-
-## Automatic proxy-to-target LR transfer
-
-`tune_lr.py` automatically computes Scion transfer from the proxy run to the target run.
-
-The transfer uses:
-
-- token multiplier `mT`
-- layer multiplier `mL`
-- transfer exponent `alpha` (default `0.5`)
-
-It prints:
-
-- proxy LR selected by the sweep
-- transferred target embed LR
-- transferred target hidden LR
-- transferred target output LR
-
-Because the current train script uses one global LR, the practical recommendation is to start from the transferred hidden LR.
+That mirrors the Scion paper's nanoGPT setup more closely than the previous 20 percent tail.
 
 ## Install
 
@@ -119,110 +59,119 @@ Because the current train script uses one global LR, the practical recommendatio
 pip install torch
 ```
 
-## Train
+## Train a single run
 
 ```bash
-python train_shakespeare.py --mode train --compile
+python train_shakespeare.py \
+  --mode train \
+  --optimizer scion \
+  --prenorm rmsnorm \
+  --batch-size 16 --grad-accum 4 --block-size 256 \
+  --n-layer 6 --n-head 6 --d-model 384 \
+  --lr 1e-3 \
+  --warmup-frac 0.0 --decay-frac 0.285 --min-lr 0.0 \
+  --beta2 0.95 --phi 0.0 \
+  --rho-embed 1 --rho-hidden 3 --rho-out 10 \
+  --no-compile
 ```
 
-Useful flags:
+For the RMS-ball ablation:
 
 ```bash
-python train_shakespeare.py   --mode train   --n-layer 6 --n-head 6 --d-model 384   --batch-size 16 --grad-accum 4 --block-size 256   --lr 1e-3   --warmup-frac 0.0 --decay-frac 0.2 --min-lr 0.0   --beta2 0.95 --phi 0.0   --rho-embed 1 --rho-hidden 3 --rho-out 10   --prenorm rmsnorm   --compile
+python train_shakespeare.py --mode train --optimizer scion --prenorm rmsball --no-compile
 ```
 
-RMS-ball pre-norm ablation:
+## LR sweep on a proxy model
+
+The sweep works in base-2 LR space. It does a coarse sweep, then a fine sweep around the best coarse center.
+
+Recommended first pass:
 
 ```bash
-python train_shakespeare.py --mode train --prenorm rmsball
+python tune_lr.py \
+  --prenorm both \
+  --exp2-min -14 --exp2-max -8 \
+  --coarse-step 1.0 \
+  --fine-radius 1.0 --fine-step 0.25 \
+  --num-seeds 1 \
+  --batch-size 16 --grad-accum 4 --block-size 256 \
+  --warmup-frac 0.0 --decay-frac 0.285 --min-lr 0.0 \
+  --optimizer scion \
+  --rho-embed 1 --rho-hidden 3 --rho-out 10
 ```
 
-To turn primal averaging on explicitly:
+For a more robust confirmation pass:
 
 ```bash
-python train_shakespeare.py --mode train --phi 1.0
+python tune_lr.py \
+  --prenorm both \
+  --exp2-min -14 --exp2-max -8 \
+  --coarse-step 1.0 \
+  --fine-radius 1.0 --fine-step 0.25 \
+  --num-seeds 3 --seed-stride 1000 \
+  --stable-threshold 1.0 \
+  --final-val-tol 0.03 \
+  --batch-size 16 --grad-accum 4 --block-size 256 \
+  --warmup-frac 0.0 --decay-frac 0.285 --min-lr 0.0 \
+  --optimizer scion \
+  --rho-embed 1 --rho-hidden 3 --rho-out 10
 ```
 
-## LR sweep
+This writes:
 
-Proxy sweep with default proxy model and WSD:
+- `out/lr_sweep.csv`: one row per trial
+- `out/lr_sweep_summary.csv`: one row per LR candidate after aggregation
 
-```bash
-python tune_lr.py   --exp2-min -14 --exp2-max -8   --coarse-step 1.0   --fine-radius 1.0 --fine-step 0.25   --csv-path out/lr_sweep.csv   --batch-size 16 --grad-accum 4 --block-size 256   --warmup-frac 0.0 --decay-frac 0.2 --min-lr 0.0   --rho-embed 1 --rho-hidden 3 --rho-out 10   --compile
-```
+## How the recommendation is chosen
 
-This runs both:
+The sweep now recommends:
 
-- `prenorm = rmsnorm`
-- `prenorm = rmsball`
+1. candidates whose stability rate is at least `--stable-threshold`
+2. among those, candidates whose median final validation loss is within `--final-val-tol` of the best stable median final validation loss
+3. the largest LR in that shortlist
 
-and prints separate recommendations for each.
+That keeps the Scion/WSD bias toward large stable LRs, but avoids picking a clearly worse point just because it is barely stable.
 
-To disable the proxy and sweep the full model directly:
+## Proxy-to-target LR transfer
 
-```bash
-python tune_lr.py --no-proxy --n-layer 6 --n-head 6 --d-model 384
-```
+The script also prints transferred target LRs using:
 
-## Logging
+- token multiplier `mT`
+- depth multiplier `mL`
+- transfer exponent `alpha`
 
-When `--compile` is enabled, the script logs:
-
-- `compile_seconds`: one-time compile and first forward/backward warmup cost
-- `train_seconds`: elapsed training time excluding compile
-- `tok/s`: throughput excluding compile
-
-The training loop also returns divergence information used by `tune_lr.py`:
-
-- `diverged`
-- `diverge_reason`
-- `initial_val`
-- `max_val`
-
-## Sample
-
-```bash
-python train_shakespeare.py --mode sample --out-path out/scionc_shakespeare.pt --prompt "To be, or not to be"
-```
+Because the trainer currently uses a single global LR, the practical starting point for the full model is the transferred hidden LR.
 
 ## File guide
 
-### `lionk_ccwd.py`
-
-- `LionKCCWDPA`: general optimizer core
-- `corrected_eta(...)`: corrected multiplicative decay helper
-
 ### `scion.py`
 
-- LMOs with explicit radii: `ColNormLMO`, `SpectralLMO`, `RowNormLMO`, `RMSLMO`
-- default Shakespeare radii: embed `1`, hidden `3`, output `10`
-- init helpers: `init_colnorm_`, `init_rownorm_`, `init_semiorthogonal_`
-- transfer helper: `scion_transfer_lr(...)`
-- optimizer specialization: `Scion`, `ScionC`
-
-### `gpt.py`
-
-- GPT model
-- gainless `Norm(kind='rmsnorm'|'rmsball')`
-- tiny Shakespeare downloader
-- on-device vectorized dataset batching
+- `ColNormLMO`, `RowNormLMO`, `SpectralLMO`
+- `init_colnorm_`, `init_rownorm_`, `init_spectral_`
+- `scion_transfer_lr(...)`
+- `Scion`, `ScionC`
 
 ### `train_shakespeare.py`
 
-- Scion init and parameter grouping
-- one-global-lr tuning interface
-- WSD-only LR schedule
-- explicit radii flags for embed/hidden/output LMOs
-- gradient accumulation
-- compile-time warmup and separate logging
-- train loop
-- checkpoint save/load
-- sampling
+- geometry-matched Scion initialization
+- exact stable-decay schedule
+- grouped Scion optimizer construction
+- training, checkpointing, and sampling
 
 ### `tune_lr.py`
 
-- two-stage base-2 LR sweep
-- proxy-model defaults
-- CSV export
-- stability-based LR selection
-- automatic proxy-to-target LR transfer
+- coarse + fine base-2 LR sweep
+- proxy defaults
+- optional multi-seed aggregation
+- CSV export for both raw trials and aggregated summaries
+
+## Current default recommendation
+
+Until you have evidence otherwise, use:
+
+- `optimizer = scion`
+- `warmup = 0`
+- `decay_frac = 0.285`
+- fixed radii
+- LR tuned on a proxy model
+- transferred hidden LR as the first full-model LR

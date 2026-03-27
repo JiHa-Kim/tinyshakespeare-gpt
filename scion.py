@@ -6,14 +6,15 @@ import torch.nn as nn
 from lionk_ccwd import LionKCCWDPA, lionk_S
 
 __all__ = [
-    "ColNormLMO",
-    "RowNormLMO",
-    "SpectralLMO",
-    "init_colnorm_",
-    "init_rownorm_",
-    "init_semiorthogonal_",
-    "Scion",
-    "ScionC",
+    'ColNormLMO',
+    'RowNormLMO',
+    'SpectralLMO',
+    'init_colnorm_',
+    'init_rownorm_',
+    'init_spectral_',
+    'scion_transfer_lr',
+    'Scion',
+    'ScionC',
 ]
 
 
@@ -36,7 +37,7 @@ def polar_express_uvt(
     work_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     if g.ndim != 2:
-        raise ValueError("polar_express_uvt expects a 2D tensor")
+        raise ValueError('polar_express_uvt expects a 2D tensor')
 
     if work_dtype is None:
         work_dtype = torch.bfloat16 if g.is_cuda else g.dtype
@@ -45,7 +46,7 @@ def polar_express_uvt(
     if transposed:
         x = x.mT
 
-    x = x / (torch.linalg.matrix_norm(x, ord="fro") * 1.01 + eps)
+    x = x / (torch.linalg.matrix_norm(x, ord='fro') * 1.01 + eps)
     n = len(_PE)
     for i in range(steps):
         a, b, c = _PE[i if i < n else n - 1]
@@ -56,34 +57,49 @@ def polar_express_uvt(
     return (x.mT if transposed else x).to(g.dtype)
 
 
-class ColNormLMO:
-    __slots__ = ("radius", "eps")
+def _maybe_transpose(w: torch.Tensor, transpose: bool) -> torch.Tensor:
+    return w.mT if transpose else w
 
-    def __init__(self, radius: float = 1.0, eps: float = 1e-12):
+
+def _spectral_scale(rows: int, cols: int, input_like: bool = False) -> float:
+    scale = math.sqrt(rows / cols)
+    return max(1.0, scale) if input_like else scale
+
+
+class ColNormLMO:
+    __slots__ = ('radius', 'eps', 'transpose')
+
+    def __init__(self, radius: float = 1.0, eps: float = 1e-12, transpose: bool = False):
         self.radius = radius
         self.eps = eps
+        self.transpose = transpose
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
-        return w.div_(torch.linalg.vector_norm(w, dim=0, keepdim=True).clamp_min_(self.eps)).mul_(
-            -self.radius * math.sqrt(w.size(0))
+        x = _maybe_transpose(w, self.transpose)
+        x = x.div_(torch.linalg.vector_norm(x, dim=0, keepdim=True).clamp_min_(self.eps)).mul_(
+            -self.radius * math.sqrt(x.size(0))
         )
+        return _maybe_transpose(x, self.transpose)
 
 
 class RowNormLMO:
-    __slots__ = ("radius", "eps")
+    __slots__ = ('radius', 'eps', 'transpose')
 
-    def __init__(self, radius: float = 10.0, eps: float = 1e-12):
+    def __init__(self, radius: float = 10.0, eps: float = 1e-12, transpose: bool = False):
         self.radius = radius
         self.eps = eps
+        self.transpose = transpose
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
-        return w.div_(torch.linalg.vector_norm(w, dim=1, keepdim=True).clamp_min_(self.eps)).mul_(
-            -self.radius / math.sqrt(w.size(1))
+        x = _maybe_transpose(w, self.transpose)
+        x = x.div_(torch.linalg.vector_norm(x, dim=1, keepdim=True).clamp_min_(self.eps)).mul_(
+            -self.radius / math.sqrt(x.size(1))
         )
+        return _maybe_transpose(x, self.transpose)
 
 
 class SpectralLMO:
-    __slots__ = ("radius", "steps", "eps", "work_dtype", "input_like")
+    __slots__ = ('radius', 'steps', 'eps', 'work_dtype', 'input_like')
 
     def __init__(
         self,
@@ -100,26 +116,65 @@ class SpectralLMO:
         self.input_like = input_like
 
     def __call__(self, v: torch.Tensor) -> torch.Tensor:
-        scale = math.sqrt(v.size(0) / v.size(1))
-        if self.input_like:
-            scale = max(1.0, scale)
-        return polar_express_uvt(v, self.steps, self.eps, self.work_dtype).mul_(
-            -self.radius * scale
-        )
+        scale = _spectral_scale(v.size(0), v.size(1), self.input_like)
+        return polar_express_uvt(v, self.steps, self.eps, self.work_dtype).mul_(-self.radius * scale)
 
 
-def init_colnorm_(w: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    nn.init.normal_(w)
-    return w.div_(torch.linalg.vector_norm(w, dim=0, keepdim=True).clamp_min_(eps))
+@torch.no_grad()
+def init_colnorm_(w: torch.Tensor, radius: float = 1.0, eps: float = 1e-12, transpose: bool = False) -> torch.Tensor:
+    x = _maybe_transpose(w, transpose)
+    nn.init.normal_(x)
+    x.div_(torch.linalg.vector_norm(x, dim=0, keepdim=True).clamp_min_(eps)).mul_(radius * math.sqrt(x.size(0)))
+    return w
 
 
-def init_rownorm_(w: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    nn.init.normal_(w)
-    return w.div_(torch.linalg.vector_norm(w, dim=1, keepdim=True).clamp_min_(eps))
+@torch.no_grad()
+def init_rownorm_(w: torch.Tensor, radius: float = 1.0, eps: float = 1e-12, transpose: bool = False) -> torch.Tensor:
+    x = _maybe_transpose(w, transpose)
+    nn.init.normal_(x)
+    x.div_(torch.linalg.vector_norm(x, dim=1, keepdim=True).clamp_min_(eps)).mul_(radius / math.sqrt(x.size(1)))
+    return w
 
 
-def init_semiorthogonal_(w: torch.Tensor) -> torch.Tensor:
-    return nn.init.orthogonal_(w)
+@torch.no_grad()
+def init_spectral_(w: torch.Tensor, radius: float = 1.0, input_like: bool = False) -> torch.Tensor:
+    w_fp = w.data.double()
+    nn.init.orthogonal_(w_fp)
+    w_fp.mul_(radius * _spectral_scale(w_fp.size(0), w_fp.size(1), input_like))
+    w.data.copy_(w_fp.to(dtype=w.dtype))
+    return w
+
+
+@torch.no_grad()
+def init_semiorthogonal_(w: torch.Tensor, radius: float = 1.0, input_like: bool = False) -> torch.Tensor:
+    return init_spectral_(w, radius=radius, input_like=input_like)
+
+
+def scion_transfer_lr(lr: float, mT: float = 1.0, mL: float = 1.0, alpha: float = 0.5):
+    """Transfer a tuned proxy Scion LR to a target model.
+
+    For Scion-style width-invariant LMOs, the width multiplier drops out.
+    The transferred LRs are therefore:
+
+        embed,out: lr' = lr * mT^(-1/2)
+        hidden:    lr' = lr * mT^(-1/2) * mL^(alpha - 1)
+
+    where mT is the token-budget multiplier and mL the depth multiplier.
+    """
+    if lr <= 0.0:
+        raise ValueError(f'invalid lr: {lr}')
+    if mT <= 0.0:
+        raise ValueError(f'invalid mT: {mT}')
+    if mL <= 0.0:
+        raise ValueError(f'invalid mL: {mL}')
+
+    token_factor = mT ** -0.5
+    depth_factor = mL ** (alpha - 1.0)
+    return {
+        'embed': lr * token_factor,
+        'hidden': lr * token_factor * depth_factor,
+        'out': lr * token_factor,
+    }
 
 
 class Scion(LionKCCWDPA):
