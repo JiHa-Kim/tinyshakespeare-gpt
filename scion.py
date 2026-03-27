@@ -105,7 +105,7 @@ class RMSLMO:
 class ColNormLMO:
     __slots__ = ("radius", "eps")
 
-    def __init__(self, radius: float = 50.0, eps: float = 1e-12):
+    def __init__(self, radius: float = 1.0, eps: float = 1e-12):
         self.radius = radius
         self.eps = eps
 
@@ -119,7 +119,7 @@ class ColNormLMO:
 class RowNormLMO:
     __slots__ = ("radius", "eps")
 
-    def __init__(self, radius: float = 3000.0, eps: float = 1e-12):
+    def __init__(self, radius: float = 10.0, eps: float = 1e-12):
         self.radius = radius
         self.eps = eps
 
@@ -135,7 +135,7 @@ class SpectralLMO:
 
     def __init__(
         self,
-        radius: float = 50.0,
+        radius: float = 3.0,
         steps: int = 5,
         eps: float = 1e-7,
         work_dtype: torch.dtype | None = None,

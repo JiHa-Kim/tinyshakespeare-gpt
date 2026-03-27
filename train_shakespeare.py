@@ -87,7 +87,7 @@ def init_gpt_scion_(model: GPT):
 @torch.no_grad()
 def build_scionc(model: GPT, args, device: torch.device) -> ScionC:
     work_dtype = torch.bfloat16 if device.type == "cuda" else None
-    lmo_embed = ColNormLMO(radius=args.rho_hidden)
+    lmo_embed = ColNormLMO(radius=args.rho_embed)
     lmo_hidden = SpectralLMO(
         radius=args.rho_hidden, steps=args.pe_steps, work_dtype=work_dtype
     )
@@ -372,8 +372,9 @@ def make_parser():
     p.add_argument("--eta", type=float, default=0.0)
     p.add_argument("--cwd", action="store_true")
     p.add_argument("--pe-steps", type=int, default=5)
-    p.add_argument("--rho-hidden", type=float, default=50.0)
-    p.add_argument("--rho-out", type=float, default=3000.0)
+    p.add_argument("--rho-embed", type=float, default=1.0)
+    p.add_argument("--rho-hidden", type=float, default=3.0)
+    p.add_argument("--rho-out", type=float, default=10.0)
 
     p.add_argument("--prompt", default="To be, or not to be")
     p.add_argument("--sample-tokens", type=int, default=400)

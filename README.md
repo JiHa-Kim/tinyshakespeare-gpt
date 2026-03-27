@@ -26,10 +26,11 @@ Tune a single global learning rate first, but tune it **separately** for:
 - `--prenorm rmsnorm`
 - `--prenorm rmsball`
 
-Keep the Scion radii fixed:
+Keep the Scion radii fixed while tuning LR:
 
-- `--rho-hidden 50`
-- `--rho-out 3000`
+- `--rho-embed 1`
+- `--rho-hidden 3`
+- `--rho-out 10`
 
 Keep the rest fixed while tuning LR:
 
@@ -127,16 +128,7 @@ python train_shakespeare.py --mode train --compile
 Useful flags:
 
 ```bash
-python train_shakespeare.py \
-  --mode train \
-  --n-layer 6 --n-head 6 --d-model 384 \
-  --batch-size 16 --grad-accum 4 --block-size 256 \
-  --lr 1e-3 \
-  --warmup-frac 0.0 --decay-frac 0.2 --min-lr 0.0 \
-  --beta2 0.95 --phi 0.0 \
-  --rho-hidden 50 --rho-out 3000 \
-  --prenorm rmsnorm \
-  --compile
+python train_shakespeare.py   --mode train   --n-layer 6 --n-head 6 --d-model 384   --batch-size 16 --grad-accum 4 --block-size 256   --lr 1e-3   --warmup-frac 0.0 --decay-frac 0.2 --min-lr 0.0   --beta2 0.95 --phi 0.0   --rho-embed 1 --rho-hidden 3 --rho-out 10   --prenorm rmsnorm   --compile
 ```
 
 RMS-ball pre-norm ablation:
@@ -156,14 +148,7 @@ python train_shakespeare.py --mode train --phi 1.0
 Proxy sweep with default proxy model and WSD:
 
 ```bash
-python tune_lr.py \
-  --exp2-min -14 --exp2-max -8 \
-  --coarse-step 1.0 \
-  --fine-radius 1.0 --fine-step 0.25 \
-  --csv-path out/lr_sweep.csv \
-  --batch-size 16 --grad-accum 4 --block-size 256 \
-  --warmup-frac 0.0 --decay-frac 0.2 --min-lr 0.0 \
-  --compile
+python tune_lr.py   --exp2-min -14 --exp2-max -8   --coarse-step 1.0   --fine-radius 1.0 --fine-step 0.25   --csv-path out/lr_sweep.csv   --batch-size 16 --grad-accum 4 --block-size 256   --warmup-frac 0.0 --decay-frac 0.2 --min-lr 0.0   --rho-embed 1 --rho-hidden 3 --rho-out 10   --compile
 ```
 
 This runs both:
@@ -210,9 +195,10 @@ python train_shakespeare.py --mode sample --out-path out/scionc_shakespeare.pt -
 ### `scion.py`
 
 - LMOs with explicit radii: `ColNormLMO`, `SpectralLMO`, `RowNormLMO`, `RMSLMO`
+- default Shakespeare radii: embed `1`, hidden `3`, output `10`
 - init helpers: `init_colnorm_`, `init_rownorm_`, `init_semiorthogonal_`
 - transfer helper: `scion_transfer_lr(...)`
-- optimizer specialization: `Scion`
+- optimizer specialization: `Scion`, `ScionC`
 
 ### `gpt.py`
 
@@ -226,7 +212,7 @@ python train_shakespeare.py --mode sample --out-path out/scionc_shakespeare.pt -
 - Scion init and parameter grouping
 - one-global-lr tuning interface
 - WSD-only LR schedule
-- explicit radii flags for hidden/output LMOs
+- explicit radii flags for embed/hidden/output LMOs
 - gradient accumulation
 - compile-time warmup and separate logging
 - train loop
@@ -238,4 +224,5 @@ python train_shakespeare.py --mode sample --out-path out/scionc_shakespeare.pt -
 - two-stage base-2 LR sweep
 - proxy-model defaults
 - CSV export
-- ranking by best validation loss
+- stability-based LR selection
+- automatic proxy-to-target LR transfer
