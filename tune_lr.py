@@ -212,6 +212,7 @@ def main():
     p.add_argument("--proxy-eval-interval", type=int, default=50)
     p.add_argument("--proxy-eval-iters", type=int, default=20)
     p.add_argument("--alpha-transfer", type=float, default=0.5)
+    p.add_argument("--prenorm", choices=["rmsnorm", "rmsball", "both"], default="both")
     args, rest = p.parse_known_args()
 
     target_cfg = make_parser().parse_args(rest)
@@ -221,7 +222,8 @@ def main():
     coarse_exp2s = exp2_grid(args.exp2_min, args.exp2_max, args.coarse_step)
     all_rows = []
     recommendations = []
-    for prenorm in ("rmsnorm", "rmsball"):
+    prenorms = ["rmsnorm", "rmsball"] if args.prenorm == "both" else [args.prenorm]
+    for prenorm in prenorms:
         rows, rec, center, mode = sweep_prenorm(
             base, target_cfg, args, coarse_exp2s, args.keep_checkpoints, prenorm
         )
