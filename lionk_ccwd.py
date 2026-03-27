@@ -130,7 +130,7 @@ class LionKCCWDPA(Optimizer):
 
                 state = self.state[p]
                 if not state:
-                    state['m'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state['m'] = g.detach().clone(memory_format=torch.preserve_format)
                     state['z'] = p.detach().clone(memory_format=torch.preserve_format)
                     if phi:
                         state['x'] = p.detach().clone(memory_format=torch.preserve_format)
