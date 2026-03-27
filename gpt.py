@@ -81,8 +81,8 @@ class CausalSelfAttention(nn.Module):
 
         cos = self.rope_cos[:seqlen].view(1, 1, seqlen, self.head_dim // 2)
         sin = self.rope_sin[:seqlen].view(1, 1, seqlen, self.head_dim // 2)
-        q = rms_ball_proj(apply_rope(q, cos, sin))
-        k = rms_ball_proj(apply_rope(k, cos, sin))
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.proj(y.transpose(1, 2).contiguous().view(bsz, seqlen, d_model))
 

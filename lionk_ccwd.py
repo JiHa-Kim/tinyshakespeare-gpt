@@ -11,8 +11,7 @@ def sign_(x: torch.Tensor) -> torch.Tensor:
 def lionk_S(beta1: float, beta2: float, nesterov: bool = True) -> float:
     beta_eff = beta1 * beta2 if nesterov else beta1
     return (1.0 + beta2) / (
-        ((1.0 - beta_eff) ** 2) * (1.0 + beta2)
-        + (beta_eff * beta_eff) * (1.0 - beta2)
+        ((1.0 - beta_eff) ** 2) * (1.0 + beta2) + (beta_eff * beta_eff) * (1.0 - beta2)
     )
 
 
@@ -133,7 +132,9 @@ class LionKCCWDPA(Optimizer):
                     state["m"] = g.detach().clone(memory_format=torch.preserve_format)
                     state["z"] = p.detach().clone(memory_format=torch.preserve_format)
                     if phi:
-                        state["x"] = p.detach().clone(memory_format=torch.preserve_format)
+                        state["x"] = p.detach().clone(
+                            memory_format=torch.preserve_format
+                        )
 
                 m = state["m"]
                 z = state["z"]
