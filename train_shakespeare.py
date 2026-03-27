@@ -342,7 +342,7 @@ def make_parser():
     p.add_argument("--out-path", default="out/scionc_shakespeare.pt")
     p.add_argument("--device", default="")
     p.add_argument("--seed", type=int, default=1337)
-    p.add_argument("--compile", action="store_true")
+    p.add_argument("--compile", action="store_true", default=True)
 
     p.add_argument("--block-size", type=int, default=256)
     p.add_argument("--batch-size", type=int, default=64, help="microbatch size")
