@@ -28,6 +28,27 @@ def dedupe_sorted(xs):
     return out
 
 
+def has_flag(rest, *names):
+    return any(name in rest for name in names)
+
+
+def apply_proxy_defaults(base, rest, args):
+    if args.no_proxy:
+        return
+    if not has_flag(rest, '--n-layer'):
+        base.n_layer = args.proxy_n_layer
+    if not has_flag(rest, '--n-head'):
+        base.n_head = args.proxy_n_head
+    if not has_flag(rest, '--d-model'):
+        base.d_model = args.proxy_d_model
+    if not has_flag(rest, '--max-iters'):
+        base.max_iters = args.proxy_max_iters
+    if not has_flag(rest, '--eval-interval'):
+        base.eval_interval = args.proxy_eval_interval
+    if not has_flag(rest, '--eval-iters'):
+        base.eval_iters = args.proxy_eval_iters
+
+
 def run_sweep(base, exp2s, stage_name: str, keep_checkpoints: bool):
     rows = []
     for i, exp2_lr in enumerate(exp2s):
@@ -47,6 +68,10 @@ def run_sweep(base, exp2s, stage_name: str, keep_checkpoints: bool):
             'final_val': metrics['final_val'],
             'final_train': metrics['final_train'],
             'compile_seconds': metrics['compile_seconds'],
+            'n_layer': run.n_layer,
+            'n_head': run.n_head,
+            'd_model': run.d_model,
+            'max_iters': run.max_iters,
             'out_path': run.out_path,
         }
         rows.append(row)
@@ -69,9 +94,17 @@ def main():
     p.add_argument('--fine-radius', type=float, default=1.0)
     p.add_argument('--csv-path', default='out/lr_sweep.csv')
     p.add_argument('--keep-checkpoints', action='store_true')
+    p.add_argument('--no-proxy', action='store_true')
+    p.add_argument('--proxy-n-layer', type=int, default=4)
+    p.add_argument('--proxy-n-head', type=int, default=4)
+    p.add_argument('--proxy-d-model', type=int, default=256)
+    p.add_argument('--proxy-max-iters', type=int, default=600)
+    p.add_argument('--proxy-eval-interval', type=int, default=50)
+    p.add_argument('--proxy-eval-iters', type=int, default=20)
     args, rest = p.parse_known_args()
 
     base = make_parser().parse_args(rest)
+    apply_proxy_defaults(base, rest, args)
 
     coarse_exp2s = exp2_grid(args.exp2_min, args.exp2_max, args.coarse_step)
     coarse_rows = run_sweep(base, coarse_exp2s, 'coarse', args.keep_checkpoints)

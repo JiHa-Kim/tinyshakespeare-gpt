@@ -1,5 +1,4 @@
 import argparse
-import math
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -35,35 +34,18 @@ def lr_at_step(
     max_steps: int,
     lr: float,
     min_lr: float,
-    schedule: str,
     warmup_steps: int,
     decay_steps: int,
 ) -> float:
     if warmup_steps > 0 and step < warmup_steps:
         return lr * (step + 1) / warmup_steps
 
-    if schedule == "constant":
+    decay_steps = min(max(decay_steps, 1), max_steps)
+    stable_end = max_steps - decay_steps
+    if step < stable_end:
         return lr
-
-    if schedule == "linear":
-        t = min(max(step - warmup_steps, 0), max(max_steps - warmup_steps, 1))
-        T = max(max_steps - warmup_steps, 1)
-        return lr + (min_lr - lr) * (t / T)
-
-    if schedule == "cosine":
-        t = min(max(step - warmup_steps, 0), max(max_steps - warmup_steps, 1))
-        T = max(max_steps - warmup_steps, 1)
-        return min_lr + 0.5 * (1.0 + math.cos(math.pi * (t / T))) * (lr - min_lr)
-
-    if schedule == "wsd":
-        decay_steps = min(max(decay_steps, 1), max_steps)
-        stable_end = max_steps - decay_steps
-        if step < stable_end:
-            return lr
-        t = min(step - stable_end, decay_steps)
-        return lr + (min_lr - lr) * (t / decay_steps)
-
-    raise ValueError(f"invalid schedule: {schedule}")
+    t = min(step - stable_end, decay_steps)
+    return lr + (min_lr - lr) * (t / decay_steps)
 
 
 @torch.inference_mode()
@@ -242,13 +224,7 @@ def train(args):
 
     for step in range(args.max_iters):
         lr = lr_at_step(
-            step,
-            args.max_iters,
-            args.lr,
-            args.min_lr,
-            args.schedule,
-            warmup_steps,
-            decay_steps,
+            step, args.max_iters, args.lr, args.min_lr, warmup_steps, decay_steps
         )
         for group in opt.param_groups:
             group["lr"] = lr
@@ -344,9 +320,6 @@ def make_parser():
     p.add_argument("--eval-iters", type=int, default=50)
     p.add_argument("--grad-clip", type=float, default=0.0)
 
-    p.add_argument(
-        "--schedule", choices=["wsd", "cosine", "linear", "constant"], default="wsd"
-    )
     p.add_argument(
         "--warmup-iters", type=int, default=-1, help="if >=0, overrides warmup-frac"
     )

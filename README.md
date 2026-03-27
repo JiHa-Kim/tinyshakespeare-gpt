@@ -18,6 +18,7 @@ Model choices:
 - output head always uses row norm
 - ScionC defaults to primal averaging OFF (`phi = 0.0`)
 - ScionC defaults to no gradient clipping (`--grad-clip 0.0`)
+- Warmup-stable-decay learning rate schedule
 
 ## Tuning policy
 
@@ -25,16 +26,35 @@ Tune a single global learning rate first:
 
 - `--lr`
 
-Keep the Scion radii fixed at the paper-style GPT defaults:
+Keep the Scion radii fixed:
 
 - `--rho-hidden 50`
 - `--rho-out 3000`
 
-These radii live inside the LMOs and act like built-in per-group step scales, so fixing them and tuning only `lr` is the cleanest first pass.
+Keep the rest fixed while tuning LR:
 
-## Schedule policy
+- `--phi 0.0`
+- `--grad-clip 0.0`
+- `--prenorm rmsnorm`
 
-Default schedule is warmup-stable-decay (`--schedule wsd`) with:
+## WSD schedule
+
+The repo uses warmup-stable-decay learning rate schedule.
+
+The LR at step `t` is:
+
+- linear warmup for the first `warmup_steps`
+- constant plateau at the peak LR
+- linear decay over the last `decay_steps`
+
+Main knobs:
+
+- `--warmup-frac`
+- `--warmup-iters`
+- `--decay-frac`
+- `--min-lr`
+
+Recommended default for LR tuning:
 
 - `--warmup-frac 0.0`
 - `--decay-frac 0.2`
@@ -42,22 +62,36 @@ Default schedule is warmup-stable-decay (`--schedule wsd`) with:
 
 That means:
 
-- no warmup by default for ScionC
-- hold the peak LR constant for the first `80%` of training
-- linearly decay over the last `20%`
+- no warmup by default
+- hold the peak LR for the first `80%` of training
+- linearly decay to zero over the last `20%`
 
-## What is optimized here
+## Proxy-model LR tuning
 
-This repo keeps the code minimal while pushing the hot path as far as possible without adding a lot of machinery:
+By default, `tune_lr.py` tunes on a proxy model unless you explicitly override the model size or pass `--no-proxy`.
 
-- whole Shakespeare train/val tensors are moved to the target device once
-- batches are drawn with vectorized indexing on-device
-- `scaled_dot_product_attention` is used directly
-- TF32 is enabled on CUDA
-- autocast uses `bfloat16` when available
-- optional `torch.compile`
-- compile time is logged separately from actual training throughput
-- gradient accumulation is built in via `--grad-accum`
+Default proxy settings:
+
+- `--n-layer 4`
+- `--n-head 4`
+- `--d-model 256`
+- `--max-iters 600`
+- `--eval-interval 50`
+- `--eval-iters 20`
+
+## LR strategy with WSD
+
+Use this order:
+
+1. Sweep `log2(lr)` on the proxy model with WSD.
+2. Pick the best LR by best validation loss.
+3. Recheck the top 1 to 3 LR values on the full model.
+4. Only if the first 20 to 50 optimizer steps are obviously unstable, add a tiny warmup such as `--warmup-frac 0.01`.
+
+The default sweep is two-stage in `log2(lr)`:
+
+1. coarse sweep over integer-ish exponents
+2. fine sweep around the best coarse exponent
 
 ## Install
 
@@ -79,17 +113,11 @@ python train_shakespeare.py \
   --n-layer 6 --n-head 6 --d-model 384 \
   --batch-size 16 --grad-accum 4 --block-size 256 \
   --lr 1e-3 \
-  --schedule wsd --warmup-frac 0.0 --decay-frac 0.2 --min-lr 0.0 \
+  --warmup-frac 0.0 --decay-frac 0.2 --min-lr 0.0 \
   --beta2 0.95 --phi 0.0 \
   --rho-hidden 50 --rho-out 3000 \
   --prenorm rmsnorm \
   --compile
-```
-
-This example uses a microbatch of `16` and gradient accumulation of `4`, so the effective batch is:
-
-```text
-16 * 4 = 64
 ```
 
 RMS-ball pre-norm ablation:
@@ -106,20 +134,7 @@ python train_shakespeare.py --mode train --phi 1.0
 
 ## LR sweep
 
-The tuning script now uses a two-stage base-2 sweep:
-
-1. coarse sweep over integer-ish `log2(lr)` values
-2. fine sweep around the best coarse exponent
-
-So the main tuning space is:
-
-- `--exp2-min`
-- `--exp2-max`
-- `--coarse-step`
-- `--fine-radius`
-- `--fine-step`
-
-Example:
+Proxy sweep with default proxy model and WSD:
 
 ```bash
 python tune_lr.py \
@@ -127,25 +142,16 @@ python tune_lr.py \
   --coarse-step 1.0 \
   --fine-radius 1.0 --fine-step 0.25 \
   --csv-path out/lr_sweep.csv \
-  --mode train --max-iters 400 --eval-interval 50 --eval-iters 20 \
   --batch-size 16 --grad-accum 4 --block-size 256 \
-  --schedule wsd --warmup-frac 0.0 --decay-frac 0.2 \
+  --warmup-frac 0.0 --decay-frac 0.2 --min-lr 0.0 \
   --compile
 ```
 
-This first tries:
+To disable the proxy and sweep the full model directly:
 
-```text
-2**(-14), 2**(-13), ..., 2**(-8)
+```bash
+python tune_lr.py --no-proxy --n-layer 6 --n-head 6 --d-model 384
 ```
-
-then refines near the best exponent, for example with quarter-step resolution:
-
-```text
-2**(e* - 1.0), 2**(e* - 0.75), ..., 2**(e* + 1.0)
-```
-
-The script writes a CSV and prints the top runs ranked by best validation loss.
 
 ## Logging
 
@@ -186,7 +192,7 @@ python train_shakespeare.py --mode sample --out-path out/scionc_shakespeare.pt -
 
 - Scion init and parameter grouping
 - one-global-lr tuning interface
-- WSD / cosine / linear / constant schedules
+- WSD-only LR schedule
 - explicit radii flags for hidden/output LMOs
 - gradient accumulation
 - compile-time warmup and separate logging
@@ -196,6 +202,7 @@ python train_shakespeare.py --mode sample --out-path out/scionc_shakespeare.pt -
 
 ### `tune_lr.py`
 
-- geometric LR sweep
+- two-stage base-2 LR sweep
+- proxy-model defaults
 - CSV export
 - ranking by best validation loss
