@@ -1,8 +1,7 @@
 import torch
 from torch.optim import Optimizer
 
-
-__all__ = ['sign_', 'lionk_S', 'corrected_eta', 'LionKCCWDPA']
+__all__ = ["sign_", "lionk_S", "corrected_eta", "LionKCCWDPA"]
 
 
 def sign_(x: torch.Tensor) -> torch.Tensor:
@@ -12,8 +11,8 @@ def sign_(x: torch.Tensor) -> torch.Tensor:
 def lionk_S(beta1: float, beta2: float, nesterov: bool = True) -> float:
     beta_eff = beta1 * beta2 if nesterov else beta1
     return (1.0 + beta2) / (
-        ((1.0 - beta_eff) ** 2) * (1.0 + beta2) +
-        (beta_eff * beta_eff) * (1.0 - beta2)
+        ((1.0 - beta_eff) ** 2) * (1.0 + beta2)
+        + (beta_eff * beta_eff) * (1.0 - beta2)
     )
 
 
@@ -30,16 +29,14 @@ def corrected_eta(
 
 class LionKCCWDPA(Optimizer):
     """
-    General Lion-K with corrected decoupled decay, optional cautious masking,
+    Lion-K with corrected decoupled decay, optional cautious masking,
     and optional primal averaging.
 
-    Live params are always the gradient-eval point
+    Parameters are kept at the gradient-eval point
         y_t = (1 - phi) z_t + phi x_t.
 
-    Each param group may provide:
-        dir_fn: maps v_t -> negative direction u_t
-        eta: fixed multiplicative decay per step
-    or enough info to derive eta from corrected_eta(...).
+    `dir_fn` maps the momentum proxy to a negative update direction.
+    `eta` applies fixed decoupled decay; otherwise it is derived from `theta2`.
     """
 
     def __init__(
@@ -59,29 +56,31 @@ class LionKCCWDPA(Optimizer):
         eps: float = 1e-12,
     ):
         if lr <= 0.0:
-            raise ValueError(f'invalid lr: {lr}')
+            raise ValueError(f"invalid lr: {lr}")
         beta1, beta2 = betas
         if not (0.0 <= beta1 <= 1.0 and 0.0 <= beta2 < 1.0):
-            raise ValueError(f'invalid betas: {betas}')
+            raise ValueError(f"invalid betas: {betas}")
         if not (0.0 <= phi <= 1.0):
-            raise ValueError(f'invalid phi: {phi}')
+            raise ValueError(f"invalid phi: {phi}")
 
-        defaults = dict(
-            lr=lr,
-            betas=betas,
-            dir_fn=dir_fn,
-            phi=phi,
-            eta=eta,
-            theta2=theta2,
-            cu2=cu2,
-            S=S,
-            q=q,
-            cwd=cwd,
-            nesterov=nesterov,
-            eps=eps,
-            _pa_denom=0.0,
+        super().__init__(
+            params,
+            dict(
+                lr=lr,
+                betas=betas,
+                dir_fn=dir_fn,
+                phi=phi,
+                eta=eta,
+                theta2=theta2,
+                cu2=cu2,
+                S=S,
+                q=q,
+                cwd=cwd,
+                nesterov=nesterov,
+                eps=eps,
+                _pa_denom=0.0,
+            ),
         )
-        super().__init__(params, defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -91,75 +90,88 @@ class LionKCCWDPA(Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            lr = group['lr']
-            beta1, beta2 = group['betas']
-            dir_fn = group['dir_fn']
-            phi = group['phi']
-            cwd = group['cwd']
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            dir_fn = group["dir_fn"]
+            phi = group["phi"]
+            cwd = group["cwd"]
+            nesterov = group["nesterov"]
 
             if phi:
-                group['_pa_denom'] += lr * lr
-                c = (lr * lr) / group['_pa_denom']
+                group["_pa_denom"] += lr * lr
+                c = (lr * lr) / group["_pa_denom"]
             else:
                 c = 0.0
 
-            eta = group['eta']
+            eta = group["eta"]
+            theta2 = group["theta2"]
             if eta is None:
-                theta2 = group['theta2']
                 if theta2 is None:
                     eta = 0.0
                 else:
-                    S = group['S']
+                    S = group["S"]
                     if S is None:
-                        S = lionk_S(beta1, beta2, nesterov=group['nesterov'])
+                        S = group["S"] = lionk_S(beta1, beta2, nesterov=nesterov)
                     eta = corrected_eta(
                         lr=lr,
                         theta2=theta2,
-                        cu2=group['cu2'],
+                        cu2=group["cu2"],
                         S=S,
-                        q=group['q'] if cwd else 1.0,
-                        eps=group['eps'],
+                        q=group["q"] if cwd else 1.0,
+                        eps=group["eps"],
                     )
 
-            for p in group['params']:
+            for p in group["params"]:
                 g = p.grad
                 if g is None:
                     continue
                 if g.is_sparse:
-                    raise RuntimeError('LionKCCWDPA does not support sparse gradients')
+                    raise RuntimeError("LionKCCWDPA does not support sparse gradients")
 
                 state = self.state[p]
                 if not state:
-                    state['m'] = g.detach().clone(memory_format=torch.preserve_format)
-                    state['z'] = p.detach().clone(memory_format=torch.preserve_format)
+                    state["m"] = g.detach().clone(memory_format=torch.preserve_format)
+                    state["z"] = p.detach().clone(memory_format=torch.preserve_format)
                     if phi:
-                        state['x'] = p.detach().clone(memory_format=torch.preserve_format)
+                        state["x"] = p.detach().clone(memory_format=torch.preserve_format)
 
-                m = state['m']
-                z = state['z']
+                m = state["m"]
+                z = state["z"]
 
-                m.lerp_(g, 1.0 - beta2)
-
-                if beta1 == 1.0:
-                    v = g.copy_(m)
-                elif beta1 == 0.0:
-                    v = g
+                # Reuse grad storage as scratch to avoid per-step allocations.
+                if nesterov:
+                    m.lerp_(g, 1.0 - beta2)
+                    if beta1 == 1.0:
+                        g.copy_(m)
+                    elif beta1 != 0.0:
+                        g.lerp_(m, beta1)
                 else:
-                    v = g.mul_(1.0 - beta1).add_(m, alpha=beta1)
+                    if beta1 != 0.0:
+                        tmp = state.get("tmp")
+                        if tmp is None:
+                            tmp = state["tmp"] = m.detach().clone(
+                                memory_format=torch.preserve_format
+                            )
+                        else:
+                            tmp.copy_(m)
+                    m.lerp_(g, 1.0 - beta2)
+                    if beta1 == 1.0:
+                        g.copy_(tmp)
+                    elif beta1 != 0.0:
+                        g.mul_(1.0 - beta1).add_(tmp, alpha=beta1)
 
-                u = dir_fn(v)
+                u = dir_fn(g)
 
                 if eta:
                     if cwd:
-                        mask = (p * u) > 0
-                        z.addcmul_(p, mask.to(dtype=p.dtype), value=-eta)
+                        z.addcmul_(p, (p * u > 0).to(dtype=p.dtype), value=-eta)
                     else:
                         z.add_(p, alpha=-eta)
 
                 z.add_(u, alpha=lr)
 
                 if phi:
-                    x = state['x']
+                    x = state["x"]
                     x.lerp_(z, c)
                     if phi == 1.0:
                         p.copy_(x)
@@ -169,21 +181,3 @@ class LionKCCWDPA(Optimizer):
                     p.copy_(z)
 
         return loss
-
-    @torch.no_grad()
-    def copy_fast_to_params_(self):
-        for group in self.param_groups:
-            for p in group['params']:
-                state = self.state.get(p)
-                if state:
-                    p.copy_(state['z'])
-
-    @torch.no_grad()
-    def copy_average_to_params_(self):
-        for group in self.param_groups:
-            if not group['phi']:
-                continue
-            for p in group['params']:
-                state = self.state.get(p)
-                if state:
-                    p.copy_(state['x'])
