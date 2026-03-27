@@ -242,8 +242,6 @@ def scion_transfer_lr(lr: float, mT: float = 1.0, mL: float = 1.0, alpha: float 
 
 
 class Scion(LionKCCWDPA):
-    """Scion with optional fixed decoupled decay via `eta`."""
-
     def __init__(
         self,
         params,
@@ -257,7 +255,41 @@ class Scion(LionKCCWDPA):
         S: float | None = None,
         q: float = 1.0,
         cwd: bool = False,
-        nesterov: bool = True,
+        nesterov: bool = False,
+        eps: float = 1e-12,
+    ):
+        super().__init__(
+            params=params,
+            lr=lr,
+            betas=(1.0, beta2),
+            dir_fn=dir_fn,
+            phi=phi,
+            eta=eta,
+            theta2=theta2,
+            cu2=cu2,
+            S=1.0 if S is None else S,
+            q=q,
+            cwd=cwd,
+            nesterov=nesterov,
+            eps=eps,
+        )
+
+
+class ScionC(LionKCCWDPA):
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-4,
+        beta2: float = 0.95,
+        dir_fn=None,
+        phi: float = 0.0,
+        eta: float | None = None,
+        theta2: float | None = None,
+        cu2: float = 1.0,
+        S: float | None = None,
+        q: float = 1.0,
+        cwd: bool = False,
+        nesterov: bool = False,
         eps: float = 1e-12,
     ):
         super().__init__(
@@ -275,7 +307,3 @@ class Scion(LionKCCWDPA):
             nesterov=nesterov,
             eps=eps,
         )
-
-
-class ScionC(Scion):
-    """Scion with corrected decay, typically driven by per-group `theta2`."""
