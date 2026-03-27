@@ -26,8 +26,10 @@ def sync_now(device: torch.device) -> float:
     return time.perf_counter()
 
 
+
 def amp_ctx(amp_dtype: torch.dtype | None):
     return torch.autocast(device_type='cuda', dtype=amp_dtype) if amp_dtype is not None else nullcontext()
+
 
 
 def resolve_schedule(max_steps: int, warmup_steps: int, decay_steps: int) -> tuple[int, int, int]:
@@ -37,6 +39,7 @@ def resolve_schedule(max_steps: int, warmup_steps: int, decay_steps: int) -> tup
     decay_steps = max(0, min(decay_steps, max_steps - warmup_steps))
     stable_steps = max_steps - warmup_steps - decay_steps
     return warmup_steps, stable_steps, decay_steps
+
 
 
 def lr_at_step(
@@ -160,6 +163,7 @@ def load_checkpoint(path: Path, device: torch.device):
     return model, stoi, itos
 
 
+
 def maybe_compile(model: GPT, source: BatchSource, args, amp_dtype: torch.dtype | None, device: torch.device):
     if not (args.compile and hasattr(torch, 'compile')):
         return model, 0.0
@@ -172,6 +176,7 @@ def maybe_compile(model: GPT, source: BatchSource, args, amp_dtype: torch.dtype 
     loss.backward()
     model.zero_grad(set_to_none=True)
     return model, sync_now(device) - t0
+
 
 
 def train(args):
@@ -322,6 +327,7 @@ def sample(args):
     print(''.join(itos[int(i)] for i in y[0].tolist()))
 
 
+
 def make_parser():
     p = argparse.ArgumentParser()
     p.add_argument('--mode', choices=['train', 'sample'], default='train')
@@ -373,6 +379,7 @@ def make_parser():
     p.add_argument('--skip-sample', action='store_true')
     p.add_argument('--no-save', action='store_true')
     return p
+
 
 
 def main():
