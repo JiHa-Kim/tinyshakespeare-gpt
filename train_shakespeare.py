@@ -16,12 +16,12 @@ from gpt import (
 )
 from scion import (
     ColNormLMO,
-    RowNormLMO,
     Scion,
     ScionC,
+    SignLMO,
     SpectralLMO,
     init_colnorm_,
-    init_rownorm_,
+    init_sign_,
     init_spectral_,
 )
 
@@ -115,7 +115,7 @@ def init_gpt_scion_(model: GPT, args):
         init_spectral_(block.mlp.gate.weight, radius=args.rho_hidden)
         init_spectral_(block.mlp.up.weight, radius=args.rho_hidden)
         init_spectral_(block.mlp.down.weight, radius=args.rho_hidden)
-    init_rownorm_(model.lm_head.weight, radius=args.rho_out)
+    init_sign_(model.lm_head.weight, radius=args.rho_out)
 
 
 def resolve_group_lr(args, group: str) -> tuple[float, float]:
@@ -174,7 +174,7 @@ def build_optimizer(model: GPT, args, device: torch.device):
         SpectralLMO(args.rho_hidden, args.pe_steps, work_dtype=work_dtype),
         args.theta2_hidden,
     )
-    add("out", [model.lm_head.weight], RowNormLMO(args.rho_out), args.theta2_out)
+    add("out", [model.lm_head.weight], SignLMO(args.rho_out), args.theta2_out)
 
     default_lr, _ = resolve_group_lr(args, "hidden")
     opt_cls = Scion if args.optimizer == "scion" else ScionC

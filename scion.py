@@ -9,9 +9,11 @@ __all__ = [
     "ColNormLMO",
     "RowNormLMO",
     "SpectralLMO",
+    "SignLMO",
     "init_colnorm_",
     "init_rownorm_",
     "init_spectral_",
+    "init_sign_",
     "init_semiorthogonal_",
     "scion_transfer_lr",
     "Scion",
@@ -147,6 +149,19 @@ class RowNormLMO:
         return x.mT if self.transpose else x
 
 
+class SignLMO:
+    __slots__ = ("radius", "transpose")
+
+    def __init__(self, radius: float = 10.0, transpose: bool = False):
+        self.radius = radius
+        self.transpose = transpose
+
+    def __call__(self, w: torch.Tensor) -> torch.Tensor:
+        x = w.mT if self.transpose else w
+        x = x.sign().mul_(-self.radius / x.size(1))
+        return x.mT if self.transpose else x
+
+
 class SpectralLMO:
     __slots__ = ("radius", "steps", "eps", "work_dtype", "input_like", "workspace")
 
@@ -201,6 +216,18 @@ def init_rownorm_(
     x.div_(torch.linalg.vector_norm(x, dim=1, keepdim=True).clamp_min_(eps)).mul_(
         radius / math.sqrt(x.size(1))
     )
+    return w
+
+
+@torch.no_grad()
+def init_sign_(
+    w: torch.Tensor,
+    radius: float = 1.0,
+    transpose: bool = False,
+) -> torch.Tensor:
+    x = w.mT if transpose else w
+    x.copy_(torch.randn_like(x).sign_())
+    x.mul_(radius / x.size(1))
     return w
 
 
