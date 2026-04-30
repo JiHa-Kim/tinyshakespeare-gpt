@@ -162,6 +162,7 @@ def build_optimizer(model: GPT, args, device: torch.device):
                 refresh_threshold=args.spi_refresh_threshold,
                 filter_ridge=args.filter_ridge,
                 cov_interval=args.filter_cov_interval,
+                filter_metric=args.filter_metric,
             )
         return StreamingSVDSpectralLMO(
             radius=args.rho_hidden,
@@ -225,10 +226,13 @@ def hidden_svd_filter_lmo(opt):
 def register_hidden_cov_hooks(model: GPT, lmo: HiddenSVDFilterLMO):
     handles = []
 
-    def add_cov(weight, x):
-        flat = x.detach().reshape(-1, x.size(-1)).float()
+    def add_cov_flat(weight, flat):
         cov = flat.mT @ flat
         lmo.add_covariance(weight, cov, flat.size(0))
+
+    def add_cov(weight, x):
+        flat = x.detach().reshape(-1, x.size(-1)).float()
+        add_cov_flat(weight, flat)
 
     def make_linear_hook(weight):
         def hook(_module, inputs):
@@ -348,7 +352,7 @@ def train(args):
     )
     opt = build_optimizer(raw_model, args, device)
     cov_lmo = hidden_svd_filter_lmo(opt)
-    if cov_lmo is not None:
+    if cov_lmo is not None and cov_lmo.filter_metric != "grad-sigma":
         if args.compile:
             print("warning: hidden_lmo=svd-filter uses forward hooks; disabling compile.")
             args.compile = False
@@ -571,7 +575,13 @@ def make_parser():
     p.add_argument("--spi-ridge", type=float, default=1e-3)
     p.add_argument("--filter-ridge", type=float, default=1e-3)
     p.add_argument("--filter-cov-interval", type=int, default=1)
-    p.add_argument("--spi-refresh-interval", type=int, default=25)
+    p.add_argument(
+        "--filter-metric",
+        choices=["full", "grad-sigma"],
+        default="grad-sigma",
+        help="activation metric for svd-filter",
+    )
+    p.add_argument("--spi-refresh-interval", type=int, default=100)
     p.add_argument("--spi-refresh-threshold", type=float, default=0.10)
     p.add_argument("--rho-embed", type=float, default=8.0)
     p.add_argument("--rho-hidden", type=float, default=8.0)

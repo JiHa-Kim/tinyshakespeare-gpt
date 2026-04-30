@@ -51,17 +51,19 @@ The default hidden-matrix LMO is now `--hidden-lmo streaming-svd`, which keeps a
 - ColNorm before Cholesky
 - direct Gram formation from `(M @ V).T @ (M @ V)` for numerical stability rather than `V.T @ (M.T @ M @ V)`
 - one shifted CholeskyQR correction for the final QR
-- RMS-offdiagonal gated QR refresh of the cached basis
+- RMS-offdiagonal gated QR refresh of the cached basis; default check interval is `100`
 - no Householder QR fallback in the per-step hot path
 
 There is also an experimental hidden-only closed-form filter:
 
-- `--hidden-lmo svd-filter`: accumulates the incoming activation covariance for hidden linear layers
-- uses the streaming SVD basis and the hidden denominator `v_i^T A v_i`
+- `--hidden-lmo svd-filter`
+- defaults to `--filter-metric grad-sigma`, a zero-hook proxy using `sigma_i^2` as the denominator metric
+- `--filter-metric full` restores the exact incoming activation covariance for hidden linear layers
 - applies the closed-form diagonal filter under the same activation-perturbation budget as the matrix-sign direction
 - uses `--filter-ridge` as the relative damping in `A = X^T X / b + lambda I`
-- `--filter-cov-interval` can reuse streamed activation covariances for speed; `1` is freshest, `4` is a faster tested tradeoff
-- shares the MLP input covariance between SwiGLU `gate` and `up` and batches denominator evaluation by shape
+- with `full`, `--filter-cov-interval` can reuse streamed activation covariances for speed
+- with `full`, the MLP input covariance is shared between SwiGLU `gate` and `up`
+- recommended faster-quality tradeoff: `--hidden-lmo svd-filter --filter-metric grad-sigma --spi-refresh-interval 100`
 
 Use `--hidden-lmo polar` to restore the previous polynomial polar approximation.
 

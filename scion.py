@@ -196,7 +196,9 @@ def _column_inverse_scale(x: torch.Tensor, eps: float) -> torch.Tensor:
     return norms.reciprocal()
 
 
-def _normalize_columns(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+def _normalize_columns(
+    x: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
     inv_scale = _column_inverse_scale(x, eps)
     return x * inv_scale, inv_scale
 
@@ -343,6 +345,15 @@ class StreamingSVDSpectralLMO:
     ) -> torch.Tensor | None:
         return None
 
+    def _output_scale(
+        self,
+        items: list[tuple],
+        v_batch: torch.Tensor,
+        mv: torch.Tensor,
+        sigma: torch.Tensor,
+    ) -> torch.Tensor | None:
+        return sigma.reciprocal()
+
     def _basis_for(self, p: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
         key = (id(p), tuple(m.shape), m.dtype, m.device)
         v = self.states.get(key)
@@ -350,7 +361,9 @@ class StreamingSVDSpectralLMO:
             v = torch.eye(m.size(-1), dtype=m.dtype, device=m.device)
         return v
 
-    def _store_basis_for(self, p: torch.Tensor, m: torch.Tensor, v: torch.Tensor) -> None:
+    def _store_basis_for(
+        self, p: torch.Tensor, m: torch.Tensor, v: torch.Tensor
+    ) -> None:
         key = (id(p), tuple(m.shape), m.dtype, m.device)
         self.states[key] = v.detach()
 
@@ -389,11 +402,15 @@ class StreamingSVDSpectralLMO:
 
             mv = m_batch @ v_batch
             sigma = torch.linalg.vector_norm(mv, dim=-2).clamp_min(self.eps)
-            u = mv / sigma.unsqueeze(-2)
-            coeff = self._filter_coefficients(items, v_batch, u, sigma)
-            if coeff is not None:
-                u = u * coeff.unsqueeze(-2)
-            y_batch = u @ v_batch.mT
+            mv_scale = self._output_scale(items, v_batch, mv, sigma)
+            if mv_scale is None:
+                u = mv / sigma.unsqueeze(-2)
+                coeff = self._filter_coefficients(items, v_batch, u, sigma)
+                if coeff is not None:
+                    u = u * coeff.unsqueeze(-2)
+                y_batch = u @ v_batch.mT
+            else:
+                y_batch = (mv * mv_scale.unsqueeze(-2)) @ v_batch.mT
 
             for j, (i, x, p, m, transposed, scale) in enumerate(items):
                 v = v_batch[j]
@@ -436,8 +453,7 @@ class StreamingSVDSpectralLMO:
 
         mv = m @ v
         sigma = torch.linalg.vector_norm(mv, dim=0).clamp_min(self.eps)
-        u = mv / sigma.unsqueeze(0)
-        out = u @ v.mT
+        out = (mv * sigma.reciprocal().unsqueeze(0)) @ v.mT
         if transposed:
             out = out.mT
         self.stats["calls"] += 1
@@ -450,20 +466,34 @@ class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
     q(D)=tr(D A D^T), where A is the incoming activation covariance.
     """
 
-    __slots__ = ("cov_accums", "cov_cache", "filter_ridge", "cov_interval")
+    __slots__ = (
+        "cov_accums",
+        "cov_cache",
+        "filter_ridge",
+        "cov_interval",
+        "filter_metric",
+    )
 
     def __init__(
-        self, *args, filter_ridge: float = 1e-3, cov_interval: int = 1, **kwargs
+        self,
+        *args,
+        filter_ridge: float = 1e-3,
+        cov_interval: int = 1,
+        filter_metric: str = "grad-sigma",
+        **kwargs,
     ):
         if filter_ridge < 0.0:
             raise ValueError(f"invalid filter_ridge: {filter_ridge}")
         if cov_interval <= 0:
             raise ValueError(f"invalid cov_interval: {cov_interval}")
+        if filter_metric not in {"full", "grad-sigma"}:
+            raise ValueError(f"invalid filter_metric: {filter_metric}")
         super().__init__(*args, **kwargs)
         self.cov_accums = {}
         self.cov_cache = {}
         self.filter_ridge = filter_ridge
         self.cov_interval = cov_interval
+        self.filter_metric = filter_metric
         self.stats.update({"filtered": 0, "missing_covs": 0, "cov_updates": 0})
 
     def collect_covariance(self) -> bool:
@@ -487,19 +517,46 @@ class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
                 self.stats["cov_updates"] += 1
         return self.cov_cache.get(key)
 
-    def _coeff_batch(
-        self, cov: torch.Tensor, basis: torch.Tensor, sigma: torch.Tensor
+    def _coeff_from_denom(
+        self, denom: torch.Tensor, sigma: torch.Tensor
     ) -> torch.Tensor:
-        cov = cov.to(device=basis.device, dtype=basis.dtype)
-        denom = (cov @ basis).mul(basis).sum(dim=-2).clamp_min(self.eps)
+        denom = denom.clamp_min(self.eps)
         scale = denom.mean(dim=-1, keepdim=True).abs().clamp_min(self.eps)
         denom = denom + self.filter_ridge * scale
 
         raw = torch.nan_to_num(sigma / denom, nan=0.0, posinf=0.0, neginf=0.0)
         budget = denom.sum(dim=-1, keepdim=True).clamp_min(self.eps)
         q_norm = denom.mul(raw.square()).sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        coeff = raw * torch.sqrt(budget / q_norm)
-        return coeff
+        return raw * torch.sqrt(budget / q_norm)
+
+    def _grad_sigma_mv_scale(self, sigma: torch.Tensor) -> torch.Tensor:
+        sigma2 = sigma.square()
+        denom = sigma2.clamp_min(self.eps)
+        scale = denom.mean(dim=-1, keepdim=True).abs().clamp_min(self.eps)
+        denom = denom + self.filter_ridge * scale
+        budget = denom.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        q_norm = sigma2.div(denom).sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        factor = torch.sqrt(budget / q_norm).div(denom)
+        return torch.nan_to_num(factor, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _output_scale(
+        self,
+        items: list[tuple],
+        v_batch: torch.Tensor,
+        mv: torch.Tensor,
+        sigma: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self.filter_metric == "grad-sigma":
+            self.stats["filtered"] += len(items)
+            return self._grad_sigma_mv_scale(sigma)
+        return None
+
+    def _coeff_batch(
+        self, cov: torch.Tensor, basis: torch.Tensor, sigma: torch.Tensor
+    ) -> torch.Tensor:
+        cov = cov.to(device=basis.device, dtype=basis.dtype)
+        denom = (cov @ basis).mul(basis).sum(dim=-2).clamp_min(self.eps)
+        return self._coeff_from_denom(denom, sigma)
 
     def _filter_coefficients(
         self,
@@ -510,6 +567,10 @@ class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
     ) -> torch.Tensor | None:
         coeffs: list[torch.Tensor | None] = [None] * len(items)
         groups: dict[tuple, list[tuple]] = {}
+
+        if self.filter_metric == "grad-sigma":
+            self.stats["filtered"] += len(items)
+            return self._coeff_from_denom(sigma.square(), sigma)
 
         for i, item in enumerate(items):
             basis = u_batch[i] if item[4] else v_batch[i]
