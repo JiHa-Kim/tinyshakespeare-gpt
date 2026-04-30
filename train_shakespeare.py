@@ -370,7 +370,9 @@ def save_eval_checkpoint(
 ):
     if args.save_interval <= 0 or step % args.save_interval != 0:
         return
-    eval_path = path.with_name(f"{path.stem}_step{step:05d}_val{val_loss:.4f}{path.suffix}")
+    eval_path = path.with_name(
+        f"{path.stem}_step{step:05d}_val{val_loss:.4f}{path.suffix}"
+    )
     save_checkpoint(eval_path, model, dataset, args)
 
 
@@ -491,8 +493,7 @@ def train(args):
         f"hidden_lmo={args.hidden_lmo} "
         f"embed_lmo={args.embed_lmo} out_lmo={args.out_lmo} "
         f"qkv=split spi_iteration={args.spi_iteration} "
-        f"lr_groups="
-        + ", ".join(group_schedule)
+        f"lr_groups=" + ", ".join(group_schedule)
     )
 
     total_opt_steps = 0
@@ -629,6 +630,10 @@ def train(args):
 
 @torch.inference_mode()
 def sample(args):
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
@@ -637,13 +642,46 @@ def sample(args):
     bad = [c for c in prompt if c not in stoi]
     if bad:
         raise ValueError(f"prompt contains unseen chars: {bad}")
-    y = model.generate(
-        torch.tensor([[stoi[c] for c in prompt]], dtype=torch.long, device=device),
-        max_new_tokens=args.sample_tokens,
-        temperature=args.temperature,
-        top_k=args.top_k,
-    )
-    print("".join(itos[int(i)] for i in y[0].tolist()))
+    x = torch.tensor([[stoi[c] for c in prompt]], dtype=torch.long, device=device)
+    texts = []
+    for _ in range(args.sample_count):
+        y = model.generate(
+            x,
+            max_new_tokens=args.sample_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+        )
+        texts.append("".join(itos[int(i)] for i in y[0].tolist()))
+
+    if args.sample_out:
+        path = Path(args.sample_out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(sample_report(args, texts), encoding="utf-8")
+        print(f"wrote_samples {path}")
+        return
+
+    for i, text in enumerate(texts, start=1):
+        if len(texts) > 1:
+            print(f"\n--- sample {i} ---\n")
+        print(text)
+
+
+def sample_report(args, texts: list[str]) -> str:
+    lines = [
+        "# Sample Report",
+        "",
+        f"- checkpoint: `{args.out_path}`",
+        f"- seed: `{args.seed}`",
+        f"- prompt: `{args.prompt or r'\\n'}`",
+        f"- sample_tokens: `{args.sample_tokens}`",
+        f"- temperature: `{args.temperature}`",
+        f"- top_k: `{args.top_k}`",
+        f"- sample_count: `{len(texts)}`",
+        "",
+    ]
+    for i, text in enumerate(texts, start=1):
+        lines.extend([f"## Sample {i}", "", "```text", text, "```", ""])
+    return "\n".join(lines)
 
 
 @torch.inference_mode()
@@ -778,6 +816,8 @@ def make_parser():
 
     p.add_argument("--prompt", default="To be, or not to be")
     p.add_argument("--sample-tokens", type=int, default=400)
+    p.add_argument("--sample-count", type=int, default=1)
+    p.add_argument("--sample-out", default="")
     p.add_argument("--temperature", type=float, default=0.9)
     p.add_argument("--top-k", type=int, default=40)
     p.add_argument("--skip-sample", action="store_true")
