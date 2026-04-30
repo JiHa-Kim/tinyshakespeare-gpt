@@ -2,7 +2,7 @@ import argparse
 import math
 import time
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 
 import torch
@@ -20,6 +20,7 @@ from scion import (
     ColNormLMO,
     GramNewtonSchulzLMO,
     HiddenSVDFilterLMO,
+    RowNormLMO,
     Scion,
     ScionC,
     SignLMO,
@@ -28,12 +29,47 @@ from scion import (
     init_sign_,
     init_spectral_,
 )
+from lionk_ccwd import consume_step_stats
 
 
 def sync_now(device: torch.device) -> float:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     return time.perf_counter()
+
+
+def cuda_memory_stats(device: torch.device) -> dict[str, float]:
+    if device.type != "cuda":
+        return {}
+    return {
+        "alloc_gb": torch.cuda.memory_allocated(device) / 1e9,
+        "reserved_gb": torch.cuda.memory_reserved(device) / 1e9,
+        "max_reserved_gb": torch.cuda.max_memory_reserved(device) / 1e9,
+        "total_gb": torch.cuda.get_device_properties(device).total_memory / 1e9,
+    }
+
+
+def cuda_memory_text(device: torch.device) -> str:
+    stats = cuda_memory_stats(device)
+    if not stats:
+        return ""
+    return (
+        f" | cuda_alloc {stats['alloc_gb']:.2f}G"
+        f" | cuda_reserved {stats['reserved_gb']:.2f}G"
+        f" | cuda_max_reserved {stats['max_reserved_gb']:.2f}G"
+    )
+
+
+def step_stats_text(stats: dict[str, dict]) -> str:
+    if not stats:
+        return ""
+    parts = []
+    for name, values in stats.items():
+        rel = values["update_rms"] / max(values["param_rms"], 1e-12)
+        parts.append(
+            f"{name}:cos={values['cos']:.3f},u/p={rel:.2e},g={values['grad_rms']:.2e}"
+        )
+    return " | step_stats " + "; ".join(parts)
 
 
 def amp_ctx(amp_dtype: torch.dtype | None):
@@ -78,6 +114,8 @@ def lr_at_step(
 
     progress = (step - decay_start) / (decay_steps - 1)
     progress = min(max(progress, 0.0), 1.0)
+    if lr > 0.0 and min_lr > 0.0:
+        return 1.0 / ((1.0 - progress) / lr + progress / min_lr)
     return lr + (min_lr - lr) * progress
 
 
@@ -114,7 +152,9 @@ def estimate_val_loss(
 def init_gpt_scion_(model: GPT, args):
     init_colnorm_(model.tok_emb.weight, radius=args.rho_embed, transpose=True)
     for block in model.blocks:
-        init_spectral_(block.attn.qkv.weight, radius=args.rho_hidden)
+        init_spectral_(block.attn.q.weight, radius=args.rho_hidden)
+        init_spectral_(block.attn.k.weight, radius=args.rho_hidden)
+        init_spectral_(block.attn.v.weight, radius=args.rho_hidden)
         init_spectral_(block.attn.proj.weight, radius=args.rho_hidden)
         init_spectral_(block.mlp.gate.weight, radius=args.rho_hidden)
         init_spectral_(block.mlp.up.weight, radius=args.rho_hidden)
@@ -129,6 +169,8 @@ def resolve_group_lr(args, group: str) -> tuple[float, float]:
     min_lr = getattr(args, f"min_lr_{group}", None)
     if min_lr is None:
         min_lr = args.min_lr
+    if min_lr is None:
+        min_lr = 0.1 * peak
     return peak, min_lr
 
 
@@ -162,8 +204,8 @@ def build_optimizer(model: GPT, args, device: torch.device):
                 ridge=args.spi_ridge,
                 refresh_interval=args.spi_refresh_interval,
                 refresh_threshold=args.spi_refresh_threshold,
+                iteration=args.spi_iteration,
                 filter_ridge=args.filter_ridge,
-                cov_interval=args.filter_cov_interval,
                 filter_metric=args.filter_metric,
             )
         return StreamingSVDSpectralLMO(
@@ -172,7 +214,22 @@ def build_optimizer(model: GPT, args, device: torch.device):
             ridge=args.spi_ridge,
             refresh_interval=args.spi_refresh_interval,
             refresh_threshold=args.spi_refresh_threshold,
+            iteration=args.spi_iteration,
         )
+
+    def embed_lmo():
+        if args.embed_lmo == "sign":
+            return SignLMO(args.rho_embed)
+        if args.embed_lmo == "rownorm":
+            return RowNormLMO(args.rho_embed)
+        return ColNormLMO(args.rho_embed, transpose=True)
+
+    def out_lmo():
+        if args.out_lmo == "colnorm":
+            return ColNormLMO(args.rho_out, transpose=True)
+        if args.out_lmo == "rownorm":
+            return RowNormLMO(args.rho_out)
+        return SignLMO(args.rho_out)
 
     def add(name, params, dir_fn, theta2=None):
         if not params:
@@ -185,6 +242,7 @@ def build_optimizer(model: GPT, args, device: torch.device):
             "lr": peak_lr,
             "peak_lr": peak_lr,
             "min_lr": min_lr,
+            "track_stats": args.track_step_stats,
         }
         if args.optimizer == "scionc" and theta2 is not None:
             group["theta2"] = theta2
@@ -193,7 +251,7 @@ def build_optimizer(model: GPT, args, device: torch.device):
     add(
         "embed",
         [model.tok_emb.weight],
-        ColNormLMO(args.rho_embed, transpose=True),
+        embed_lmo(),
         args.theta2_embed,
     )
     add(
@@ -202,7 +260,7 @@ def build_optimizer(model: GPT, args, device: torch.device):
         hidden_lmo(),
         args.theta2_hidden,
     )
-    add("out", [model.lm_head.weight], SignLMO(args.rho_out), args.theta2_out)
+    add("out", [model.lm_head.weight], out_lmo(), args.theta2_out)
 
     default_lr, _ = resolve_group_lr(args, "hidden")
     opt_cls = Scion if args.optimizer == "scion" else ScionC
@@ -217,24 +275,23 @@ def build_optimizer(model: GPT, args, device: torch.device):
     )
 
 
-def hidden_svd_filter_lmo(opt):
+def group_lmo(opt, name: str, cls):
     for group in opt.param_groups:
-        dir_fn = group.get("dir_fn")
-        if isinstance(dir_fn, HiddenSVDFilterLMO):
-            return dir_fn
+        if group.get("name") == name and isinstance(group.get("dir_fn"), cls):
+            return group["dir_fn"]
     return None
+
+
+def hidden_svd_filter_lmo(opt):
+    return group_lmo(opt, "hidden", HiddenSVDFilterLMO)
 
 
 def register_hidden_cov_hooks(model: GPT, lmo: HiddenSVDFilterLMO):
     handles = []
 
-    def add_cov_flat(weight, flat):
-        cov = flat.mT @ flat
-        lmo.add_covariance(weight, cov, flat.size(0))
-
-    def add_cov(weight, x):
-        flat = x.detach().reshape(-1, x.size(-1)).float()
-        add_cov_flat(weight, flat)
+    def covariance(x):
+        flat = x.detach().reshape(-1, x.size(-1))
+        return (flat.mT @ flat).float(), flat.size(0)
 
     def make_linear_hook(weight):
         def hook(_module, inputs):
@@ -242,7 +299,8 @@ def register_hidden_cov_hooks(model: GPT, lmo: HiddenSVDFilterLMO):
                 return
             if not lmo.collect_covariance():
                 return
-            add_cov(weight, inputs[0])
+            cov, count = covariance(inputs[0])
+            lmo.add_covariance(weight, cov, count)
 
         return hook
 
@@ -252,21 +310,40 @@ def register_hidden_cov_hooks(model: GPT, lmo: HiddenSVDFilterLMO):
                 return
             if not lmo.collect_covariance():
                 return
-            x = inputs[0].detach()
-            flat = x.reshape(-1, x.size(-1)).float()
-            cov = flat.mT @ flat
-            lmo.add_covariance(module.gate.weight, cov, flat.size(0))
-            lmo.add_covariance(module.up.weight, cov.clone(), flat.size(0))
+            cov, count = covariance(inputs[0])
+            lmo.add_covariance(module.gate.weight, cov, count)
+            lmo.add_covariance(module.up.weight, cov, count)
+
+        return hook
+
+    def make_qkv_hook(module: CausalSelfAttention):
+        def hook(_module, inputs):
+            if not _module.training or not torch.is_grad_enabled():
+                return
+            if not lmo.collect_covariance():
+                return
+            cov, count = covariance(inputs[0])
+            lmo.add_covariance(module.q.weight, cov, count)
+            lmo.add_covariance(module.k.weight, cov, count)
+            lmo.add_covariance(module.v.weight, cov, count)
 
         return hook
 
     for module in model.modules():
         if isinstance(module, CausalSelfAttention):
-            handles.append(module.qkv.register_forward_pre_hook(make_linear_hook(module.qkv.weight)))
-            handles.append(module.proj.register_forward_pre_hook(make_linear_hook(module.proj.weight)))
+            handles.append(module.register_forward_pre_hook(make_qkv_hook(module)))
+            handles.append(
+                module.proj.register_forward_pre_hook(
+                    make_linear_hook(module.proj.weight)
+                )
+            )
         elif isinstance(module, MLP):
             handles.append(module.register_forward_pre_hook(make_mlp_hook(module)))
-            handles.append(module.down.register_forward_pre_hook(make_linear_hook(module.down.weight)))
+            handles.append(
+                module.down.register_forward_pre_hook(
+                    make_linear_hook(module.down.weight)
+                )
+            )
     return handles
 
 
@@ -283,12 +360,33 @@ def save_checkpoint(path: Path, model: GPT, dataset: CharDataset, args):
     )
 
 
+def save_eval_checkpoint(
+    path: Path,
+    step: int,
+    val_loss: float,
+    model: GPT,
+    dataset: CharDataset,
+    args,
+):
+    if args.save_interval <= 0 or step % args.save_interval != 0:
+        return
+    eval_path = path.with_name(f"{path.stem}_step{step:05d}_val{val_loss:.4f}{path.suffix}")
+    save_checkpoint(eval_path, model, dataset, args)
+
+
+def save_final_checkpoint(path: Path, model: GPT, dataset: CharDataset, args):
+    final_path = path.with_name(f"{path.stem}_final{path.suffix}")
+    save_checkpoint(final_path, model, dataset, args)
+
+
 def load_checkpoint(path: Path, device: torch.device):
     ckpt = torch.load(path, map_location=device)
     chars = ckpt["chars"]
     stoi = {ch: i for i, ch in enumerate(chars)}
     itos = {i: ch for i, ch in enumerate(chars)}
-    model = GPT(GPTConfig(**ckpt["model_cfg"])).to(device)
+    cfg_keys = {field.name for field in fields(GPTConfig)}
+    cfg = {k: v for k, v in ckpt["model_cfg"].items() if k in cfg_keys}
+    model = GPT(GPTConfig(**cfg)).to(device)
     model.load_state_dict(ckpt["model"])
     return model, stoi, itos
 
@@ -326,6 +424,8 @@ def train(args):
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     amp_dtype = (
         torch.bfloat16
         if device.type == "cuda" and torch.cuda.is_bf16_supported()
@@ -345,6 +445,7 @@ def train(args):
             d_model=args.d_model,
             rope_base=args.rope_base,
             prenorm=args.prenorm,
+            dropout=args.dropout,
         )
     ).to(device)
     init_gpt_scion_(raw_model, args)
@@ -355,11 +456,10 @@ def train(args):
     opt = build_optimizer(raw_model, args, device)
     cov_lmo = hidden_svd_filter_lmo(opt)
     if cov_lmo is not None and cov_lmo.filter_metric != "grad-sigma":
-        if args.compile:
-            print("warning: hidden_lmo=svd-filter uses forward hooks; disabling compile.")
-            args.compile = False
         register_hidden_cov_hooks(raw_model, cov_lmo)
     model, compile_seconds = maybe_compile(raw_model, source, args, amp_dtype, device)
+    if cov_lmo is not None:
+        cov_lmo.cov_accums.clear()
     if compile_seconds:
         print(f"compile_seconds {compile_seconds:.3f}")
 
@@ -368,7 +468,11 @@ def train(args):
         if args.warmup_iters >= 0
         else round(args.warmup_frac * args.max_iters)
     )
-    decay_steps = round(args.decay_frac * args.max_iters)
+    decay_steps = (
+        args.decay_iters
+        if args.decay_iters >= 0
+        else round(args.decay_frac * args.max_iters)
+    )
     warmup_steps, stable_steps, decay_steps = resolve_schedule(
         args.max_iters, warmup_steps, decay_steps
     )
@@ -383,7 +487,10 @@ def train(args):
     print(
         "schedule "
         f"warmup_steps={warmup_steps} stable_steps={stable_steps} decay_steps={decay_steps} "
-        f"optimizer={args.optimizer} prenorm={args.prenorm} hidden_lmo={args.hidden_lmo} "
+        f"optimizer={args.optimizer} prenorm={args.prenorm} dropout={args.dropout:.3f} "
+        f"hidden_lmo={args.hidden_lmo} "
+        f"embed_lmo={args.embed_lmo} out_lmo={args.out_lmo} "
+        f"qkv=split spi_iteration={args.spi_iteration} "
         f"lr_groups="
         + ", ".join(group_schedule)
     )
@@ -413,6 +520,7 @@ def train(args):
             train_loss = last_losses["train"]
             val_loss = estimate_val_loss(model, source, args.eval_iters, amp_dtype)
             last_losses["val"] = val_loss
+            opt_stats = consume_step_stats(opt) if args.track_step_stats else {}
 
             if not math.isfinite(val_loss):
                 diverged, diverge_reason = True, "nonfinite_eval_loss"
@@ -427,16 +535,37 @@ def train(args):
                     diverge_reason = (
                         f"val_loss_exceeded_{args.diverge_mult:.2f}x_initial"
                     )
-                if not args.no_save and (
-                    val_loss < prev_best or step == args.max_iters - 1
-                ):
+                if not args.no_save and val_loss < prev_best:
                     save_checkpoint(Path(args.out_path), raw_model, dataset, args)
+                if not args.no_save:
+                    save_eval_checkpoint(
+                        Path(args.out_path), step, val_loss, raw_model, dataset, args
+                    )
+                    if step == args.max_iters - 1:
+                        save_final_checkpoint(
+                            Path(args.out_path), raw_model, dataset, args
+                        )
 
             elapsed = max(sync_now(device) - train_start, 1e-9)
+            mem_text = cuda_memory_text(device)
+            opt_text = step_stats_text(opt_stats)
             print(
                 f"step {step:5d} | lr {lr:.3e} | train {train_loss:.4f} | val {val_loss:.4f} | "
-                f"best_val {best_val:.4f} | train_seconds {elapsed:.3f} | tok/s {(total_opt_steps * effective_tokens) / elapsed:.0f}"
+                f"best_val {best_val:.4f} | train_seconds {elapsed:.3f} | "
+                f"tok/s {(total_opt_steps * effective_tokens) / elapsed:.0f}"
+                f"{mem_text}{opt_text}"
             )
+            memory = cuda_memory_stats(device)
+            if (
+                args.max_cuda_reserved_gb > 0
+                and memory
+                and memory["reserved_gb"] > args.max_cuda_reserved_gb
+            ):
+                diverged = True
+                diverge_reason = (
+                    f"cuda_reserved_{memory['reserved_gb']:.2f}G_exceeded_"
+                    f"{args.max_cuda_reserved_gb:.2f}G"
+                )
             if diverged:
                 print(f"diverged {diverge_reason}")
                 break
@@ -517,9 +646,41 @@ def sample(args):
     print("".join(itos[int(i)] for i in y[0].tolist()))
 
 
+@torch.inference_mode()
+def evaluate(args):
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    device = torch.device(
+        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    amp_dtype = (
+        torch.bfloat16
+        if device.type == "cuda" and torch.cuda.is_bf16_supported()
+        else None
+    )
+
+    data_path = Path(args.data_path)
+    maybe_download_tiny_shakespeare(data_path)
+    dataset = CharDataset(data_path)
+    model, _, _ = load_checkpoint(Path(args.out_path), device)
+    source = BatchSource(
+        dataset.train, dataset.val, model.cfg.block_size, args.batch_size, device
+    )
+    losses = estimate_loss(model, source, args.eval_iters, amp_dtype)
+    print(
+        f"eval_iters {args.eval_iters} | batch_size {args.batch_size} | "
+        f"train {losses['train']:.4f} | val {losses['val']:.4f}"
+        f"{cuda_memory_text(device)}"
+    )
+
+
 def make_parser():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["train", "sample"], default="train")
+    p.add_argument("--mode", choices=["train", "sample", "eval"], default="train")
     p.add_argument("--data-path", default="data/tiny_shakespeare.txt")
     p.add_argument("--out-path", default="out/scion_shakespeare.pt")
     p.add_argument("--device", default="")
@@ -534,25 +695,34 @@ def make_parser():
     p.add_argument("--d-model", type=int, default=384)
     p.add_argument("--rope-base", type=float, default=10000.0)
     p.add_argument("--prenorm", choices=["rmsnorm", "rmsball"], default="rmsnorm")
+    p.add_argument("--dropout", type=float, default=0.10)
 
-    p.add_argument("--max-iters", type=int, default=3000)
-    p.add_argument("--eval-interval", type=int, default=200)
+    p.add_argument("--max-iters", type=int, default=2000)
+    p.add_argument("--eval-interval", type=int, default=100)
     p.add_argument("--eval-iters", type=int, default=50)
     p.add_argument("--grad-clip", type=float, default=0.0)
     p.add_argument("--diverge-mult", type=float, default=2.0)
 
     p.add_argument(
-        "--warmup-iters", type=int, default=-1, help="if >=0, overrides warmup-frac"
+        "--warmup-iters", type=int, default=100, help="if >=0, overrides warmup-frac"
     )
     p.add_argument("--warmup-frac", type=float, default=0.0)
-    p.add_argument("--decay-frac", type=float, default=0.285)
+    p.add_argument(
+        "--decay-iters", type=int, default=-1, help="if >=0, overrides decay-frac"
+    )
+    p.add_argument("--decay-frac", type=float, default=0.10)
 
     p.add_argument("--optimizer", choices=["scion", "scionc"], default="scion")
-    p.add_argument("--lr", type=float, default=1e-2)
+    p.add_argument("--lr", type=float, default=4e-3)
     p.add_argument("--lr-embed", dest="lr_embed", type=float, default=None)
     p.add_argument("--lr-hidden", dest="lr_hidden", type=float, default=None)
     p.add_argument("--lr-out", "--lr-unembed", dest="lr_out", type=float, default=None)
-    p.add_argument("--min-lr", type=float, default=0.0)
+    p.add_argument(
+        "--min-lr",
+        type=float,
+        default=None,
+        help="decay floor; defaults to 10%% of each group's peak LR",
+    )
     p.add_argument("--min-lr-embed", dest="min_lr_embed", type=float, default=None)
     p.add_argument("--min-lr-hidden", dest="min_lr_hidden", type=float, default=None)
     p.add_argument(
@@ -569,25 +739,42 @@ def make_parser():
     p.add_argument(
         "--hidden-lmo",
         choices=["streaming-svd", "svd-filter", "gram-ns"],
-        default="streaming-svd",
+        default="svd-filter",
         help="hidden-matrix LMO; gram-ns is the baseline",
+    )
+    p.add_argument(
+        "--embed-lmo",
+        choices=["colnorm", "sign", "rownorm"],
+        default="sign",
+        help="embedding-table LMO",
+    )
+    p.add_argument(
+        "--out-lmo",
+        choices=["sign", "colnorm", "rownorm"],
+        default="sign",
+        help="output-head LMO",
     )
     p.add_argument("--pe-steps", type=int, default=5, help="Gram-NS coefficient steps")
     p.add_argument("--spi-steps", type=int, default=1)
     p.add_argument("--spi-ridge", type=float, default=1e-3)
+    p.add_argument(
+        "--spi-iteration",
+        choices=["scqr2", "norm-power"],
+        default="norm-power",
+        help="streaming-SVD subspace iteration path",
+    )
     p.add_argument("--filter-ridge", type=float, default=1e-3)
-    p.add_argument("--filter-cov-interval", type=int, default=1)
     p.add_argument(
         "--filter-metric",
         choices=["full", "grad-sigma"],
-        default="grad-sigma",
+        default="full",
         help="activation metric for svd-filter",
     )
     p.add_argument("--spi-refresh-interval", type=int, default=100)
     p.add_argument("--spi-refresh-threshold", type=float, default=0.10)
-    p.add_argument("--rho-embed", type=float, default=8.0)
-    p.add_argument("--rho-hidden", type=float, default=8.0)
-    p.add_argument("--rho-out", type=float, default=8.0)
+    p.add_argument("--rho-embed", type=float, default=1.0)
+    p.add_argument("--rho-hidden", type=float, default=3.0)
+    p.add_argument("--rho-out", type=float, default=10.0)
 
     p.add_argument("--prompt", default="To be, or not to be")
     p.add_argument("--sample-tokens", type=int, default=400)
@@ -595,12 +782,34 @@ def make_parser():
     p.add_argument("--top-k", type=int, default=40)
     p.add_argument("--skip-sample", action="store_true")
     p.add_argument("--no-save", action="store_true")
+    p.add_argument(
+        "--save-interval",
+        type=int,
+        default=400,
+        help="save eval checkpoints every N steps in addition to best/final",
+    )
+    p.add_argument(
+        "--max-cuda-reserved-gb",
+        type=float,
+        default=0.0,
+        help="abort if process CUDA reserved memory exceeds this limit",
+    )
+    p.add_argument(
+        "--track-step-stats",
+        action="store_true",
+        help="accumulate optimizer group stats and print them on eval lines",
+    )
     return p
 
 
 def main():
     args = make_parser().parse_args()
-    train(args) if args.mode == "train" else sample(args)
+    if args.mode == "train":
+        train(args)
+    elif args.mode == "sample":
+        sample(args)
+    else:
+        evaluate(args)
 
 
 if __name__ == "__main__":

@@ -58,23 +58,32 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
 class CausalSelfAttention(nn.Module):
     def __init__(
-        self, d_model: int, n_head: int, block_size: int, rope_base: float = 10000.0
+        self,
+        d_model: int,
+        n_head: int,
+        block_size: int,
+        rope_base: float = 10000.0,
+        dropout: float = 0.0,
     ):
         super().__init__()
         if d_model % n_head:
             raise ValueError("d_model must be divisible by n_head")
         self.n_head = n_head
         self.head_dim = d_model // n_head
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.q = nn.Linear(d_model, d_model, bias=False)
+        self.k = nn.Linear(d_model, d_model, bias=False)
+        self.v = nn.Linear(d_model, d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
         cos, sin = rotary_cache(block_size, self.head_dim, rope_base)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seqlen, d_model = x.shape
-        qkv = self.qkv(x).view(bsz, seqlen, 3, self.n_head, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
+        q = self.q(x).view(bsz, seqlen, self.n_head, self.head_dim)
+        k = self.k(x).view(bsz, seqlen, self.n_head, self.head_dim)
+        v = self.v(x).view(bsz, seqlen, self.n_head, self.head_dim)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -84,18 +93,20 @@ class CausalSelfAttention(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        return self.proj(y.transpose(1, 2).contiguous().view(bsz, seqlen, d_model))
+        y = self.proj(y.transpose(1, 2).contiguous().view(bsz, seqlen, d_model))
+        return self.dropout(y)
 
 
 class MLP(nn.Module):
-    def __init__(self, d_model: int, hidden_dim: int):
+    def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
         self.gate = nn.Linear(d_model, hidden_dim, bias=False)
         self.up = nn.Linear(d_model, hidden_dim, bias=False)
         self.down = nn.Linear(hidden_dim, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+        return self.dropout(self.down(F.silu(self.gate(x)) * self.up(x)))
 
 
 class Block(nn.Module):
@@ -107,12 +118,15 @@ class Block(nn.Module):
         block_size: int,
         prenorm: str = "rmsnorm",
         rope_base: float = 10000.0,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.norm1 = Norm(prenorm)
-        self.attn = CausalSelfAttention(d_model, n_head, block_size, rope_base)
+        self.attn = CausalSelfAttention(
+            d_model, n_head, block_size, rope_base, dropout
+        )
         self.norm2 = Norm(prenorm)
-        self.mlp = MLP(d_model, hidden_dim)
+        self.mlp = MLP(d_model, hidden_dim, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
@@ -128,6 +142,7 @@ class GPTConfig:
     d_model: int = 384
     rope_base: float = 10000.0
     prenorm: str = "rmsnorm"
+    dropout: float = 0.0
 
     @property
     def hidden_dim(self) -> int:
@@ -148,6 +163,7 @@ class GPT(nn.Module):
                     cfg.block_size,
                     cfg.prenorm,
                     cfg.rope_base,
+                    cfg.dropout,
                 )
                 for _ in range(cfg.n_layer)
             ]

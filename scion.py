@@ -306,6 +306,7 @@ class StreamingSVDSpectralLMO:
         "ridge",
         "refresh_interval",
         "refresh_threshold",
+        "iteration",
         "eps",
         "work_dtype",
         "input_like",
@@ -321,6 +322,7 @@ class StreamingSVDSpectralLMO:
         ridge: float = 1e-3,
         refresh_interval: int = 25,
         refresh_threshold: float = 0.10,
+        iteration: str = "scqr2",
         eps: float = 1e-12,
         work_dtype: torch.dtype | None = torch.float32,
         input_like: bool = False,
@@ -333,12 +335,15 @@ class StreamingSVDSpectralLMO:
             raise ValueError(f"invalid refresh_interval: {refresh_interval}")
         if refresh_threshold < 0.0:
             raise ValueError(f"invalid refresh_threshold: {refresh_threshold}")
+        if iteration not in {"scqr2", "norm-power"}:
+            raise ValueError(f"invalid iteration: {iteration}")
 
         self.radius = radius
         self.steps = steps
         self.ridge = ridge
         self.refresh_interval = refresh_interval
         self.refresh_threshold = refresh_threshold
+        self.iteration = iteration
         self.eps = eps
         self.work_dtype = work_dtype
         self.input_like = input_like
@@ -369,6 +374,8 @@ class StreamingSVDSpectralLMO:
         )
 
     def _cholesky_fast(self, gram: torch.Tensor, ridge: float) -> torch.Tensor:
+        if gram.dtype not in {torch.float32, torch.float64}:
+            gram = gram.float()
         scale = self._ridge_scale(gram)
         shifted = (gram + gram.mT).mul(0.5)
         diag = shifted.diagonal(dim1=-2, dim2=-1)
@@ -380,6 +387,8 @@ class StreamingSVDSpectralLMO:
         return r
 
     def _solve_right(self, x: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+        if x.dtype != r.dtype:
+            x = x.to(r.dtype)
         return torch.linalg.solve_triangular(r, x, upper=True, left=False)
 
     def _scqr_once_fast(self, x: torch.Tensor, ridge: float) -> torch.Tensor:
@@ -417,12 +426,41 @@ class StreamingSVDSpectralLMO:
         b = self._solve_right(a_scaled, r1)
         if exact_qr:
             self.stats["refreshes"] += b.shape[0] if b.ndim == 3 else 1
-            return torch.linalg.qr(b, mode="reduced").Q
-        return self._qr(b)
+            return torch.linalg.qr(b.float(), mode="reduced").Q.to(dtype=v.dtype)
+        return self._qr(b.to(dtype=v.dtype)).to(dtype=v.dtype)
+
+    def _v_step_norm_power(
+        self, m: torch.Tensor, v: torch.Tensor, check_refresh: bool = False
+    ) -> torch.Tensor:
+        mv = m @ v
+        mv_scaled, inv_scale = _normalize_columns(mv, self.eps)
+        b = (m.mT @ mv) * inv_scale
+
+        exact_qr = False
+        if check_refresh:
+            if self.refresh_threshold == 0.0:
+                exact_qr = True
+            else:
+                quality = mv_scaled.mT @ mv_scaled
+                n = quality.size(-1)
+                offdiag_sq = quality.square().sum(dim=(-2, -1))
+                offdiag_sq = offdiag_sq - quality.diagonal(
+                    dim1=-2, dim2=-1
+                ).square().sum(dim=-1)
+                rms = torch.sqrt(offdiag_sq.clamp_min_(0.0) / max(n * (n - 1), 1))
+                self.stats["quality_checks"] += int(rms.numel())
+                exact_qr = bool((rms > self.refresh_threshold).any())
+
+        if exact_qr:
+            self.stats["refreshes"] += b.shape[0] if b.ndim == 3 else 1
+            return torch.linalg.qr(b.float(), mode="reduced").Q.to(dtype=v.dtype)
+        return self._qr(b.to(dtype=v.dtype)).to(dtype=v.dtype)
 
     def _v_step(
         self, m: torch.Tensor, v: torch.Tensor, check_refresh: bool = False
     ) -> torch.Tensor:
+        if self.iteration == "norm-power":
+            return self._v_step_norm_power(m, v, check_refresh)
         return self._v_step_scqr2(m, v, check_refresh)
 
     def _filter_coefficients(
@@ -557,7 +595,6 @@ class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
         "cov_accums",
         "cov_cache",
         "filter_ridge",
-        "cov_interval",
         "filter_metric",
     )
 
@@ -565,33 +602,29 @@ class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
         self,
         *args,
         filter_ridge: float = 1e-3,
-        cov_interval: int = 1,
         filter_metric: str = "grad-sigma",
         **kwargs,
     ):
         if filter_ridge < 0.0:
             raise ValueError(f"invalid filter_ridge: {filter_ridge}")
-        if cov_interval <= 0:
-            raise ValueError(f"invalid cov_interval: {cov_interval}")
         if filter_metric not in {"full", "grad-sigma"}:
             raise ValueError(f"invalid filter_metric: {filter_metric}")
         super().__init__(*args, **kwargs)
         self.cov_accums = {}
         self.cov_cache = {}
         self.filter_ridge = filter_ridge
-        self.cov_interval = cov_interval
         self.filter_metric = filter_metric
         self.stats.update({"filtered": 0, "missing_covs": 0, "cov_updates": 0})
 
     def collect_covariance(self) -> bool:
-        return self.stats["steps"] % self.cov_interval == 0
+        return True
 
     def add_covariance(self, p: torch.Tensor, cov: torch.Tensor, count: int) -> None:
         state = self.cov_accums.get(id(p))
         if state is None:
             self.cov_accums[id(p)] = [cov, count]
         else:
-            state[0].add_(cov)
+            state[0] = state[0] + cov
             state[1] += count
 
     def _cov_for(self, p: torch.Tensor) -> torch.Tensor | None:

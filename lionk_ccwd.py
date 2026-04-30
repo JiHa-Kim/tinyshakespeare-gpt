@@ -1,7 +1,13 @@
 import torch
 from torch.optim import Optimizer
 
-__all__ = ["sign_", "lionk_S", "corrected_eta", "LionKCCWDPA"]
+__all__ = [
+    "sign_",
+    "lionk_S",
+    "corrected_eta",
+    "consume_step_stats",
+    "LionKCCWDPA",
+]
 
 
 def sign_(x: torch.Tensor) -> torch.Tensor:
@@ -24,6 +30,53 @@ def corrected_eta(
     eps: float = 1e-12,
 ) -> float:
     return (lr * lr * cu2 * S) / (2.0 * max(q, eps) * max(theta2, eps))
+
+
+def _stat_add(stats: dict, name: str, value: torch.Tensor) -> None:
+    value = value.detach()
+    current = stats.get(name)
+    stats[name] = value if current is None else current + value
+
+
+def _accumulate_step_stats(group: dict, entries, updates) -> None:
+    if not group.get("track_stats"):
+        return
+    stats = group.setdefault("_step_stats", {"steps": 0, "params": 0, "numel": 0})
+    stats["steps"] += 1
+    stats["params"] += len(entries)
+
+    for (p, g, _, _), u in zip(entries, updates, strict=True):
+        stats["numel"] += p.numel()
+        g32 = g.float()
+        u32 = u.float()
+        p32 = p.float()
+        _stat_add(stats, "grad_sq", g32.square().sum())
+        _stat_add(stats, "update_sq", u32.square().sum())
+        _stat_add(stats, "param_sq", p32.square().sum())
+        _stat_add(stats, "descent", -(g32 * u32).sum())
+
+
+def consume_step_stats(optimizer: Optimizer, eps: float = 1e-12) -> dict[str, dict]:
+    out = {}
+    for group in optimizer.param_groups:
+        stats = group.pop("_step_stats", None)
+        if not stats:
+            continue
+        grad_sq = float(stats.get("grad_sq", 0.0))
+        update_sq = float(stats.get("update_sq", 0.0))
+        param_sq = float(stats.get("param_sq", 0.0))
+        descent = float(stats.get("descent", 0.0))
+        numel = max(int(stats["numel"]), 1)
+        out[group.get("name", "group")] = {
+            "steps": int(stats["steps"]),
+            "params": int(stats["params"]),
+            "grad_rms": (grad_sq / numel) ** 0.5,
+            "update_rms": (update_sq / numel) ** 0.5,
+            "param_rms": (param_sq / numel) ** 0.5,
+            "descent": descent,
+            "cos": descent / ((grad_sq * update_sq) ** 0.5 + eps),
+        }
+    return out
 
 
 class LionKCCWDPA(Optimizer):
@@ -78,6 +131,7 @@ class LionKCCWDPA(Optimizer):
                 nesterov=nesterov,
                 eps=eps,
                 _pa_denom=0.0,
+                track_stats=False,
             ),
         )
 
@@ -177,6 +231,8 @@ class LionKCCWDPA(Optimizer):
                     [g for _, g, _, _ in entries],
                     [p for p, _, _, _ in entries],
                 )
+
+            _accumulate_step_stats(group, entries, updates)
 
             for (p, _, z, state), u in zip(entries, updates, strict=True):
 
