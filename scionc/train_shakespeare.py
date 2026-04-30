@@ -871,14 +871,14 @@ def make_parser():
     )
     p.add_argument("--decay-frac", type=float, default=0.10)
 
-    p.add_argument("--lr", type=float, default=4e-3)
+    p.add_argument("--lr", type=float, default=3.5e-2)
     p.add_argument("--lr-embed", dest="lr_embed", type=float, default=None)
     p.add_argument("--lr-hidden", dest="lr_hidden", type=float, default=None)
     p.add_argument("--lr-out", "--lr-unembed", dest="lr_out", type=float, default=None)
     p.add_argument(
         "--min-lr",
         type=float,
-        default=1e-4,
+        default=0.0,
         help="decay floor",
     )
     p.add_argument("--min-lr-embed", dest="min_lr_embed", type=float, default=None)

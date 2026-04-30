@@ -44,6 +44,8 @@ Current defaults:
 - batch size: 64
 - gradient accumulation: 1
 - block size: 256
+- peak LR: 0.035
+- decay floor: 0
 - WSD schedule: 100 warmup steps, stable phase, 10% decay by default
 
 The general Lion-K core still supports cautious weight decay. It is out of scope
@@ -83,7 +85,7 @@ python -m scionc.train_shakespeare \
   --prenorm rmsnorm \
   --batch-size 64 --grad-accum 1 --block-size 256 \
   --n-layer 6 --n-head 6 --d-model 384 \
-  --lr 4e-3 --min-lr 1e-4 \
+  --lr 3.5e-2 --min-lr 0 \
   --warmup-iters 100 --decay-frac 0.10 \
   --beta2 0.95 \
   --hidden-lmo gram-ns \
