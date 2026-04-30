@@ -79,9 +79,17 @@ def step_stats_text(stats: dict[str, dict]) -> str:
         return ""
     parts = []
     for name, values in stats.items():
-        rel = values["update_rms"] / max(values["param_rms"], 1e-12)
         parts.append(
-            f"{name}:cos={values['cos']:.3f},u/p={rel:.2e},g={values['grad_rms']:.2e}"
+            f"{name}:cos={values['cos']:.3f},"
+            f"u/p={values['update_param_rms']:.2e},"
+            f"u/g={values['update_grad_rms']:.2e},"
+            f"g/p={values['grad_param_rms']:.2e},"
+            f"xg={values['param_grad_cos']:.3f},"
+            f"xu={values['param_update_cos']:.3f},"
+            f"ga/r={values['grad_abs_rms']:.3f},"
+            f"ua/r={values['update_abs_rms']:.3f},"
+            f"gk={values['grad_kurtosis']:.2e},"
+            f"uk={values['update_kurtosis']:.2e}"
         )
     return " | step_stats " + "; ".join(parts)
 
@@ -788,12 +796,13 @@ def sample(args):
 
 
 def sample_report(args, texts: list[str]) -> str:
+    prompt = args.prompt or "\\n"
     lines = [
         "# Sample Report",
         "",
         f"- checkpoint: `{args.out_path}`",
         f"- seed: `{args.seed}`",
-        f"- prompt: `{args.prompt or r'\\n'}`",
+        f"- prompt: `{prompt}`",
         f"- sample_tokens: `{args.sample_tokens}`",
         f"- temperature: `{args.temperature}`",
         f"- top_k: `{args.top_k}`",
@@ -869,7 +878,7 @@ def make_parser():
     p.add_argument(
         "--decay-iters", type=int, default=-1, help="if >=0, overrides decay-frac"
     )
-    p.add_argument("--decay-frac", type=float, default=0.10)
+    p.add_argument("--decay-frac", type=float, default=0.15)
 
     p.add_argument("--lr", type=float, default=3.5e-2)
     p.add_argument("--lr-embed", dest="lr_embed", type=float, default=None)
@@ -886,7 +895,7 @@ def make_parser():
     p.add_argument(
         "--min-lr-out", "--min-lr-unembed", dest="min_lr_out", type=float, default=None
     )
-    p.add_argument("--beta2", type=float, default=0.95)
+    p.add_argument("--beta2", type=float, default=0.93)
     p.add_argument("--nesterov", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
         "--hidden-lmo",

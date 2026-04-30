@@ -46,7 +46,8 @@ Current defaults:
 - block size: 256
 - peak LR: 0.035
 - decay floor: 0
-- WSD schedule: 100 warmup steps, stable phase, 10% decay by default
+- beta2: 0.93
+- WSD schedule: 100 warmup steps, stable phase, 15% decay by default
 
 The general Lion-K core still supports cautious weight decay. It is out of scope
 for the ScionC Shakespeare recipe.
@@ -86,8 +87,8 @@ python -m scionc.train_shakespeare \
   --batch-size 64 --grad-accum 1 --block-size 256 \
   --n-layer 6 --n-head 6 --d-model 384 \
   --lr 3.5e-2 --min-lr 0 \
-  --warmup-iters 100 --decay-frac 0.10 \
-  --beta2 0.95 \
+  --warmup-iters 100 --decay-frac 0.15 \
+  --beta2 0.93 \
   --hidden-lmo gram-ns \
   --embed-lmo colnorm --out-lmo sign \
   --rho-embed 1 --rho-hidden 3 --rho-out 10
@@ -95,9 +96,10 @@ python -m scionc.train_shakespeare \
 
 ## Current Result
 
-The current working recipe reached validation loss `1.3940` after 2k steps on
-tiny Shakespeare with batch size 64, gradient accumulation 1, block size 256,
-and about 2.28 GB reserved CUDA memory.
+The current working recipe reached validation loss `1.3912` over 200 eval
+batches after 2k steps on tiny Shakespeare with batch size 64, gradient
+accumulation 1, and block size 256. On a 4070 Ti, the compiled run reserved
+about 1.85 GB CUDA memory and trained at about 450k tokens/s.
 
 Example sample from `out/scionc_wsd_lr0p035_min0.pt`, using temperature `0.8`
 and top-k `40`:

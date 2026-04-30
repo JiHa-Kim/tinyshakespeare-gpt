@@ -71,11 +71,31 @@ def line_probe_text(
         if lr2_update_sq > eps
         else float("nan")
     )
+    obj = line_object_stats_text(stats)
     return (
         f"line_probe step {step:5d} | "
         f"pred {pred:.3e} | actual {actual:.3e} | "
         f"ratio {ratio:.3f} | alpha {alpha:.3f} | curv {curvature:.3e}"
+        f"{obj}"
     )
+
+
+def line_object_stats_text(stats: dict[str, dict]) -> str:
+    parts = []
+    for name, values in stats.items():
+        parts.append(
+            f"{name}:cos={values['cos']:.3f},"
+            f"u/p={values['update_param_rms']:.2e},"
+            f"u/g={values['update_grad_rms']:.2e},"
+            f"g/p={values['grad_param_rms']:.2e},"
+            f"xg={values['param_grad_cos']:.3f},"
+            f"xu={values['param_update_cos']:.3f},"
+            f"ga/r={values['grad_abs_rms']:.3f},"
+            f"ua/r={values['update_abs_rms']:.3f},"
+            f"gk={values['grad_kurtosis']:.2e},"
+            f"uk={values['update_kurtosis']:.2e}"
+        )
+    return " | obj_stats " + "; ".join(parts) if parts else ""
 
 
 def line_curve_text(step: int, losses: list[tuple[float, float]]) -> str:
