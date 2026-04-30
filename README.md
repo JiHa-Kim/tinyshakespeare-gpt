@@ -1,10 +1,12 @@
 # Minimal Lion-K / ScionC Repo
 
-A tiny reference implementation with three pieces:
+A tiny reference implementation organized by category:
 
-- `lionk_ccwd.py`: general Lion-K core with optional cautious weight decay and primal averaging.
-- `scion.py`: ScionC wrapper, LMOs, geometry-matched init helpers, and LR transfer helper.
-- `gpt.py` + `train_shakespeare.py`: compact GPT training loop for tiny Shakespeare.
+- `scionc/optim/`: general Lion-K core with optional cautious weight decay and primal averaging.
+- `scionc/lmos/`: ScionC wrapper, basic LMOs, Gram-NS, streaming SVD, SVD-filter, and geometry-matched init helpers.
+- `scionc/models/`: compact GPT model and tiny Shakespeare data utilities.
+- `scionc/probes/`: optional line, convergence, and optimizer-step stats probes.
+- `scionc/train_shakespeare.py`: training entrypoint.
 
 ## Active Recipe
 
@@ -76,7 +78,7 @@ and applies one or more streaming subspace steps per optimizer update.
 ## Recommended Command
 
 ```bash
-python train_shakespeare.py \
+python -m scionc.train_shakespeare \
   --mode train \
   --prenorm rmsnorm \
   --batch-size 64 --grad-accum 1 --block-size 256 \

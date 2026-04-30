@@ -4,8 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from gpt import GPT
-from scion import (
+from scionc.lmos import (
     ColNormLMO,
     GramNewtonSchulzLMO,
     RowNormLMO,
@@ -13,6 +12,7 @@ from scion import (
     StreamingSVDSpectralLMO,
     gram_newton_schulz_uvt,
 )
+from scionc.models import GPT
 
 
 @dataclass

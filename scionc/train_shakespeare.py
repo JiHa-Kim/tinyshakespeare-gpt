@@ -7,28 +7,7 @@ from pathlib import Path
 
 import torch
 
-from convergence_probe import ConvergenceProbe
-from gpt import (
-    GPT,
-    MLP,
-    BatchSource,
-    CausalSelfAttention,
-    CharDataset,
-    GPTConfig,
-    maybe_download_tiny_shakespeare,
-)
-from line_probe import (
-    apply_line_scale,
-    capture_params,
-    capture_rng,
-    finish_line_snapshot,
-    line_curve_text,
-    line_probe_text,
-    parse_line_scales,
-    restore_rng,
-)
-from lionk_ccwd import consume_step_stats
-from scion import (
+from scionc.lmos import (
     ColNormLMO,
     GramNewtonSchulzLMO,
     HiddenSVDFilterLMO,
@@ -39,6 +18,31 @@ from scion import (
     init_colnorm_,
     init_sign_,
     init_spectral_,
+)
+from scionc.models import (
+    GPT,
+    MLP,
+    BatchSource,
+    CausalSelfAttention,
+    CharDataset,
+    GPTConfig,
+    maybe_download_tiny_shakespeare,
+)
+from scionc.probes.convergence import ConvergenceProbe
+from scionc.probes.line import (
+    apply_line_scale,
+    capture_params,
+    capture_rng,
+    finish_line_snapshot,
+    line_curve_text,
+    line_probe_text,
+    parse_line_scales,
+    restore_rng,
+)
+from scionc.probes.optimizer_stats import (
+    accumulate_step_stats,
+    capture_step_stats,
+    consume_step_stats,
 )
 
 
@@ -261,7 +265,6 @@ def build_optimizer(model: GPT, args, device: torch.device):
             "min_lr": min_lr,
             "radius": radius,
             "weight_decay": 1.0 / radius,
-            "track_stats": args.track_step_stats or args.track_line_probe,
         }
         groups.append(group)
 
@@ -538,6 +541,7 @@ def train(args):
     diverged = False
     diverge_reason = ""
     train_start = sync_now(device)
+    step_stat_accum = {}
 
     for step in range(args.max_iters):
         current_lrs = {}
@@ -555,7 +559,9 @@ def train(args):
             train_loss = last_losses["train"]
             val_loss = estimate_val_loss(model, source, args.eval_iters, amp_dtype)
             last_losses["val"] = val_loss
-            opt_stats = consume_step_stats(opt) if args.track_step_stats else {}
+            opt_stats = (
+                consume_step_stats(step_stat_accum) if args.track_step_stats else {}
+            )
 
             if not math.isfinite(val_loss):
                 diverged, diverge_reason = True, "nonfinite_eval_loss"
@@ -652,20 +658,25 @@ def train(args):
                     auto_text = apply_auto_group_lrs(opt, conv_probe.summary, args)
                     if auto_text:
                         print(auto_text)
-        if line_active:
-            consume_step_stats(opt)
         line_params_before = (
             capture_params(raw_model.parameters())
             if line_active and line_curve_scales
             else None
         )
-        if args.track_line_probe:
-            for group in opt.param_groups:
-                group["_line_probe"] = line_active
+        stat_snapshot = (
+            capture_step_stats(opt)
+            if args.track_step_stats or line_active
+            else None
+        )
         opt.step()
-        if args.track_line_probe:
-            for group in opt.param_groups:
-                group.pop("_line_probe", None)
+        line_stats = {}
+        if stat_snapshot is not None:
+            if args.track_step_stats:
+                accumulate_step_stats(step_stat_accum, stat_snapshot)
+            if line_active:
+                line_stat_accum = {}
+                accumulate_step_stats(line_stat_accum, stat_snapshot)
+                line_stats = consume_step_stats(line_stat_accum)
         total_opt_steps = step + 1
         if (
             line_active
@@ -673,7 +684,6 @@ def train(args):
             and line_rng_before is not None
             and line_loss_before is not None
         ):
-            line_stats = consume_step_stats(opt)
             rng_after = capture_rng(device)
             if line_params_before is None:
                 restore_rng(line_rng_before, device)
