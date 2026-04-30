@@ -95,6 +95,8 @@ class LionKCCWDPA(Optimizer):
             phi = group["phi"]
             cwd = group["cwd"]
             nesterov = group["nesterov"]
+            set_dir_param = getattr(dir_fn, "set_param", None)
+            batch_dir = getattr(dir_fn, "batch", None)
 
             if phi:
                 group["_pa_denom"] += lr * lr
@@ -120,6 +122,7 @@ class LionKCCWDPA(Optimizer):
                         eps=group["eps"],
                     )
 
+            entries = []
             for p in group["params"]:
                 g = p.grad
                 if g is None:
@@ -161,7 +164,21 @@ class LionKCCWDPA(Optimizer):
                     elif beta1 != 0.0:
                         g.mul_(1.0 - beta1).add_(tmp, alpha=beta1)
 
-                u = dir_fn(g)
+                entries.append((p, g, z, state))
+
+            if batch_dir is None:
+                updates = []
+                for p, g, _, _ in entries:
+                    if set_dir_param is not None:
+                        set_dir_param(p)
+                    updates.append(dir_fn(g))
+            else:
+                updates = batch_dir(
+                    [g for _, g, _, _ in entries],
+                    [p for p, _, _, _ in entries],
+                )
+
+            for (p, _, z, state), u in zip(entries, updates, strict=True):
 
                 if eta:
                     if cwd:

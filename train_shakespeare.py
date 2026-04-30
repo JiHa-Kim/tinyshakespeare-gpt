@@ -10,16 +10,20 @@ import torch
 from gpt import (
     BatchSource,
     CharDataset,
+    CausalSelfAttention,
     GPT,
     GPTConfig,
+    MLP,
     maybe_download_tiny_shakespeare,
 )
 from scion import (
     ColNormLMO,
+    HiddenSVDFilterLMO,
     Scion,
     ScionC,
     SignLMO,
     SpectralLMO,
+    StreamingSVDSpectralLMO,
     init_colnorm_,
     init_sign_,
     init_spectral_,
@@ -146,6 +150,27 @@ def build_optimizer(model: GPT, args, device: torch.device):
     hidden = [p for p in model.parameters() if p.requires_grad and id(p) not in skip]
     groups = []
 
+    def hidden_lmo():
+        if args.hidden_lmo == "polar":
+            return SpectralLMO(args.rho_hidden, args.pe_steps, work_dtype=work_dtype)
+        if args.hidden_lmo == "svd-filter":
+            return HiddenSVDFilterLMO(
+                radius=args.rho_hidden,
+                steps=args.spi_steps,
+                ridge=args.spi_ridge,
+                refresh_interval=args.spi_refresh_interval,
+                refresh_threshold=args.spi_refresh_threshold,
+                filter_ridge=args.filter_ridge,
+                cov_interval=args.filter_cov_interval,
+            )
+        return StreamingSVDSpectralLMO(
+            radius=args.rho_hidden,
+            steps=args.spi_steps,
+            ridge=args.spi_ridge,
+            refresh_interval=args.spi_refresh_interval,
+            refresh_threshold=args.spi_refresh_threshold,
+        )
+
     def add(name, params, dir_fn, theta2=None):
         if not params:
             return
@@ -171,7 +196,7 @@ def build_optimizer(model: GPT, args, device: torch.device):
     add(
         "hidden",
         hidden,
-        SpectralLMO(args.rho_hidden, args.pe_steps, work_dtype=work_dtype),
+        hidden_lmo(),
         args.theta2_hidden,
     )
     add("out", [model.lm_head.weight], SignLMO(args.rho_out), args.theta2_out)
@@ -187,6 +212,56 @@ def build_optimizer(model: GPT, args, device: torch.device):
         cwd=args.cwd,
         nesterov=args.nesterov,
     )
+
+
+def hidden_svd_filter_lmo(opt):
+    for group in opt.param_groups:
+        dir_fn = group.get("dir_fn")
+        if isinstance(dir_fn, HiddenSVDFilterLMO):
+            return dir_fn
+    return None
+
+
+def register_hidden_cov_hooks(model: GPT, lmo: HiddenSVDFilterLMO):
+    handles = []
+
+    def add_cov(weight, x):
+        flat = x.detach().reshape(-1, x.size(-1)).float()
+        cov = flat.mT @ flat
+        lmo.add_covariance(weight, cov, flat.size(0))
+
+    def make_linear_hook(weight):
+        def hook(_module, inputs):
+            if not _module.training or not torch.is_grad_enabled():
+                return
+            if not lmo.collect_covariance():
+                return
+            add_cov(weight, inputs[0])
+
+        return hook
+
+    def make_mlp_hook(module: MLP):
+        def hook(_module, inputs):
+            if not _module.training or not torch.is_grad_enabled():
+                return
+            if not lmo.collect_covariance():
+                return
+            x = inputs[0].detach()
+            flat = x.reshape(-1, x.size(-1)).float()
+            cov = flat.mT @ flat
+            lmo.add_covariance(module.gate.weight, cov, flat.size(0))
+            lmo.add_covariance(module.up.weight, cov.clone(), flat.size(0))
+
+        return hook
+
+    for module in model.modules():
+        if isinstance(module, CausalSelfAttention):
+            handles.append(module.qkv.register_forward_pre_hook(make_linear_hook(module.qkv.weight)))
+            handles.append(module.proj.register_forward_pre_hook(make_linear_hook(module.proj.weight)))
+        elif isinstance(module, MLP):
+            handles.append(module.register_forward_pre_hook(make_mlp_hook(module)))
+            handles.append(module.down.register_forward_pre_hook(make_linear_hook(module.down.weight)))
+    return handles
 
 
 def save_checkpoint(path: Path, model: GPT, dataset: CharDataset, args):
@@ -272,6 +347,12 @@ def train(args):
         dataset.train, dataset.val, args.block_size, args.batch_size, device
     )
     opt = build_optimizer(raw_model, args, device)
+    cov_lmo = hidden_svd_filter_lmo(opt)
+    if cov_lmo is not None:
+        if args.compile:
+            print("warning: hidden_lmo=svd-filter uses forward hooks; disabling compile.")
+            args.compile = False
+        register_hidden_cov_hooks(raw_model, cov_lmo)
     model, compile_seconds = maybe_compile(raw_model, source, args, amp_dtype, device)
     if compile_seconds:
         print(f"compile_seconds {compile_seconds:.3f}")
@@ -296,7 +377,8 @@ def train(args):
     print(
         "schedule "
         f"warmup_steps={warmup_steps} stable_steps={stable_steps} decay_steps={decay_steps} "
-        f"optimizer={args.optimizer} prenorm={args.prenorm} lr_groups="
+        f"optimizer={args.optimizer} prenorm={args.prenorm} hidden_lmo={args.hidden_lmo} "
+        f"lr_groups="
         + ", ".join(group_schedule)
     )
 
@@ -387,6 +469,14 @@ def train(args):
         print("\n--- sample ---\n")
         print(dataset.decode(y[0].tolist()))
 
+    for group in opt.param_groups:
+        stats = getattr(group.get("dir_fn"), "stats", None)
+        if stats:
+            print(
+                f"{group.get('name', 'group')}_lmo_stats "
+                + " ".join(f"{k}={v}" for k, v in stats.items())
+            )
+
     return {
         "best_val": best_val,
         "final_train": last_losses["train"],
@@ -470,7 +560,19 @@ def make_parser():
     p.add_argument("--theta2-embed", type=float, default=None)
     p.add_argument("--theta2-hidden", type=float, default=None)
     p.add_argument("--theta2-out", type=float, default=None)
+    p.add_argument(
+        "--hidden-lmo",
+        choices=["streaming-svd", "svd-filter", "polar"],
+        default="streaming-svd",
+        help="hidden-matrix LMO; svd-filter uses hidden activation covariance",
+    )
     p.add_argument("--pe-steps", type=int, default=5)
+    p.add_argument("--spi-steps", type=int, default=1)
+    p.add_argument("--spi-ridge", type=float, default=1e-3)
+    p.add_argument("--filter-ridge", type=float, default=1e-3)
+    p.add_argument("--filter-cov-interval", type=int, default=1)
+    p.add_argument("--spi-refresh-interval", type=int, default=25)
+    p.add_argument("--spi-refresh-threshold", type=float, default=0.10)
     p.add_argument("--rho-embed", type=float, default=8.0)
     p.add_argument("--rho-hidden", type=float, default=8.0)
     p.add_argument("--rho-out", type=float, default=8.0)

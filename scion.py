@@ -9,6 +9,8 @@ __all__ = [
     "ColNormLMO",
     "RowNormLMO",
     "SpectralLMO",
+    "StreamingSVDSpectralLMO",
+    "HiddenSVDFilterLMO",
     "SignLMO",
     "init_colnorm_",
     "init_rownorm_",
@@ -187,6 +189,358 @@ class SpectralLMO:
         return polar_express_uvt(
             v, self.steps, self.eps, self.work_dtype, self.workspace
         ).mul_(-self.radius * scale)
+
+
+def _column_inverse_scale(x: torch.Tensor, eps: float) -> torch.Tensor:
+    norms = torch.linalg.vector_norm(x, dim=-2, keepdim=True).clamp_min(eps)
+    return norms.reciprocal()
+
+
+def _normalize_columns(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    inv_scale = _column_inverse_scale(x, eps)
+    return x * inv_scale, inv_scale
+
+
+class StreamingSVDSpectralLMO:
+    """
+    Spectral LMO based on one or more streaming power-iteration steps.
+
+    The cached V basis is stored per parameter via `set_param`, which is called
+    by LionKCCWDPA when the LMO exposes that hook.
+    """
+
+    __slots__ = (
+        "radius",
+        "steps",
+        "ridge",
+        "refresh_interval",
+        "refresh_threshold",
+        "eps",
+        "work_dtype",
+        "input_like",
+        "states",
+        "_param_key",
+        "stats",
+    )
+
+    def __init__(
+        self,
+        radius: float = 3.0,
+        steps: int = 1,
+        ridge: float = 1e-3,
+        refresh_interval: int = 25,
+        refresh_threshold: float = 0.10,
+        eps: float = 1e-12,
+        work_dtype: torch.dtype | None = torch.float32,
+        input_like: bool = False,
+    ):
+        if steps <= 0:
+            raise ValueError(f"invalid steps: {steps}")
+        if ridge < 0.0:
+            raise ValueError(f"invalid ridge: {ridge}")
+        if refresh_interval < 0:
+            raise ValueError(f"invalid refresh_interval: {refresh_interval}")
+        if refresh_threshold < 0.0:
+            raise ValueError(f"invalid refresh_threshold: {refresh_threshold}")
+
+        self.radius = radius
+        self.steps = steps
+        self.ridge = ridge
+        self.refresh_interval = refresh_interval
+        self.refresh_threshold = refresh_threshold
+        self.eps = eps
+        self.work_dtype = work_dtype
+        self.input_like = input_like
+        self.states = {}
+        self._param_key = None
+        self.stats = {"calls": 0, "steps": 0, "refreshes": 0, "quality_checks": 0}
+
+    def set_param(self, p: torch.Tensor) -> None:
+        self._param_key = id(p)
+
+    def _state_key(self, x: torch.Tensor) -> tuple:
+        base = self._param_key
+        if base is None:
+            base = ("shape", tuple(x.shape))
+        return (base, tuple(x.shape), x.dtype, x.device)
+
+    def _resolve_work_dtype(self, x: torch.Tensor) -> torch.dtype:
+        if self.work_dtype is not None:
+            return self.work_dtype
+        if x.dtype in {torch.float16, torch.bfloat16}:
+            return torch.float32
+        return x.dtype
+
+    def _ridge_scale(self, gram: torch.Tensor) -> torch.Tensor:
+        scale = gram[..., 0, 0].abs()
+        return torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0).clamp_min(
+            self.eps
+        )
+
+    def _cholesky_fast(self, gram: torch.Tensor, ridge: float) -> torch.Tensor:
+        scale = self._ridge_scale(gram)
+        shifted = (gram + gram.mT).mul(0.5)
+        diag = shifted.diagonal(dim1=-2, dim2=-1)
+        shift = ridge * scale
+        if shift.ndim:
+            shift = shift.unsqueeze(-1)
+        diag.add_(shift)
+        r, _ = torch.linalg.cholesky_ex(shifted, upper=True, check_errors=False)
+        return r
+
+    def _solve_right(self, x: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+        return torch.linalg.solve_triangular(r, x, upper=True, left=False)
+
+    def _scqr_once_fast(self, x: torch.Tensor, ridge: float) -> torch.Tensor:
+        r = self._cholesky_fast(x.mT @ x, ridge)
+        return self._solve_right(x, r)
+
+    def _qr(self, x: torch.Tensor) -> torch.Tensor:
+        x_scaled, _ = _normalize_columns(x, self.eps)
+        return self._scqr_once_fast(x_scaled, self.ridge)
+
+    def _v_step_scqr2(
+        self, m: torch.Tensor, v: torch.Tensor, check_refresh: bool = False
+    ) -> torch.Tensor:
+        mv = m @ v
+        mv_scaled, inv_scale = _normalize_columns(mv, self.eps)
+
+        # Direct Gram from M @ V preserves positive semidefiniteness better than
+        # the algebraically equivalent V.T @ (M.T @ M @ V) in finite precision.
+        a_scaled = (m.mT @ mv) * inv_scale
+        gram1 = mv_scaled.mT @ mv_scaled
+        exact_qr = False
+        if check_refresh:
+            if self.refresh_threshold == 0.0:
+                exact_qr = True
+            else:
+                quality = gram1.detach().clone()
+                quality.diagonal(dim1=-2, dim2=-1).zero_()
+                n = quality.size(-1)
+                rms = torch.sqrt(
+                    quality.square().sum(dim=(-2, -1)) / max(n * (n - 1), 1)
+                )
+                self.stats["quality_checks"] += int(rms.numel())
+                exact_qr = bool((rms > self.refresh_threshold).any())
+        r1 = self._cholesky_fast(gram1, self.ridge)
+        b = self._solve_right(a_scaled, r1)
+        if exact_qr:
+            self.stats["refreshes"] += b.shape[0] if b.ndim == 3 else 1
+            return torch.linalg.qr(b, mode="reduced").Q
+        return self._qr(b)
+
+    def _v_step(
+        self, m: torch.Tensor, v: torch.Tensor, check_refresh: bool = False
+    ) -> torch.Tensor:
+        return self._v_step_scqr2(m, v, check_refresh)
+
+    def _filter_coefficients(
+        self,
+        items: list[tuple],
+        v_batch: torch.Tensor,
+        u_batch: torch.Tensor,
+        sigma: torch.Tensor,
+    ) -> torch.Tensor | None:
+        return None
+
+    def _basis_for(self, p: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        key = (id(p), tuple(m.shape), m.dtype, m.device)
+        v = self.states.get(key)
+        if v is None or v.shape != (m.size(-1), m.size(-1)):
+            v = torch.eye(m.size(-1), dtype=m.dtype, device=m.device)
+        return v
+
+    def _store_basis_for(self, p: torch.Tensor, m: torch.Tensor, v: torch.Tensor) -> None:
+        key = (id(p), tuple(m.shape), m.dtype, m.device)
+        self.states[key] = v.detach()
+
+    def batch(
+        self, tensors: list[torch.Tensor], params: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        out: list[torch.Tensor | None] = [None] * len(tensors)
+        groups: dict[tuple, list[tuple]] = {}
+        self.stats["steps"] += 1
+        check_refresh = (
+            self.refresh_interval > 0
+            and self.stats["steps"] % self.refresh_interval == 0
+        )
+
+        for i, (x, p) in enumerate(zip(tensors, params, strict=True)):
+            if x.ndim != 2:
+                out[i] = self(x)
+                continue
+            work_dtype = self._resolve_work_dtype(x)
+            m = x.to(work_dtype)
+            transposed = m.size(0) < m.size(1)
+            if transposed:
+                m = m.mT
+            scale = math.sqrt(x.size(0) / x.size(1))
+            if self.input_like:
+                scale = max(1.0, scale)
+            key = (tuple(m.shape), m.dtype, m.device)
+            groups.setdefault(key, []).append((i, x, p, m, transposed, scale))
+
+        for items in groups.values():
+            m_batch = torch.stack([item[3] for item in items])
+            v_batch = torch.stack([self._basis_for(item[2], item[3]) for item in items])
+
+            for _ in range(self.steps):
+                v_batch = self._v_step(m_batch, v_batch, check_refresh)
+
+            mv = m_batch @ v_batch
+            sigma = torch.linalg.vector_norm(mv, dim=-2).clamp_min(self.eps)
+            u = mv / sigma.unsqueeze(-2)
+            coeff = self._filter_coefficients(items, v_batch, u, sigma)
+            if coeff is not None:
+                u = u * coeff.unsqueeze(-2)
+            y_batch = u @ v_batch.mT
+
+            for j, (i, x, p, m, transposed, scale) in enumerate(items):
+                v = v_batch[j]
+                self._store_basis_for(p, m, v)
+                y = y_batch[j].mT if transposed else y_batch[j]
+                out[i] = y.to(dtype=x.dtype).mul_(-self.radius * scale)
+                self.stats["calls"] += 1
+
+        if any(x is None for x in out):
+            raise RuntimeError("batched StreamingSVDSpectralLMO missed an output")
+        return out
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError("StreamingSVDSpectralLMO expects a 2D tensor")
+
+        scale = math.sqrt(x.size(0) / x.size(1))
+        if self.input_like:
+            scale = max(1.0, scale)
+
+        work_dtype = self._resolve_work_dtype(x)
+        m = x.to(work_dtype)
+        transposed = m.size(0) < m.size(1)
+        if transposed:
+            m = m.mT
+        self.stats["steps"] += 1
+        check_refresh = (
+            self.refresh_interval > 0
+            and self.stats["steps"] % self.refresh_interval == 0
+        )
+
+        key = self._state_key(m)
+        v = self.states.get(key)
+        if v is None or v.shape != (m.size(1), m.size(1)):
+            v = torch.eye(m.size(1), dtype=m.dtype, device=m.device)
+
+        for _ in range(self.steps):
+            v = self._v_step(m, v, check_refresh)
+        self.states[key] = v.detach()
+
+        mv = m @ v
+        sigma = torch.linalg.vector_norm(mv, dim=0).clamp_min(self.eps)
+        u = mv / sigma.unsqueeze(0)
+        out = u @ v.mT
+        if transposed:
+            out = out.mT
+        self.stats["calls"] += 1
+        return out.to(dtype=x.dtype).mul_(-self.radius * scale)
+
+
+class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
+    """
+    Streaming-SVD hidden update with the closed-form diagonal filter for
+    q(D)=tr(D A D^T), where A is the incoming activation covariance.
+    """
+
+    __slots__ = ("cov_accums", "cov_cache", "filter_ridge", "cov_interval")
+
+    def __init__(
+        self, *args, filter_ridge: float = 1e-3, cov_interval: int = 1, **kwargs
+    ):
+        if filter_ridge < 0.0:
+            raise ValueError(f"invalid filter_ridge: {filter_ridge}")
+        if cov_interval <= 0:
+            raise ValueError(f"invalid cov_interval: {cov_interval}")
+        super().__init__(*args, **kwargs)
+        self.cov_accums = {}
+        self.cov_cache = {}
+        self.filter_ridge = filter_ridge
+        self.cov_interval = cov_interval
+        self.stats.update({"filtered": 0, "missing_covs": 0, "cov_updates": 0})
+
+    def collect_covariance(self) -> bool:
+        return self.stats["steps"] % self.cov_interval == 0
+
+    def add_covariance(self, p: torch.Tensor, cov: torch.Tensor, count: int) -> None:
+        state = self.cov_accums.get(id(p))
+        if state is None:
+            self.cov_accums[id(p)] = [cov, count]
+        else:
+            state[0].add_(cov)
+            state[1] += count
+
+    def _cov_for(self, p: torch.Tensor) -> torch.Tensor | None:
+        key = id(p)
+        state = self.cov_accums.get(key)
+        if state is not None:
+            cov_sum, count = state
+            if count > 0:
+                self.cov_cache[key] = (cov_sum / count).detach()
+                self.stats["cov_updates"] += 1
+        return self.cov_cache.get(key)
+
+    def _coeff_batch(
+        self, cov: torch.Tensor, basis: torch.Tensor, sigma: torch.Tensor
+    ) -> torch.Tensor:
+        cov = cov.to(device=basis.device, dtype=basis.dtype)
+        denom = (cov @ basis).mul(basis).sum(dim=-2).clamp_min(self.eps)
+        scale = denom.mean(dim=-1, keepdim=True).abs().clamp_min(self.eps)
+        denom = denom + self.filter_ridge * scale
+
+        raw = torch.nan_to_num(sigma / denom, nan=0.0, posinf=0.0, neginf=0.0)
+        budget = denom.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        q_norm = denom.mul(raw.square()).sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        coeff = raw * torch.sqrt(budget / q_norm)
+        return coeff
+
+    def _filter_coefficients(
+        self,
+        items: list[tuple],
+        v_batch: torch.Tensor,
+        u_batch: torch.Tensor,
+        sigma: torch.Tensor,
+    ) -> torch.Tensor | None:
+        coeffs: list[torch.Tensor | None] = [None] * len(items)
+        groups: dict[tuple, list[tuple]] = {}
+
+        for i, item in enumerate(items):
+            basis = u_batch[i] if item[4] else v_batch[i]
+            cov = self._cov_for(item[2])
+            if cov is None:
+                self.stats["missing_covs"] += 1
+                coeffs[i] = torch.ones_like(sigma[i])
+                continue
+            key = (tuple(cov.shape), tuple(basis.shape), basis.dtype, basis.device)
+            groups.setdefault(key, []).append((i, cov, basis, sigma[i]))
+
+        for entries in groups.values():
+            cov = torch.stack([x[1] for x in entries])
+            basis = torch.stack([x[2] for x in entries])
+            sig = torch.stack([x[3] for x in entries])
+            coeff = self._coeff_batch(cov, basis, sig)
+            self.stats["filtered"] += len(entries)
+            for j, (i, _, _, _) in enumerate(entries):
+                coeffs[i] = coeff[j]
+
+        if any(x is None for x in coeffs):
+            raise RuntimeError("HiddenSVDFilterLMO missed a coefficient")
+        return torch.stack(coeffs)
+
+    def batch(
+        self, tensors: list[torch.Tensor], params: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        try:
+            return super().batch(tensors, params)
+        finally:
+            self.cov_accums.clear()
 
 
 @torch.no_grad()
