@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+from convergence_probe import ConvergenceProbe
 from gpt import (
     GPT,
     MLP,
@@ -16,13 +17,22 @@ from gpt import (
     GPTConfig,
     maybe_download_tiny_shakespeare,
 )
+from line_probe import (
+    apply_line_scale,
+    capture_params,
+    capture_rng,
+    finish_line_snapshot,
+    line_curve_text,
+    line_probe_text,
+    parse_line_scales,
+    restore_rng,
+)
 from lionk_ccwd import consume_step_stats
 from scion import (
     ColNormLMO,
     GramNewtonSchulzLMO,
     HiddenSVDFilterLMO,
     RowNormLMO,
-    Scion,
     ScionC,
     SignLMO,
     StreamingSVDSpectralLMO,
@@ -174,20 +184,27 @@ def resolve_group_lr(args, group: str) -> tuple[float, float]:
     return peak, min_lr
 
 
+def apply_auto_group_lrs(opt, summary: dict[str, dict[str, float]], args) -> str:
+    parts = []
+    for group in opt.param_groups:
+        name = group.get("name", "group")
+        l1 = summary.get(name, {}).get("l1")
+        if l1 is None or not math.isfinite(l1) or l1 <= 0.0:
+            continue
+        old = group.get("auto_l1", l1)
+        l1 = args.auto_lr_beta * old + (1.0 - args.auto_lr_beta) * l1
+        group["auto_l1"] = l1
+
+        lr = args.auto_lr_alpha / l1
+        lr = min(max(lr, group.get("min_lr", 0.0)), group.get("max_lr", lr))
+        group["peak_lr"] = lr
+        parts.append(f"{name}={lr:.3e}")
+    return "auto_lr " + ", ".join(parts) if parts else ""
+
+
 @torch.no_grad()
 def build_optimizer(model: GPT, args, device: torch.device):
     gns_dtype = torch.float16 if device.type == "cuda" else torch.float32
-    if (
-        args.optimizer == "scionc"
-        and args.eta is None
-        and args.theta2_embed is None
-        and args.theta2_hidden is None
-        and args.theta2_out is None
-    ):
-        print(
-            "warning: optimizer=scionc but no eta/theta2 values were provided; "
-            "corrected decay is effectively disabled."
-        )
     skip = {id(model.tok_emb.weight), id(model.lm_head.weight)}
     hidden = [p for p in model.parameters() if p.requires_grad and id(p) not in skip]
     groups = []
@@ -195,11 +212,10 @@ def build_optimizer(model: GPT, args, device: torch.device):
     def hidden_lmo():
         if args.hidden_lmo == "gram-ns":
             return GramNewtonSchulzLMO(
-                args.rho_hidden, args.pe_steps, work_dtype=gns_dtype
+                steps=args.pe_steps, work_dtype=gns_dtype
             )
         if args.hidden_lmo == "svd-filter":
             return HiddenSVDFilterLMO(
-                radius=args.rho_hidden,
                 steps=args.spi_steps,
                 ridge=args.spi_ridge,
                 refresh_interval=args.spi_refresh_interval,
@@ -209,7 +225,6 @@ def build_optimizer(model: GPT, args, device: torch.device):
                 filter_metric=args.filter_metric,
             )
         return StreamingSVDSpectralLMO(
-            radius=args.rho_hidden,
             steps=args.spi_steps,
             ridge=args.spi_ridge,
             refresh_interval=args.spi_refresh_interval,
@@ -219,58 +234,56 @@ def build_optimizer(model: GPT, args, device: torch.device):
 
     def embed_lmo():
         if args.embed_lmo == "sign":
-            return SignLMO(args.rho_embed)
+            return SignLMO()
         if args.embed_lmo == "rownorm":
-            return RowNormLMO(args.rho_embed)
-        return ColNormLMO(args.rho_embed, transpose=True)
+            return RowNormLMO()
+        return ColNormLMO(transpose=True)
 
     def out_lmo():
         if args.out_lmo == "colnorm":
-            return ColNormLMO(args.rho_out, transpose=True)
+            return ColNormLMO(transpose=True)
         if args.out_lmo == "rownorm":
-            return RowNormLMO(args.rho_out)
-        return SignLMO(args.rho_out)
+            return RowNormLMO()
+        return SignLMO()
 
-    def add(name, params, dir_fn, theta2=None):
+    def add(name, params, dir_fn, radius):
         if not params:
             return
         peak_lr, min_lr = resolve_group_lr(args, name)
+        radius = max(float(radius), 1e-12)
         group = {
             "name": name,
             "params": params,
             "dir_fn": dir_fn,
             "lr": peak_lr,
             "peak_lr": peak_lr,
+            "max_lr": peak_lr,
             "min_lr": min_lr,
-            "track_stats": args.track_step_stats,
+            "radius": radius,
+            "weight_decay": 1.0 / radius,
+            "track_stats": args.track_step_stats or args.track_line_probe,
         }
-        if args.optimizer == "scionc" and theta2 is not None:
-            group["theta2"] = theta2
         groups.append(group)
 
     add(
         "embed",
         [model.tok_emb.weight],
         embed_lmo(),
-        args.theta2_embed,
+        args.rho_embed,
     )
     add(
         "hidden",
         hidden,
         hidden_lmo(),
-        args.theta2_hidden,
+        args.rho_hidden,
     )
-    add("out", [model.lm_head.weight], out_lmo(), args.theta2_out)
+    add("out", [model.lm_head.weight], out_lmo(), args.rho_out)
 
     default_lr, _ = resolve_group_lr(args, "hidden")
-    opt_cls = Scion if args.optimizer == "scion" else ScionC
-    return opt_cls(
+    return ScionC(
         groups,
         lr=default_lr,
         beta2=args.beta2,
-        phi=args.phi,
-        eta=args.eta,
-        cwd=args.cwd,
         nesterov=args.nesterov,
     )
 
@@ -282,11 +295,11 @@ def group_lmo(opt, name: str, cls):
     return None
 
 
-def hidden_svd_filter_lmo(opt):
+def hidden_cov_lmo(opt):
     return group_lmo(opt, "hidden", HiddenSVDFilterLMO)
 
 
-def register_hidden_cov_hooks(model: GPT, lmo: HiddenSVDFilterLMO):
+def register_hidden_cov_hooks(model: GPT, lmo):
     handles = []
 
     def covariance(x):
@@ -433,6 +446,9 @@ def train(args):
         if device.type == "cuda" and torch.cuda.is_bf16_supported()
         else None
     )
+    line_curve_scales = parse_line_scales(args.line_curve_scales)
+    if line_curve_scales:
+        args.track_line_probe = True
 
     data_path = Path(args.data_path)
     maybe_download_tiny_shakespeare(data_path)
@@ -456,9 +472,19 @@ def train(args):
         dataset.train, dataset.val, args.block_size, args.batch_size, device
     )
     opt = build_optimizer(raw_model, args, device)
-    cov_lmo = hidden_svd_filter_lmo(opt)
-    if cov_lmo is not None and cov_lmo.filter_metric != "grad-sigma":
+    cov_lmo = hidden_cov_lmo(opt)
+    if cov_lmo is not None and cov_lmo.collect_covariance():
         register_hidden_cov_hooks(raw_model, cov_lmo)
+    conv_probe = (
+        ConvergenceProbe(raw_model, opt, args)
+        if args.track_convergence_stats or args.auto_lr_from_stats
+        else None
+    )
+    if conv_probe is not None:
+        conv_probe.register_hooks(raw_model)
+        if args.compile:
+            print("compile_disabled_for_convergence_stats")
+            args.compile = False
     model, compile_seconds = maybe_compile(raw_model, source, args, amp_dtype, device)
     if cov_lmo is not None:
         cov_lmo.cov_accums.clear()
@@ -485,16 +511,24 @@ def train(args):
         name = group.get("name", "group")
         peak_lr = group.get("peak_lr", group["lr"])
         min_lr = group.get("min_lr", args.min_lr)
-        group_schedule.append(f"{name}=({peak_lr:.3e}->{min_lr:.3e})")
+        radius = group.get("radius", 1.0)
+        wd = group.get("weight_decay", 0.0)
+        group_schedule.append(
+            f"{name}=({peak_lr:.3e}->{min_lr:.3e},rho={radius:g},wd={wd:.3g})"
+        )
     print(
         "schedule "
         f"warmup_steps={warmup_steps} stable_steps={stable_steps} decay_steps={decay_steps} "
-        f"optimizer={args.optimizer} prenorm={args.prenorm} dropout={args.dropout:.3f} "
+        f"optimizer=scionc prenorm={args.prenorm} dropout={args.dropout:.3f} "
         f"hidden_lmo={args.hidden_lmo} "
         f"embed_lmo={args.embed_lmo} out_lmo={args.out_lmo} "
         f"qkv=split spi_iteration={args.spi_iteration} "
         f"lr_groups=" + ", ".join(group_schedule)
     )
+    if args.track_line_probe and args.grad_accum != 1:
+        print("line_probe_disabled_requires_grad_accum_1")
+    if line_curve_scales:
+        print("line_curve_scales " + ",".join(f"{x:g}" for x in line_curve_scales))
 
     total_opt_steps = 0
     best_val = float("inf")
@@ -567,20 +601,37 @@ def train(args):
                     f"cuda_reserved_{memory['reserved_gb']:.2f}G_exceeded_"
                     f"{args.max_cuda_reserved_gb:.2f}G"
                 )
-            if diverged:
-                print(f"diverged {diverge_reason}")
-                break
+        if diverged:
+            print(f"diverged {diverge_reason}")
+            break
 
+        line_active = (
+            args.track_line_probe
+            and args.grad_accum == 1
+            and args.line_probe_interval > 0
+            and step % args.line_probe_interval == 0
+        )
+        line_batch = None
+        line_rng_before = None
+        line_loss_before = None
         opt.zero_grad(set_to_none=True)
+        if conv_probe is not None:
+            conv_probe.start_step(step)
         train_loss = 0.0
-        for _ in range(args.grad_accum):
+        for micro_step in range(args.grad_accum):
+            batch = source.get("train")
+            if line_active and micro_step == 0:
+                line_batch = batch
+                line_rng_before = capture_rng(device)
             with amp_ctx(amp_dtype):
-                _, loss = model(*source.get("train"))
+                _, loss = model(*batch)
                 loss = loss / args.grad_accum
             loss_value = float(loss.detach())
             if not math.isfinite(loss_value):
                 diverged, diverge_reason = True, "nonfinite_train_loss"
                 break
+            if line_active and micro_step == 0:
+                line_loss_before = loss_value
             train_loss += loss_value
             loss.backward()
         if diverged:
@@ -590,8 +641,68 @@ def train(args):
 
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
+        if conv_probe is not None:
+            conv_text = conv_probe.capture(step, current_lrs)
+            if conv_text:
+                print(conv_text)
+                if (
+                    args.auto_lr_from_stats
+                    and warmup_steps <= step < warmup_steps + stable_steps
+                ):
+                    auto_text = apply_auto_group_lrs(opt, conv_probe.summary, args)
+                    if auto_text:
+                        print(auto_text)
+        if line_active:
+            consume_step_stats(opt)
+        line_params_before = (
+            capture_params(raw_model.parameters())
+            if line_active and line_curve_scales
+            else None
+        )
+        if args.track_line_probe:
+            for group in opt.param_groups:
+                group["_line_probe"] = line_active
         opt.step()
+        if args.track_line_probe:
+            for group in opt.param_groups:
+                group.pop("_line_probe", None)
         total_opt_steps = step + 1
+        if (
+            line_active
+            and line_batch is not None
+            and line_rng_before is not None
+            and line_loss_before is not None
+        ):
+            line_stats = consume_step_stats(opt)
+            rng_after = capture_rng(device)
+            if line_params_before is None:
+                restore_rng(line_rng_before, device)
+                with torch.no_grad(), amp_ctx(amp_dtype):
+                    _, loss_after = model(*line_batch)
+                restore_rng(rng_after, device)
+                loss_after_value = float(loss_after.detach())
+            else:
+                snapshot = finish_line_snapshot(line_params_before)
+                curve_losses = []
+                for scale in line_curve_scales:
+                    apply_line_scale(snapshot, scale)
+                    restore_rng(line_rng_before, device)
+                    with torch.no_grad(), amp_ctx(amp_dtype):
+                        _, curve_loss = model(*line_batch)
+                    curve_losses.append((scale, float(curve_loss.detach())))
+                apply_line_scale(snapshot, 1.0)
+                restore_rng(rng_after, device)
+                loss_after_value = min(
+                    curve_losses, key=lambda item: abs(item[0] - 1.0)
+                )[1]
+                curve_text = line_curve_text(step, curve_losses)
+                if curve_text:
+                    print(curve_text)
+            line_text = line_probe_text(
+                step, line_loss_before, loss_after_value, line_stats
+            )
+            if line_text:
+                print(line_text)
 
     if not (args.skip_sample or diverged):
         y = raw_model.generate(
@@ -750,7 +861,6 @@ def make_parser():
     )
     p.add_argument("--decay-frac", type=float, default=0.10)
 
-    p.add_argument("--optimizer", choices=["scion", "scionc"], default="scion")
     p.add_argument("--lr", type=float, default=4e-3)
     p.add_argument("--lr-embed", dest="lr_embed", type=float, default=None)
     p.add_argument("--lr-hidden", dest="lr_hidden", type=float, default=None)
@@ -767,13 +877,7 @@ def make_parser():
         "--min-lr-out", "--min-lr-unembed", dest="min_lr_out", type=float, default=None
     )
     p.add_argument("--beta2", type=float, default=0.95)
-    p.add_argument("--phi", type=float, default=0.0)
-    p.add_argument("--eta", type=float, default=None)
-    p.add_argument("--cwd", action="store_true")
     p.add_argument("--nesterov", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--theta2-embed", type=float, default=None)
-    p.add_argument("--theta2-hidden", type=float, default=None)
-    p.add_argument("--theta2-out", type=float, default=None)
     p.add_argument(
         "--hidden-lmo",
         choices=["streaming-svd", "svd-filter", "gram-ns"],
@@ -783,7 +887,7 @@ def make_parser():
     p.add_argument(
         "--embed-lmo",
         choices=["colnorm", "sign", "rownorm"],
-        default="sign",
+        default="colnorm",
         help="embedding-table LMO",
     )
     p.add_argument(
@@ -838,6 +942,62 @@ def make_parser():
         "--track-step-stats",
         action="store_true",
         help="accumulate optimizer group stats and print them on eval lines",
+    )
+    p.add_argument(
+        "--track-convergence-stats",
+        action="store_true",
+        help="probe Gluon smoothness and spectral-ratio stats during training",
+    )
+    p.add_argument(
+        "--track-line-probe",
+        action="store_true",
+        help="estimate same-batch LR aggressiveness with one extra forward",
+    )
+    p.add_argument(
+        "--line-probe-interval",
+        type=int,
+        default=100,
+        help="optimizer-step interval for same-batch line probes",
+    )
+    p.add_argument(
+        "--line-curve-scales",
+        default="",
+        help="comma-separated update multipliers for expensive same-batch line curves",
+    )
+    p.add_argument(
+        "--convergence-interval",
+        type=int,
+        default=50,
+        help="optimizer-step interval for convergence probes",
+    )
+    p.add_argument(
+        "--convergence-alpha",
+        type=float,
+        default=0.5,
+        help="safety factor used when reporting LR predicted from L1 stats",
+    )
+    p.add_argument(
+        "--convergence-probe",
+        choices=["representative", "all"],
+        default="representative",
+        help="which parameters to include in convergence probes",
+    )
+    p.add_argument(
+        "--auto-lr-from-stats",
+        action="store_true",
+        help="set group peak LRs from convergence L1 estimates after warmup",
+    )
+    p.add_argument(
+        "--auto-lr-alpha",
+        type=float,
+        default=1.25,
+        help="target normalized Lion-K step alpha = lr * L1",
+    )
+    p.add_argument(
+        "--auto-lr-beta",
+        type=float,
+        default=0.8,
+        help="EMA beta for L1 estimates used by --auto-lr-from-stats",
     )
     return p
 

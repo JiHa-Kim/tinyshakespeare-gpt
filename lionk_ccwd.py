@@ -38,22 +38,31 @@ def _stat_add(stats: dict, name: str, value: torch.Tensor) -> None:
     stats[name] = value if current is None else current + value
 
 
-def _accumulate_step_stats(group: dict, entries, updates) -> None:
+def _accumulate_step_stats(group: dict, entries, updates, lr: float) -> None:
     if not group.get("track_stats"):
         return
     stats = group.setdefault("_step_stats", {"steps": 0, "params": 0, "numel": 0})
     stats["steps"] += 1
     stats["params"] += len(entries)
 
-    for (p, g, _, _), u in zip(entries, updates, strict=True):
+    for (p, g, _, _, raw_g), u in zip(entries, updates, strict=True):
         stats["numel"] += p.numel()
         g32 = g.float()
+        raw32 = g32 if raw_g is None else raw_g.float()
         u32 = u.float()
         p32 = p.float()
+        update_sq = u32.square().sum()
+        descent = -(g32 * u32).sum()
+        raw_descent = -(raw32 * u32).sum()
         _stat_add(stats, "grad_sq", g32.square().sum())
-        _stat_add(stats, "update_sq", u32.square().sum())
+        _stat_add(stats, "raw_grad_sq", raw32.square().sum())
+        _stat_add(stats, "update_sq", update_sq)
         _stat_add(stats, "param_sq", p32.square().sum())
-        _stat_add(stats, "descent", -(g32 * u32).sum())
+        _stat_add(stats, "descent", descent)
+        _stat_add(stats, "lr_descent", descent * lr)
+        _stat_add(stats, "raw_descent", raw_descent)
+        _stat_add(stats, "lr_raw_descent", raw_descent * lr)
+        _stat_add(stats, "lr2_update_sq", update_sq * (lr * lr))
 
 
 def consume_step_stats(optimizer: Optimizer, eps: float = 1e-12) -> dict[str, dict]:
@@ -63,18 +72,29 @@ def consume_step_stats(optimizer: Optimizer, eps: float = 1e-12) -> dict[str, di
         if not stats:
             continue
         grad_sq = float(stats.get("grad_sq", 0.0))
+        raw_grad_sq = float(stats.get("raw_grad_sq", grad_sq))
         update_sq = float(stats.get("update_sq", 0.0))
         param_sq = float(stats.get("param_sq", 0.0))
         descent = float(stats.get("descent", 0.0))
+        lr_descent = float(stats.get("lr_descent", 0.0))
+        raw_descent = float(stats.get("raw_descent", descent))
+        lr_raw_descent = float(stats.get("lr_raw_descent", lr_descent))
+        lr2_update_sq = float(stats.get("lr2_update_sq", 0.0))
         numel = max(int(stats["numel"]), 1)
         out[group.get("name", "group")] = {
             "steps": int(stats["steps"]),
             "params": int(stats["params"]),
             "grad_rms": (grad_sq / numel) ** 0.5,
+            "raw_grad_rms": (raw_grad_sq / numel) ** 0.5,
             "update_rms": (update_sq / numel) ** 0.5,
             "param_rms": (param_sq / numel) ** 0.5,
             "descent": descent,
+            "lr_descent": lr_descent,
+            "raw_descent": raw_descent,
+            "lr_raw_descent": lr_raw_descent,
+            "lr2_update_sq": lr2_update_sq,
             "cos": descent / ((grad_sq * update_sq) ** 0.5 + eps),
+            "raw_cos": raw_descent / ((raw_grad_sq * update_sq) ** 0.5 + eps),
         }
     return out
 
@@ -162,7 +182,7 @@ class LionKCCWDPA(Optimizer):
             theta2 = group["theta2"]
             if eta is None:
                 if theta2 is None:
-                    eta = 0.0
+                    eta = lr * group.get("weight_decay", 0.0)
                 else:
                     S = group["S"]
                     if S is None:
@@ -195,6 +215,11 @@ class LionKCCWDPA(Optimizer):
 
                 m = state["m"]
                 z = state["z"]
+                raw_g = (
+                    g.detach().clone(memory_format=torch.preserve_format)
+                    if group.get("_line_probe")
+                    else None
+                )
 
                 # Reuse grad storage as scratch to avoid per-step allocations.
                 if nesterov:
@@ -218,23 +243,23 @@ class LionKCCWDPA(Optimizer):
                     elif beta1 != 0.0:
                         g.mul_(1.0 - beta1).add_(tmp, alpha=beta1)
 
-                entries.append((p, g, z, state))
+                entries.append((p, g, z, state, raw_g))
 
             if batch_dir is None:
                 updates = []
-                for p, g, _, _ in entries:
+                for p, g, _, _, _ in entries:
                     if set_dir_param is not None:
                         set_dir_param(p)
                     updates.append(dir_fn(g))
             else:
                 updates = batch_dir(
-                    [g for _, g, _, _ in entries],
-                    [p for p, _, _, _ in entries],
+                    [g for _, g, _, _, _ in entries],
+                    [p for p, _, _, _, _ in entries],
                 )
 
-            _accumulate_step_stats(group, entries, updates)
+            _accumulate_step_stats(group, entries, updates, lr)
 
-            for (p, _, z, state), u in zip(entries, updates, strict=True):
+            for (p, _, z, state, _), u in zip(entries, updates, strict=True):
 
                 if eta:
                     if cwd:

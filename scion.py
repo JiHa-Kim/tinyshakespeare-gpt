@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 
-from lionk_ccwd import LionKCCWDPA, lionk_S
+from lionk_ccwd import LionKCCWDPA
 
 __all__ = [
     "ColNormLMO",
@@ -19,7 +19,6 @@ __all__ = [
     "init_sign_",
     "init_semiorthogonal_",
     "scion_transfer_lr",
-    "Scion",
     "ScionC",
 ]
 
@@ -176,12 +175,11 @@ def gram_newton_schulz_uvt(
 
 
 class ColNormLMO:
-    __slots__ = ("radius", "eps", "transpose")
+    __slots__ = ("eps", "transpose")
 
     def __init__(
-        self, radius: float = 1.0, eps: float = 1e-12, transpose: bool = False
+        self, eps: float = 1e-12, transpose: bool = False
     ):
-        self.radius = radius
         self.eps = eps
         self.transpose = transpose
 
@@ -189,17 +187,16 @@ class ColNormLMO:
         x = w.mT if self.transpose else w
         x = x.div_(
             torch.linalg.vector_norm(x, dim=0, keepdim=True).clamp_min_(self.eps)
-        ).mul_(-self.radius * math.sqrt(x.size(0)))
+        ).mul_(-math.sqrt(x.size(0)))
         return x.mT if self.transpose else x
 
 
 class RowNormLMO:
-    __slots__ = ("radius", "eps", "transpose")
+    __slots__ = ("eps", "transpose")
 
     def __init__(
-        self, radius: float = 10.0, eps: float = 1e-12, transpose: bool = False
+        self, eps: float = 1e-12, transpose: bool = False
     ):
-        self.radius = radius
         self.eps = eps
         self.transpose = transpose
 
@@ -207,36 +204,33 @@ class RowNormLMO:
         x = w.mT if self.transpose else w
         x = x.div_(
             torch.linalg.vector_norm(x, dim=1, keepdim=True).clamp_min_(self.eps)
-        ).mul_(-self.radius / math.sqrt(x.size(1)))
+        ).mul_(-1.0 / math.sqrt(x.size(1)))
         return x.mT if self.transpose else x
 
 
 class SignLMO:
-    __slots__ = ("radius", "transpose")
+    __slots__ = ("transpose",)
 
-    def __init__(self, radius: float = 10.0, transpose: bool = False):
-        self.radius = radius
+    def __init__(self, transpose: bool = False):
         self.transpose = transpose
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
         x = w.mT if self.transpose else w
-        x = x.sign().mul_(-self.radius / x.size(1))
+        x = x.sign().mul_(-1.0 / x.size(1))
         return x.mT if self.transpose else x
 
 
 class GramNewtonSchulzLMO:
-    __slots__ = ("radius", "steps", "eps", "work_dtype", "input_like", "bound_safety")
+    __slots__ = ("steps", "eps", "work_dtype", "input_like", "bound_safety")
 
     def __init__(
         self,
-        radius: float = 3.0,
         steps: int = 5,
         eps: float = 1e-7,
         work_dtype: torch.dtype | None = None,
         input_like: bool = False,
         bound_safety: float = 1.05,
     ):
-        self.radius = radius
         self.steps = steps
         self.eps = eps
         self.work_dtype = work_dtype
@@ -252,7 +246,7 @@ class GramNewtonSchulzLMO:
             raise ValueError("GramNewtonSchulzLMO expects a 2D tensor")
         return gram_newton_schulz_uvt(
             v, self.steps, self.eps, self.work_dtype, self.bound_safety
-        ).mul_(-self.radius * self._scale(v))
+        ).mul_(-self._scale(v))
 
     def batch(
         self, tensors: list[torch.Tensor], params: list[torch.Tensor]
@@ -276,7 +270,7 @@ class GramNewtonSchulzLMO:
                 self.bound_safety,
             )
             for j, (i, x) in enumerate(items):
-                out[i] = y_batch[j].mul_(-self.radius * self._scale(x))
+                out[i] = y_batch[j].mul_(-self._scale(x))
 
         if any(x is None for x in out):
             raise RuntimeError("batched GramNewtonSchulzLMO missed an output")
@@ -305,7 +299,6 @@ class StreamingSVDSpectralLMO:
     """
 
     __slots__ = (
-        "radius",
         "steps",
         "ridge",
         "refresh_interval",
@@ -321,7 +314,6 @@ class StreamingSVDSpectralLMO:
 
     def __init__(
         self,
-        radius: float = 3.0,
         steps: int = 1,
         ridge: float = 1e-3,
         refresh_interval: int = 25,
@@ -342,7 +334,6 @@ class StreamingSVDSpectralLMO:
         if iteration not in {"scqr2", "norm-power"}:
             raise ValueError(f"invalid iteration: {iteration}")
 
-        self.radius = radius
         self.steps = steps
         self.ridge = ridge
         self.refresh_interval = refresh_interval
@@ -529,7 +520,7 @@ class StreamingSVDSpectralLMO:
                 v = v_batch[j]
                 self._store_basis_for(p, m, v)
                 y = y_batch[j].mT if transposed else y_batch[j]
-                out[i] = y.to(dtype=x.dtype).mul_(-self.radius * scale)
+                out[i] = y.to(dtype=x.dtype).mul_(-scale)
                 self.stats["calls"] += 1
 
         if any(x is None for x in out):
@@ -570,7 +561,7 @@ class StreamingSVDSpectralLMO:
         if transposed:
             out = out.mT
         self.stats["calls"] += 1
-        return out.to(dtype=x.dtype).mul_(-self.radius * scale)
+        return out.to(dtype=x.dtype).mul_(-scale)
 
 
 class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
@@ -605,7 +596,7 @@ class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
         self.stats.update({"filtered": 0, "missing_covs": 0, "cov_updates": 0})
 
     def collect_covariance(self) -> bool:
-        return True
+        return self.filter_metric != "grad-sigma"
 
     def add_covariance(self, p: torch.Tensor, cov: torch.Tensor, count: int) -> None:
         state = self.cov_accums.get(id(p))
@@ -779,40 +770,6 @@ def scion_transfer_lr(lr: float, mT: float = 1.0, mL: float = 1.0, alpha: float 
     }
 
 
-class Scion(LionKCCWDPA):
-    def __init__(
-        self,
-        params,
-        lr: float = 1e-4,
-        beta2: float = 0.95,
-        dir_fn=None,
-        phi: float = 0.0,
-        eta: float | None = None,
-        theta2: float | None = None,
-        cu2: float = 1.0,
-        S: float | None = None,
-        q: float = 1.0,
-        cwd: bool = False,
-        nesterov: bool = False,
-        eps: float = 1e-12,
-    ):
-        super().__init__(
-            params=params,
-            lr=lr,
-            betas=(1.0, beta2),
-            dir_fn=dir_fn,
-            phi=phi,
-            eta=eta,
-            theta2=theta2,
-            cu2=cu2,
-            S=1.0 if S is None else S,
-            q=q,
-            cwd=cwd,
-            nesterov=nesterov,
-            eps=eps,
-        )
-
-
 class ScionC(LionKCCWDPA):
     def __init__(
         self,
@@ -820,13 +777,6 @@ class ScionC(LionKCCWDPA):
         lr: float = 1e-4,
         beta2: float = 0.95,
         dir_fn=None,
-        phi: float = 0.0,
-        eta: float | None = None,
-        theta2: float | None = None,
-        cu2: float = 1.0,
-        S: float | None = None,
-        q: float = 1.0,
-        cwd: bool = False,
         nesterov: bool = False,
         eps: float = 1e-12,
     ):
@@ -835,13 +785,6 @@ class ScionC(LionKCCWDPA):
             lr=lr,
             betas=(1.0, beta2),
             dir_fn=dir_fn,
-            phi=phi,
-            eta=eta,
-            theta2=theta2,
-            cu2=cu2,
-            S=lionk_S(1.0, beta2, nesterov=nesterov) if S is None else S,
-            q=q,
-            cwd=cwd,
             nesterov=nesterov,
             eps=eps,
         )

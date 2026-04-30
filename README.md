@@ -1,100 +1,90 @@
-# Minimal Lion-K / ScionC repo
+# Minimal Lion-K / ScionC Repo
 
 A tiny reference implementation with three pieces:
 
-- `lionk_ccwd.py`: general Lion-K with corrected cautious weight decay and primal averaging
-- `scion.py`: ScionC specialization, LMOs, init helpers, and simple transfer helper
-- `gpt.py` + `train_shakespeare.py`: modern minimal GPT for tiny Shakespeare
+- `lionk_ccwd.py`: general Lion-K core with optional cautious weight decay and primal averaging.
+- `scion.py`: ScionC wrapper, LMOs, geometry-matched init helpers, and LR transfer helper.
+- `gpt.py` + `train_shakespeare.py`: compact GPT training loop for tiny Shakespeare.
 
-Model choices:
+## Active Recipe
 
-- no bias
-- gainless pre-norm blocks with an explicit ablation: `rmsnorm` or `rmsball`
-- RoPE attention
-- RMS-ball projection on `q` and `k`
-- SwiGLU MLP
-- untied embeddings / output head
-- output head uses sign geometry; RowNorm is intentionally avoided
-- ScionC defaults to primal averaging OFF (`phi = 0.0`)
+The Shakespeare training script uses ScionC in standard Lion-K coordinates.
 
-Files:
+For optimizer group `i`, the LMO returns a unit atom:
 
-- `lionk_ccwd.py`: Lion-K core with optional corrected decoupled decay
-- `scion.py`: Scion LMOs, geometry-matched initialization helpers, LR transfer helper, Gram Newton-Schulz baseline LMO, and streaming SVD spectral LMO
-- `gpt.py` + `train_shakespeare.py`: a small GPT training loop for tiny Shakespeare, with val-only evals during training and best-or-final checkpointing
+$$
+V_{i,t}=\operatorname{LMO}_{g_i}(M_{i,t}),
+\qquad
+\|V_{i,t}\|_{g_i}=1.
+$$
 
-## Main policy
+The step applies the effective LR and decay:
 
-Default optimizer settings:
+$$
+X_{i,t+1}
+=
+X_{i,t}
++
+\alpha_{i,t}V_{i,t}
+-
+\alpha_{i,t}\lambda_i X_{i,t}.
+$$
 
-- optimizer: `scionc`
-- warmup: `0`
-- min LR: `0`
+Constrained Scion radius $\rho_i$ is represented as $\lambda_i=1/\rho_i$.
+The scheduled learning rate is the Lion-K effective LR $\alpha_t$.
 
-Tune separately for:
+Current defaults:
 
-- `--prenorm rmsnorm`
-- `--prenorm rmsball`
+- optimizer: ScionC
+- hidden LMO: Gram Newton-Schulz
+- input embedding LMO: ColNorm
+- output head LMO: Sign
+- batch size: 64
+- gradient accumulation: 1
+- block size: 256
+- WSD schedule: 100 warmup steps, stable phase, 10% decay by default
 
-## Geometry-matched Scion init
+The general Lion-K core still supports cautious weight decay. It is out of scope
+for the ScionC Shakespeare recipe.
 
-Initialization matches the Scion optimizer geometry instead of using generic unscaled init:
+The general Lion-K core also supports primal averaging. It is out of scope for
+the ScionC Shakespeare recipe.
 
-- token embedding: column-normalized init on the transposed embedding matrix, with `rho_embed`
-- hidden matrices: spectral / semi-orthogonal init with the same dimension-aware scaling used by the spectral LMO, with `rho_hidden`
-- output head: sign init with `rho_out`
+Default radii:
+
+| Group | Geometry | Radius | Decay |
+|---|---|---:|---:|
+| input embedding | ColNorm | 1 | 1 |
+| hidden matrices | spectral | 3 | 0.333333 |
+| output head | Sign | 10 | 0.1 |
 
 ## Hidden LMOs
 
-The default hidden-matrix LMO is now `--hidden-lmo streaming-svd`, which keeps a per-parameter cached right-singular basis and applies one streaming power-iteration step per optimizer update.
+`--hidden-lmo gram-ns` is the default. It uses the Gram Newton-Schulz form:
+five Polar Express coefficient steps, the 1.05 safety factor, a Gram-space
+rectangular update, a reset at iteration 2, and a cheap two-moment spectral
+upper-bound normalization from the already-formed Gram.
 
-- ColNorm before Cholesky
-- direct Gram formation from `(M @ V).T @ (M @ V)` for numerical stability rather than `V.T @ (M.T @ M @ V)`
-- one shifted CholeskyQR correction for the final QR
-- RMS-offdiagonal gated QR refresh of the cached basis; default check interval is `100`
-- no Householder QR fallback in the per-step hot path
+`--hidden-lmo streaming-svd` keeps a per-parameter cached right-singular basis
+and applies one or more streaming subspace steps per optimizer update.
 
-There is also an experimental hidden-only closed-form filter:
+`--hidden-lmo svd-filter` adds an experimental diagonal filter:
 
-- `--hidden-lmo svd-filter`
-- defaults to `--filter-metric grad-sigma`, a zero-hook proxy using `sigma_i^2` as the denominator metric
-- `--filter-metric full` restores the exact incoming activation covariance for hidden linear layers
-- applies the closed-form diagonal filter under the same activation-perturbation budget as the matrix-sign direction
-- uses `--filter-ridge` as the relative damping in `A = X^T X / b + lambda I`
-- with `full`, `--filter-cov-interval` can reuse streamed activation covariances for speed
-- with `full`, the MLP input covariance is shared between SwiGLU `gate` and `up`
-- recommended faster-quality tradeoff: `--hidden-lmo svd-filter --filter-metric grad-sigma --spi-refresh-interval 100`
+- `--filter-metric grad-sigma`: zero-hook proxy using singular values of the gradient proxy.
+- `--filter-metric full`: exact incoming activation covariance for hidden linear layers.
 
-Use `--hidden-lmo gram-ns` for the baseline. This is the Gram Newton-Schulz form from Dao-AILab's implementation: five Polar Express coefficient steps with the 1.05 safety factor, a Gram-space update for rectangular matrices, a reset at iteration 2, and a cheap two-moment spectral upper-bound normalization from the already-formed Gram.
-
-## Exact single-run schedule
-
-`train_shakespeare.py` now uses an exact schedule:
-
-- warmup steps are explicit
-- stable phase length is explicit
-- if `decay_frac = 0`, there is no accidental one-step decay
-- the last decay step reaches `min_lr` exactly
-
-Default single-run decay fraction:
-
-- `--decay-frac 0.285`
-
-## Recommended commands
-
-### Train a single run
+## Recommended Command
 
 ```bash
 python train_shakespeare.py \
   --mode train \
-  --optimizer scion \
   --prenorm rmsnorm \
-  --batch-size 16 --grad-accum 4 --block-size 256 \
+  --batch-size 64 --grad-accum 1 --block-size 256 \
   --n-layer 6 --n-head 6 --d-model 384 \
-  --lr 1e-3 \
-  --warmup-frac 0.0 --decay-frac 0.285 --min-lr 0.0 \
-  --beta2 0.95 --phi 0.0 \
-  --hidden-lmo streaming-svd \
-  --rho-embed 1 --rho-hidden 3 --rho-out 10 \
-  --no-compile
+  --lr 4e-3 --min-lr 1e-4 \
+  --warmup-iters 100 --decay-frac 0.10 \
+  --beta2 0.95 \
+  --hidden-lmo gram-ns \
+  --embed-lmo colnorm --out-lmo sign \
+  --rho-embed 1 --rho-hidden 3 --rho-out 10
 ```
