@@ -52,6 +52,10 @@ _GNS_COEFFS = (
     ),
 )
 _GNS_RESETS = frozenset({2})
+_FilterEntry = tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
+_FilterGroupKey = tuple[tuple[int, ...], tuple[int, ...], torch.dtype, torch.device]
+_SVDGroupKey = tuple[tuple[int, ...], torch.dtype, torch.device]
+_SVDItem = tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, bool, float]
 
 
 def _gns_coeff(i: int) -> tuple[float, float, float]:
@@ -463,22 +467,13 @@ class StreamingSVDSpectralLMO:
             return self._v_step_norm_power(m, v, check_refresh)
         return self._v_step_scqr2(m, v, check_refresh)
 
-    def _filter_coefficients(
-        self,
-        items: list[tuple],
-        v_batch: torch.Tensor,
-        u_batch: torch.Tensor,
-        sigma: torch.Tensor,
-    ) -> torch.Tensor | None:
-        return None
-
     def _output_scale(
         self,
-        items: list[tuple],
+        items: list[_SVDItem],
         v_batch: torch.Tensor,
         mv: torch.Tensor,
         sigma: torch.Tensor,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor:
         return sigma.reciprocal()
 
     def _basis_for(self, p: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
@@ -496,7 +491,7 @@ class StreamingSVDSpectralLMO:
         self, tensors: list[torch.Tensor], params: list[torch.Tensor]
     ) -> list[torch.Tensor]:
         out: list[torch.Tensor | None] = [None] * len(tensors)
-        groups: dict[tuple, list[tuple]] = {}
+        groups: dict[_SVDGroupKey, list[_SVDItem]] = {}
         self.stats["steps"] += 1
         check_refresh = (
             self.refresh_interval > 0
@@ -528,14 +523,7 @@ class StreamingSVDSpectralLMO:
             mv = m_batch @ v_batch
             sigma = torch.linalg.vector_norm(mv, dim=-2).clamp_min(self.eps)
             mv_scale = self._output_scale(items, v_batch, mv, sigma)
-            if mv_scale is None:
-                u = mv / sigma.unsqueeze(-2)
-                coeff = self._filter_coefficients(items, v_batch, u, sigma)
-                if coeff is not None:
-                    u = u * coeff.unsqueeze(-2)
-                y_batch = u @ v_batch.mT
-            else:
-                y_batch = (mv * mv_scale.unsqueeze(-2)) @ v_batch.mT
+            y_batch = (mv * mv_scale.unsqueeze(-2)) @ v_batch.mT
 
             for j, (i, x, p, m, transposed, scale) in enumerate(items):
                 v = v_batch[j]
@@ -661,44 +649,27 @@ class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
 
     def _output_scale(
         self,
-        items: list[tuple],
+        items: list[_SVDItem],
         v_batch: torch.Tensor,
         mv: torch.Tensor,
         sigma: torch.Tensor,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor:
         if self.filter_metric == "grad-sigma":
             self.stats["filtered"] += len(items)
             return self._grad_sigma_mv_scale(sigma)
-        return None
 
-    def _coeff_batch(
-        self, cov: torch.Tensor, basis: torch.Tensor, sigma: torch.Tensor
-    ) -> torch.Tensor:
-        cov = cov.to(device=basis.device, dtype=basis.dtype)
-        denom = (cov @ basis).mul(basis).sum(dim=-2).clamp_min(self.eps)
-        return self._coeff_from_denom(denom, sigma)
-
-    def _filter_coefficients(
-        self,
-        items: list[tuple],
-        v_batch: torch.Tensor,
-        u_batch: torch.Tensor,
-        sigma: torch.Tensor,
-    ) -> torch.Tensor | None:
-        coeffs: list[torch.Tensor | None] = [None] * len(items)
-        groups: dict[tuple, list[tuple]] = {}
-
-        if self.filter_metric == "grad-sigma":
-            self.stats["filtered"] += len(items)
-            return self._coeff_from_denom(sigma.square(), sigma)
-
-        for i, item in enumerate(items):
-            basis = u_batch[i] if item[4] else v_batch[i]
-            cov = self._cov_for(item[2])
+        scales = list(sigma.reciprocal().unbind())
+        groups: dict[_FilterGroupKey, list[_FilterEntry]] = {}
+        for i, (_, _, p, _, transposed, _) in enumerate(items):
+            cov = self._cov_for(p)
             if cov is None:
                 self.stats["missing_covs"] += 1
-                coeffs[i] = torch.ones_like(sigma[i])
                 continue
+            basis = (
+                mv[i] / sigma[i].unsqueeze(0).clamp_min(self.eps)
+                if transposed
+                else v_batch[i]
+            )
             key = (tuple(cov.shape), tuple(basis.shape), basis.dtype, basis.device)
             groups.setdefault(key, []).append((i, cov, basis, sigma[i]))
 
@@ -709,11 +680,16 @@ class HiddenSVDFilterLMO(StreamingSVDSpectralLMO):
             coeff = self._coeff_batch(cov, basis, sig)
             self.stats["filtered"] += len(entries)
             for j, (i, _, _, _) in enumerate(entries):
-                coeffs[i] = coeff[j]
+                scales[i] = coeff[j] / sig[j].clamp_min(self.eps)
 
-        if any(x is None for x in coeffs):
-            raise RuntimeError("HiddenSVDFilterLMO missed a coefficient")
-        return torch.stack(coeffs)
+        return torch.stack(scales)
+
+    def _coeff_batch(
+        self, cov: torch.Tensor, basis: torch.Tensor, sigma: torch.Tensor
+    ) -> torch.Tensor:
+        cov = cov.to(device=basis.device, dtype=basis.dtype)
+        denom = (cov @ basis).mul(basis).sum(dim=-2).clamp_min(self.eps)
+        return self._coeff_from_denom(denom, sigma)
 
     def batch(
         self, tensors: list[torch.Tensor], params: list[torch.Tensor]

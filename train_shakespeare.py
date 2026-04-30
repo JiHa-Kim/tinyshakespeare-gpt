@@ -8,14 +8,15 @@ from pathlib import Path
 import torch
 
 from gpt import (
-    BatchSource,
-    CharDataset,
-    CausalSelfAttention,
     GPT,
-    GPTConfig,
     MLP,
+    BatchSource,
+    CausalSelfAttention,
+    CharDataset,
+    GPTConfig,
     maybe_download_tiny_shakespeare,
 )
+from lionk_ccwd import consume_step_stats
 from scion import (
     ColNormLMO,
     GramNewtonSchulzLMO,
@@ -29,7 +30,6 @@ from scion import (
     init_sign_,
     init_spectral_,
 )
-from lionk_ccwd import consume_step_stats
 
 
 def sync_now(device: torch.device) -> float:
@@ -591,7 +591,7 @@ def train(args):
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
         opt.step()
-        total_opt_steps += 1
+        total_opt_steps = step + 1
 
     if not (args.skip_sample or diverged):
         y = raw_model.generate(
