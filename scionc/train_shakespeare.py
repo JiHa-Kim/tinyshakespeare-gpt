@@ -295,7 +295,6 @@ def build_optimizer(model: GPT, args, device: torch.device):
         groups,
         lr=default_lr,
         beta2=args.beta2,
-        nesterov=args.nesterov,
     )
 
 
@@ -896,7 +895,6 @@ def make_parser():
         "--min-lr-out", "--min-lr-unembed", dest="min_lr_out", type=float, default=None
     )
     p.add_argument("--beta2", type=float, default=0.93)
-    p.add_argument("--nesterov", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
         "--hidden-lmo",
         choices=["streaming-svd", "svd-filter", "gram-ns"],

@@ -34,6 +34,7 @@ $$
 
 Constrained Scion radius $\rho_i$ is represented as $\lambda_i=1/\rho_i$.
 The scheduled learning rate is the Lion-K effective LR $\alpha_t$.
+`--beta2` controls the current EMA gradient proxy used by the LMO
 
 Current defaults:
 

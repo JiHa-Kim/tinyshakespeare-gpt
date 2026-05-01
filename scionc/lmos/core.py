@@ -346,7 +346,6 @@ class ScionC(LionKCCWDPA):
         lr: float = 1e-4,
         beta2: float = 0.95,
         dir_fn=None,
-        nesterov: bool = False,
         eps: float = 1e-12,
     ):
         super().__init__(
@@ -354,7 +353,7 @@ class ScionC(LionKCCWDPA):
             lr=lr,
             betas=(1.0, beta2),
             dir_fn=dir_fn,
-            nesterov=nesterov,
+            nesterov=True,
             eps=eps,
         )
 
