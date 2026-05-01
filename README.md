@@ -66,9 +66,10 @@ Default radii:
 ## Hidden LMOs
 
 `--hidden-lmo gram-ns` is the default. It uses the Gram Newton-Schulz form:
-five Polar Express coefficient steps, the 1.05 safety factor, a Gram-space
-rectangular update, a reset at iteration 2, and a cheap two-moment spectral
-upper-bound normalization from the already-formed Gram.
+five minimax Polar Express coefficient steps with an fp64-derived final
+normalization so the composed scalar map satisfies `p(1)=1`, the 1.05 safety
+factor, a Gram-space rectangular update, a reset at iteration 2, and a cheap
+two-moment spectral upper-bound normalization from the already-formed Gram.
 
 `--hidden-lmo streaming-svd` keeps a per-parameter cached right-singular basis
 and applies one or more streaming subspace steps per optimizer update.
@@ -81,7 +82,7 @@ and applies one or more streaming subspace steps per optimizer update.
 ## Recommended Command
 
 ```bash
-python -m scionc.train_shakespeare \
+uv run python -m scionc.train_shakespeare \
   --mode train \
   --prenorm rmsnorm \
   --batch-size 64 --grad-accum 1 --block-size 256 \
