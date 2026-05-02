@@ -74,6 +74,33 @@ def _moment2_beta_from_m2(m2: torch.Tensor, n: int) -> torch.Tensor:
     return 1.0 / n + torch.sqrt(((n - 1.0) / n) * v)
 
 
+def _moment2_from_gram(
+    gram: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n = gram.size(-1)
+    t1_raw = gram.diagonal(dim1=-2, dim2=-1).sum(-1, dtype=torch.float32)
+    t1 = t1_raw.clamp_min(eps)
+    r2 = gram.float().square().sum(dim=(-2, -1), dtype=torch.float32)
+    m2 = r2.div(t1.square()).clamp(1.0 / n, 1.0)
+    return t1_raw > eps, t1, m2
+
+
+def _moment4_from_gram_square(
+    gram: torch.Tensor, gram_square: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    n = gram.size(-1)
+    t1_raw = gram.diagonal(dim1=-2, dim2=-1).sum(-1, dtype=torch.float32)
+    t1 = t1_raw.clamp_min(eps)
+    t1_2 = t1.square()
+    r2 = gram_square.diagonal(dim1=-2, dim2=-1).sum(-1, dtype=torch.float32)
+    r3 = (gram.float() * gram_square.float()).sum(dim=(-2, -1), dtype=torch.float32)
+    r4 = gram_square.float().square().sum(dim=(-2, -1), dtype=torch.float32)
+    m2 = r2.div(t1_2).clamp(1.0 / n, 1.0)
+    m3 = r3.div(t1_2 * t1).clamp(1.0 / (n * n), 1.0)
+    m4 = r4.div(t1_2.square()).clamp(1.0 / (n * n * n), 1.0)
+    return t1_raw > eps, t1, m2, m3, m4
+
+
 def _moment4_coupled_feasible(
     t: torch.Tensor,
     m2: torch.Tensor,
@@ -89,21 +116,16 @@ def _moment4_coupled_feasible(
     m2_sq = m2.square()
     m3_sq = m3.square()
     m2m3 = m2 * m3
-    m2m4 = m2 * m4
-    moment_gap = m2m4 - m3_sq
+    moment_gap = m2 * m4 - m3_sq
 
     e0 = (m2 - t2) * (m4 - t4) - (m3 - t3).square()
-    d0 = (
-        (1.0 - n_float * m2) * t4
-        + 2.0 * (n_float * m3 - m2) * t3
-        + (3.0 * m2_sq - 2.0 * m3 - n_float * m4) * t2
-        + 2.0 * (m4 - m2m3) * t
-        + (n_float - 1.0) * moment_gap
-        - m2 * m2_sq
-        + 2.0 * m2m3
-        - m4
-    )
-    return torch.minimum(e0, d0) >= -tol
+    d4 = 1.0 - n_float * m2
+    d3 = 2.0 * (n_float * m3 - m2)
+    d2 = 3.0 * m2_sq - 2.0 * m3 - n_float * m4
+    d1 = 2.0 * (m4 - m2m3)
+    d0 = (n_float - 1.0) * moment_gap - m2 * m2_sq + 2.0 * m2m3 - m4
+    det0 = (((d4 * t + d3) * t + d2) * t + d1) * t + d0
+    return torch.minimum(e0, det0) >= -tol
 
 
 def _moment4_support_lower(
@@ -119,18 +141,35 @@ def _moment4_support_lower(
     return torch.maximum(torch.maximum(m2, m4 / m3.clamp_min(eps)), q_root)
 
 
-def _moment4_upper_beta(
-    m2: torch.Tensor, m3: torch.Tensor, m4: torch.Tensor, n: int, eps: float
-) -> torch.Tensor:
-    beta2 = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
-    if n <= 1:
-        return beta2
-
+def _moment4_beta_bracket(
+    m2: torch.Tensor,
+    m3: torch.Tensor,
+    m4: torch.Tensor,
+    n: int,
+    eps: float,
+    beta2: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     beta_m4 = torch.sqrt(torch.sqrt(m4.clamp_min(eps)))
     c_rad = ((n - 1.0) * (n * m4 - m2.square())).clamp_min(0.0)
     beta_c = torch.sqrt(((m2 + torch.sqrt(c_rad)) / n).clamp_min(eps))
     hi = torch.minimum(beta2, torch.minimum(beta_m4, beta_c)).clamp(eps, 1.0)
-    lo = torch.minimum(_moment4_support_lower(m2, m3, m4, eps), hi)
+    return torch.minimum(_moment4_support_lower(m2, m3, m4, eps), hi), hi
+
+
+def _moment4_upper_beta(
+    m2: torch.Tensor,
+    m3: torch.Tensor,
+    m4: torch.Tensor,
+    n: int,
+    eps: float,
+    beta2: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if beta2 is None:
+        beta2 = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
+    if n <= 1:
+        return beta2
+
+    lo, hi = _moment4_beta_bracket(m2, m3, m4, n, eps, beta2)
 
     # The bracket enforces the one-dimensional PSD minors; only E and det(M0)
     # can still cut the interval.
@@ -145,6 +184,18 @@ def _moment4_upper_beta(
     return hi.clamp(eps, 1.0)
 
 
+def _spectral_bound_from_beta(
+    active: torch.Tensor,
+    t1: torch.Tensor,
+    beta: torch.Tensor,
+    eps: float,
+    safety: float,
+) -> torch.Tensor:
+    beta = (beta + _MOMENT4_BETA_PAD).clamp(eps, 1.0)
+    bound = (t1 * beta + eps * t1).mul(safety).clamp_min(eps)
+    return torch.where(active, bound, torch.ones_like(bound))
+
+
 def _spectral_bound_from_gram(
     gram: torch.Tensor,
     eps: float,
@@ -152,31 +203,16 @@ def _spectral_bound_from_gram(
     gram_square: torch.Tensor | None = None,
 ) -> torch.Tensor:
     n = gram.size(-1)
-    t1_raw = gram.diagonal(dim1=-2, dim2=-1).sum(-1, dtype=torch.float32)
-    active = t1_raw > eps
-    t1 = t1_raw.clamp_min(eps)
     if gram_square is None:
-        r2 = gram.float().square().sum(dim=(-2, -1), dtype=torch.float32)
-    else:
-        r2 = gram_square.diagonal(dim1=-2, dim2=-1).sum(-1, dtype=torch.float32)
+        active, t1, m2 = _moment2_from_gram(gram, eps)
+        beta = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
+        return _spectral_bound_from_beta(active, t1, beta, eps, safety)
 
-    m2 = r2.div(t1.square()).clamp(1.0 / n, 1.0)
-    beta = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
-
-    if gram_square is not None and n > 1:
-        t1_2 = t1.square()
-        r3 = (gram.float() * gram_square.float()).sum(
-            dim=(-2, -1), dtype=torch.float32
-        )
-        r4 = gram_square.float().square().sum(dim=(-2, -1), dtype=torch.float32)
-        m3 = r3.div(t1_2 * t1).clamp(1.0 / (n * n), 1.0)
-        m4 = r4.div(t1_2.square()).clamp(1.0 / (n * n * n), 1.0)
-        beta4 = _moment4_upper_beta(m2, m3, m4, n, eps)
-        beta = torch.minimum(beta, beta4.to(beta.dtype)).clamp(eps, 1.0)
-
-    beta = (beta + _MOMENT4_BETA_PAD).clamp(eps, 1.0)
-    bound = (t1 * beta + eps * t1).mul(safety).clamp_min(eps)
-    return torch.where(active, bound, torch.ones_like(bound))
+    active, t1, m2, m3, m4 = _moment4_from_gram_square(gram, gram_square, eps)
+    beta2 = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
+    beta4 = _moment4_upper_beta(m2, m3, m4, n, eps, beta2)
+    beta = torch.minimum(beta2, beta4.to(beta2.dtype)).clamp(eps, 1.0)
+    return _spectral_bound_from_beta(active, t1, beta, eps, safety)
 
 
 def _scale_gram_and_first_poly_eager(
@@ -232,23 +268,22 @@ def _gram_newton_schulz_core(
 
     for i in range(1, steps):
         a, b, c = _gns_coeff(i)
-        if i in _GNS_RESETS and q is not None:
+        reset = i in _GNS_RESETS
+        if reset:
             if x_scale is not None:
                 q = q * x_scale
                 x_scale = None
             x = torch.bmm(q, x)
             gram = torch.bmm(x, x.mT)
-            q = None
 
         z = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
-        q = z + a * eye if q is None else torch.baddbmm(q, q, z, beta=a)
+        q = z + a * eye if reset else torch.baddbmm(q, q, z, beta=a)
 
-        if i < steps - 1 and i + 1 not in _GNS_RESETS:
-            rz = torch.baddbmm(gram, gram, z, beta=a)
-            gram = torch.baddbmm(rz, z, rz, beta=a)
+        if i == steps - 1 or i + 1 in _GNS_RESETS:
+            continue
+        rz = torch.baddbmm(gram, gram, z, beta=a)
+        gram = torch.baddbmm(rz, z, rz, beta=a)
 
-    if q is None:
-        return x
     if x_scale is not None:
         q = q * x_scale
     return torch.bmm(q, x)
@@ -262,12 +297,11 @@ def _standard_newton_schulz_core(
 
     gram = torch.bmm(x, x.mT)
     gram_square = torch.bmm(gram, gram)
-    gram, update, x_scale = _scale_gram_and_first_poly(
+    _, update, x_scale = _scale_gram_and_first_poly(
         x, gram, gram_square, eps, bound_safety
     )
     x = torch.baddbmm(x, update, x, beta=_GNS_A0)
-    if x_scale is not None:
-        x = x * x_scale
+    x = x * x_scale
 
     for i in range(1, steps):
         a, b, c = _gns_coeff(i)
