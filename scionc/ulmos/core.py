@@ -16,6 +16,7 @@ __all__ = [
     "StreamingSVDULMO",
     "HiddenSVDFilterULMO",
     "SignULMO",
+    "spectral_moment_bounds_sq",
     "init_colnorm_",
     "init_rownorm_",
     "init_spectral_",
@@ -152,12 +153,13 @@ def _moment4_beta_bracket(
     n: int,
     eps: float,
     beta2: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     beta_m4 = torch.sqrt(torch.sqrt(m4.clamp_min(eps)))
     c_rad = ((n - 1.0) * (n * m4 - m2.square())).clamp_min(0.0)
     beta_c = torch.sqrt(((m2 + torch.sqrt(c_rad)) / n).clamp_min(eps))
     hi = torch.minimum(beta2, torch.minimum(beta_m4, beta_c)).clamp(eps, 1.0)
-    return torch.minimum(_moment4_support_lower(m2, m3, m4, eps), hi), hi
+    support_lower = _moment4_support_lower(m2, m3, m4, eps)
+    return torch.minimum(support_lower, hi), hi, support_lower
 
 
 def _moment4_upper_beta(
@@ -168,24 +170,36 @@ def _moment4_upper_beta(
     eps: float,
     beta2: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    return _moment4_beta_interval(m2, m3, m4, n, eps, beta2)[1]
+
+
+def _moment4_beta_interval(
+    m2: torch.Tensor,
+    m3: torch.Tensor,
+    m4: torch.Tensor,
+    n: int,
+    eps: float,
+    beta2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if beta2 is None:
         beta2 = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
     if n <= 1:
-        return beta2
+        beta = beta2.clamp(eps, 1.0)
+        return beta, beta
 
-    lo, hi = _moment4_beta_bracket(m2, m3, m4, n, eps, beta2)
+    lower, upper, support_lower = _moment4_beta_bracket(m2, m3, m4, n, eps, beta2)
 
-    # The bracket enforces the one-dimensional PSD minors; only E and det(M0)
-    # can still cut the interval.
     for _ in range(_MOMENT4_REFINE_STEPS):
-        mid = 0.5 * (lo + hi)
+        mid = 0.5 * (lower + upper)
         mid_feasible = _moment4_coupled_feasible(
             mid, m2, m3, m4, n, _MOMENT4_FEAS_TOL
         )
-        lo = torch.where(mid_feasible, mid, lo)
-        hi = torch.where(mid_feasible, hi, mid)
+        lower = torch.where(mid_feasible, mid, lower)
+        upper = torch.where(mid_feasible, upper, mid)
 
-    return hi.clamp(eps, 1.0)
+    upper = upper.clamp(eps, 1.0)
+    # The bisection lower brackets beta_4; the certificate lower is K(t) support.
+    return torch.minimum(support_lower, upper).clamp(eps, 1.0), upper
 
 
 def _spectral_bound_from_beta(
@@ -201,6 +215,27 @@ def _spectral_bound_from_beta(
     bound = (t1 * beta + _dot_roundoff_gamma(dot_dim) * t1).mul(safety)
     bound = bound.clamp_min(eps)
     return torch.where(active, bound, torch.ones_like(bound))
+
+
+def _spectral_bounds_from_moments(
+    active: torch.Tensor,
+    t1: torch.Tensor,
+    m2: torch.Tensor,
+    m3: torch.Tensor,
+    m4: torch.Tensor,
+    n: int,
+    eps: float,
+    safety: float,
+    dot_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    beta2 = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
+    lower_beta, upper_beta = _moment4_beta_interval(m2, m3, m4, n, eps, beta2)
+    upper_beta = torch.minimum(beta2, upper_beta.to(beta2.dtype)).clamp(eps, 1.0)
+    lower_beta = torch.minimum(lower_beta.to(beta2.dtype), upper_beta)
+
+    lower = torch.where(active, (t1 * lower_beta).clamp_min(0.0), torch.zeros_like(t1))
+    upper = _spectral_bound_from_beta(active, t1, upper_beta, eps, safety, dot_dim)
+    return lower, upper
 
 
 def _spectral_bound_from_gram(
@@ -222,6 +257,33 @@ def _spectral_bound_from_gram(
     beta4 = _moment4_upper_beta(m2, m3, m4, n, eps, beta2)
     beta = torch.minimum(beta2, beta4.to(beta2.dtype)).clamp(eps, 1.0)
     return _spectral_bound_from_beta(active, t1, beta, eps, safety, dot_dim)
+
+
+def spectral_moment_bounds_sq(
+    x: torch.Tensor,
+    eps: float = 1e-7,
+    safety: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.ndim < 2 or x.numel() == 0:
+        norm_sq = x.float().square().sum()
+        return norm_sq, norm_sq
+
+    batch_shape = x.shape[:-2]
+    y = x.reshape(-1, *x.shape[-2:]).float() if batch_shape else x.unsqueeze(0).float()
+    if y.size(-2) > y.size(-1):
+        y = y.mT
+
+    gram = torch.bmm(y, y.mT)
+    gram_square = torch.bmm(gram, gram)
+    active, t1, m2, m3, m4 = _moment4_from_gram_square(gram, gram_square, eps)
+    lower, upper = _spectral_bounds_from_moments(
+        active, t1, m2, m3, m4, gram.size(-1), eps, safety, y.size(-1)
+    )
+    fro_sq = gram.diagonal(dim1=-2, dim2=-1).sum(-1, dtype=torch.float32)
+    upper = torch.where(active, upper, fro_sq)
+    if not batch_shape:
+        return lower.squeeze(0), upper.squeeze(0)
+    return lower.reshape(batch_shape), upper.reshape(batch_shape)
 
 
 def _scale_gram_and_first_poly_eager(
