@@ -5,7 +5,7 @@ A tiny reference implementation organized by category:
 - `scionc/optim/`: general Lion-K core with corrected decay, cautious masking, primal averaging, and direct shrinkage.
 - `scionc/ulmos/`: basic ULMOs, Gram-NS, streaming SVD, and SVD-filter helpers.
 - `scionc/models/`: compact GPT model and tiny Shakespeare data utilities.
-- `scionc/probes/`: optional line, convergence, and optimizer-step stats probes.
+- `scionc/probes/`: optional line and optimizer-step stats probes.
 - `scionc/train_shakespeare.py`: training entrypoint.
 
 ## Active Recipe
@@ -43,27 +43,29 @@ X \leftarrow \zeta X+\eta V.
 The same equations apply independently to embedding, hidden, and output groups,
 with group-specific ULMOs, steady-state radii, shrink half-lives, and
 dimensionless step-scale schedules. The raw additive step $\eta_t$ is derived by
-the corrected RMS steady-state rule:
+the geometry invariant rule:
 
 ```math
+\zeta_t=\zeta_0^{r_t},
+\qquad
 \eta_t
 =
-s_t\rho
-\sqrt{
-\frac{1-2^{-2\Delta\tau/h_\zeta}}{S}
-}.
+s_{\mathrm{peak}}(1-\zeta_t)\rho.
 ```
+
+Here $\zeta_0$ is the peak shrink factor from the shrink half-life, and $r_t$
+is the warmup/stable/decay schedule ratio. Scheduling the shrink rate exactly
+uses $\zeta_t=\zeta_0^{r_t}$, so $\zeta_t\to1$ as the schedule decays to zero.
+With $s_{\mathrm{peak}}=1$, the radius ball is invariant under a persistent unit
+ULMO atom: $\|X_{\mathrm{new}}\|\le\rho$ whenever $\|X\|\le\rho$. Peak tuning
+uses the dimensionless coordinate $\ell=\log_2 s_{\mathrm{peak}}$, so changing
+$\ell$ by 1 doubles or halves the derived additive step. The script accepts
+`--log2-step-scale*` for that coordinate and keeps `--step-scale*` as a linear
+compatibility override.
 
 `--readout-mu` controls the dimensionless Nesterov readout blend. Shrinkage is
 controlled by `--shrink-half-life*`. Geometry-matched initialization uses the
-same steady-state radius $\rho$. The momentum factor is:
-
-```math
-S
-=
-\frac{1+\beta}
-{(1-\mu\beta)^2(1+\beta)+(\mu\beta)^2(1-\beta)}.
-```
+same steady-state radius $\rho$.
 
 See [docs/scionc_steady_state_parametrization.md](docs/scionc_steady_state_parametrization.md)
 for the derivation.
@@ -81,17 +83,23 @@ Current defaults:
 - batch size: 64
 - gradient accumulation: 1
 - block size: 256
-- peak step scale: 1
-- step-scale decay floor: 0
-- derived additive step: group-specific, printed as `eta`
+- peak step scale: 1 (`log2=0`)
+- schedule floor: 0
+- peak derived additive steps at the default count increment:
+  - embedding: 0.035
+  - hidden: 0.035
+  - output: 0.035
 - steady-state radii: embedding 1, hidden 3, output 10
 - readout mu: 1
-- EMA half-life: about 1.56e5 processed tokens
+- EMA half-life: about 2.21e5 processed tokens
 - shrink half-lives:
   - embedding: about 3.19e5 processed tokens
   - hidden: about 9.68e5 processed tokens
   - output: about 3.24e6 processed tokens
 - WSD schedule: 100 warmup steps, stable phase, 15% decay by default
+- train-state checkpoint: saved at the decay start by default so tail schedules
+  can be resumed with `--resume-state`; use `--stop-after-state-save` to build
+  only the shared stable prefix
 
 ## Hidden ULMOs
 
@@ -112,42 +120,60 @@ incoming activation covariance for hidden linear layers.
 ```bash
 uv run python -m scionc.train_shakespeare \
   --mode train \
+  --out-path out/scionc_rate_scheduled_2k.pt \
+  --sample-out out/scionc_rate_scheduled_2k_t08_k40_samples.md \
   --prenorm rmsnorm \
   --batch-size 64 --grad-accum 1 --block-size 256 \
   --n-layer 6 --n-head 6 --d-model 384 \
-  --step-scale 1 --min-step-scale 0 \
+  --log2-step-scale 0 --min-step-scale 0 \
   --rho-embed 1 --rho-hidden 3 --rho-out 10 \
   --warmup-iters 100 --decay-frac 0.15 \
-  --beta-half-life 1.565e5 --readout-mu 1 \
+  --beta-half-life 2.214e5 --readout-mu 1 \
   --hidden-ulmo gram-ns \
   --embed-ulmo colnorm --out-ulmo sign \
   --shrink-half-life-embed 3.188e5 \
   --shrink-half-life-hidden 9.677e5 \
-  --shrink-half-life-out 3.239e6
+  --shrink-half-life-out 3.239e6 \
+  --temperature 0.8 --top-k 40 --sample-count 2
 ```
 
-## Previous Reference Result
+Evaluate the saved checkpoint with more batches:
 
-The previous WSD recipe reached validation loss `1.3912` over 200 eval batches
-after 2k steps on tiny Shakespeare with batch size 64, gradient accumulation 1,
-and block size 256. On a 4070 Ti, the compiled run reserved about 1.85 GB CUDA
-memory and trained at about 450k tokens/s.
+```bash
+uv run python -m scionc.train_shakespeare \
+  --mode eval \
+  --device cuda \
+  --out-path out/scionc_rate_scheduled_2k.pt \
+  --eval-iters 200
+```
 
-Example sample from `out/scionc_wsd_lr0p035_min0.pt`, using temperature `0.8`
-and top-k `40`:
+## Current Reference Result
+
+The current shrink-rate parametrization completed a 2k-step tiny Shakespeare
+run with batch size 64, gradient accumulation 1, and block size 256. The final
+training eval at step 1999 reported best validation loss `1.3987`. A separate
+200-batch eval of `out/scionc_rate_scheduled_2k.pt` reported:
 
 ```text
-To be, or not to be contented
-You in conscience, your brother and your grace,
-To make the people measure of these men.
+train 1.0763 | val 1.4068
+```
 
-NORTHUMBERLAND:
-Your crown, sir, your body will confess
-I should soldier till you weep the season,
-And your tongue and yet I should be so;
-Or in that bear the town that Clarence shall be loud.
+The run also wrote a branchable train-state checkpoint at
+`out/scionc_rate_scheduled_2k_state_step01700.pt`, which is the start of the
+decay phase.
 
-BUCKINGHAM:
-Why, bear the warriors with the world my life,
-Who was an oath desires himself for stars.
+Example sample from `out/scionc_rate_scheduled_2k_t08_k40_samples.md`, using
+temperature `0.8` and top-k `40`:
+
+```text
+To be, or not to be excellent.
+
+ROMEO:
+So do you see! stir, if you say the Earl of Wiltshire,
+As now to take an after young Peter's brother.
+
+ROMEO:
+Impossible honourable between the first,
+Of blood will sue by England's friendship that love
+In all the people.
 ```

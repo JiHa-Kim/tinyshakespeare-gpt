@@ -70,8 +70,6 @@ def schedule_at_step(
 
     progress = (step - decay_start) / (decay_steps - 1)
     progress = min(max(progress, 0.0), 1.0)
-    if peak > 0.0 and floor > 0.0:
-        return 1.0 / ((1.0 - progress) / peak + progress / floor)
     return peak + (floor - peak) * progress
 
 

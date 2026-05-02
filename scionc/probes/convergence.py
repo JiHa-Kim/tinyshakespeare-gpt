@@ -21,6 +21,7 @@ class ConvergenceItem:
     group: str
     param: torch.Tensor
     ulmo: object
+    rho: float
 
 
 def median(values: list[float]) -> float:
@@ -158,6 +159,7 @@ class ConvergenceProbe:
             id(p): (
                 group.get("name", "group"),
                 group["ulmo"],
+                float(group.get("rho", 1.0)),
             )
             for group in opt.param_groups
             for p in group["params"]
@@ -169,8 +171,8 @@ class ConvergenceProbe:
                 continue
             if keep is not None and name not in keep:
                 continue
-            group, ulmo = groups[id(p)]
-            items.append(ConvergenceItem(name, group, p, ulmo))
+            group, ulmo, rho = groups[id(p)]
+            items.append(ConvergenceItem(name, group, p, ulmo, rho))
         return items
 
     def _probe_names(self, model: GPT) -> set[str]:
@@ -231,8 +233,13 @@ class ConvergenceProbe:
             if report:
                 stats = grouped.setdefault(item.group, {})
                 grad_dual = dual_norm(current_grad, item.ulmo, self.eps, item.param)
+                param_primal = primal_norm(current_param, item.ulmo, self.eps)
+                eta = current_etas.get(item.group, float("nan"))
                 self._append(stats, "gdual", grad_dual)
-                self._append(stats, "eta", current_etas.get(item.group, float("nan")))
+                self._append(stats, "grel", item.rho * grad_dual)
+                self._append(stats, "xrel", param_primal / max(item.rho, self.eps))
+                self._append(stats, "eta", eta)
+                self._append(stats, "eta_rel", eta / max(item.rho, self.eps))
 
                 if previous is not None:
                     prev_grad, prev_param = previous
@@ -244,11 +251,12 @@ class ConvergenceProbe:
                     )
                     if dparam > self.eps and grad_dual > self.eps:
                         l1hat = (dgrad / dparam) / grad_dual
+                        lrel = item.rho * l1hat
                         self._append(stats, "l1", l1hat)
+                        self._append(stats, "lrel", lrel)
                         self._append(
                             stats, "eta_pred", self.action_scale / l1hat
                         )
-                        eta = current_etas.get(item.group, float("nan"))
                         self._append(stats, "action_eff", eta * l1hat)
 
                 input_sr = self.input_sr.get(id(item.param))
@@ -275,19 +283,28 @@ class ConvergenceProbe:
         self.summary = {}
         for name, stats in grouped.items():
             fields = [f"eta={median(stats.get('eta', [])):.2e}"]
+            if stats.get("eta_rel"):
+                fields.append(f"eta/r={median(stats['eta_rel']):.2e}")
+            if stats.get("xrel"):
+                fields.append(f"x/r={median(stats['xrel']):.2f}")
             if stats.get("l1"):
                 l1 = median(stats["l1"])
+                lrel = median(stats["lrel"])
                 action_eff = median(stats["action_eff"])
                 eta_pred = median(stats["eta_pred"])
                 self.summary[name] = {
                     "l1": l1,
+                    "lrel": lrel,
                     "action_eff": action_eff,
                     "eta_pred": eta_pred,
                 }
                 fields.append(f"L1={l1:.2e}")
+                fields.append(f"Lrel={lrel:.2e}")
                 fields.append(f"act={action_eff:.2f}")
                 fields.append(f"eta*={eta_pred:.2e}")
             fields.append(f"g*={median(stats.get('gdual', [])):.2e}")
+            if stats.get("grel"):
+                fields.append(f"grel={median(stats['grel']):.2e}")
             if stats.get("spec_ratio"):
                 spec_ratio = median(stats["spec_ratio"])
                 self.summary.setdefault(name, {})["spec_ratio"] = spec_ratio

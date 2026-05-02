@@ -19,10 +19,8 @@ from scionc.ulmos import (
     init_sign_,
     init_spectral_,
 )
-from scionc.optim import ScionC, lionk_S
+from scionc.optim import ScionC
 from scionc.optim.parametrization import (
-    RMSCorrection,
-    additive_eta,
     halving_factor,
     resolve_schedule,
     schedule_at_step,
@@ -53,17 +51,21 @@ from scionc.probes.optimizer_stats import (
     consume_step_stats,
 )
 
-DEFAULT_BETA_HALF_LIFE = 156_489.1137547854
-DEFAULT_SHRINK_HALF_LIVES = {
-    "embed": 318_760.11959306244,
-    "hidden": 967_726.9243144159,
-    "out": 3_239_039.393395033,
-}
 DEFAULT_STEADY_RADII = {
     "embed": 1.0,
     "hidden": 3.0,
     "out": 10.0,
 }
+DEFAULT_COUNT_INCREMENT = 64 * 256
+DEFAULT_REFERENCE_ETA = 3.5e-2
+DEFAULT_REFERENCE_BETA = 0.95
+DEFAULT_BETA_HALF_LIFE = -DEFAULT_COUNT_INCREMENT / math.log2(DEFAULT_REFERENCE_BETA)
+DEFAULT_SHRINK_HALF_LIVES = {
+    name: -DEFAULT_COUNT_INCREMENT
+    / math.log2(1.0 - DEFAULT_REFERENCE_ETA / rho)
+    for name, rho in DEFAULT_STEADY_RADII.items()
+}
+DEFAULT_STEP_SCALE = 1.0
 
 
 def sync_now(device: torch.device) -> float:
@@ -151,18 +153,43 @@ def estimate_val_loss(
     return estimate_loss(model, source, eval_iters, amp_dtype, splits=("val",))["val"]
 
 
+def scale_from_coordinate(
+    linear: float | None, log2_value: float | None, label: str
+) -> float | None:
+    if linear is not None and log2_value is not None:
+        raise ValueError(f"set either {label} or log2 {label}, not both")
+    if log2_value is None:
+        return linear
+    if not math.isfinite(log2_value):
+        raise ValueError(f"invalid log2 {label}: {log2_value}")
+    try:
+        return 2.0**log2_value
+    except OverflowError as exc:
+        raise ValueError(f"invalid log2 {label}: {log2_value}") from exc
+
+
 def resolve_group_step_scale(args, group: str) -> tuple[float, float]:
-    peak = getattr(args, f"step_scale_{group}", None)
+    peak = scale_from_coordinate(
+        getattr(args, f"step_scale_{group}", None),
+        getattr(args, f"log2_step_scale_{group}", None),
+        f"{group} step scale",
+    )
     if peak is None:
-        peak = args.step_scale
+        peak = scale_from_coordinate(
+            args.step_scale,
+            args.log2_step_scale,
+            "global step scale",
+        )
+    if peak is None:
+        peak = DEFAULT_STEP_SCALE
     floor = getattr(args, f"min_step_scale_{group}", None)
     if floor is None:
         floor = args.min_step_scale
     if floor is None:
         floor = 0.1 * peak
-    if peak < 0.0:
+    if not math.isfinite(peak) or peak < 0.0:
         raise ValueError(f"invalid {group} step scale: {peak}")
-    if floor < 0.0:
+    if not math.isfinite(floor) or floor < 0.0:
         raise ValueError(f"invalid {group} minimum step scale: {floor}")
     return peak, floor
 
@@ -207,7 +234,7 @@ def apply_auto_group_step_scales(
         group["auto_l1"] = l1
 
         eta = args.auto_action_scale / l1
-        unit = group_eta(group, 1.0)
+        unit = (1.0 - float(group["peak_shrink"])) * float(group["rho"])
         step_scale = eta / unit
         step_scale = min(
             max(step_scale, group.get("min_step_scale", 0.0)),
@@ -260,13 +287,30 @@ def hidden_params(model: GPT) -> list[torch.Tensor]:
     return [p for p in model.parameters() if p.requires_grad and id(p) not in skip]
 
 
-def group_eta(group: dict, step_scale: float) -> float:
-    return additive_eta(
-        rho=float(group["rho"]),
-        shrink=float(group["shrink"]),
-        step_scale=step_scale,
-        correction=group["rms_correction"],
-    )
+def group_schedule_ratio(group: dict, scheduled_step_scale: float) -> float:
+    peak_step_scale = float(group["peak_step_scale"])
+    if peak_step_scale == 0.0:
+        return 0.0
+    ratio = scheduled_step_scale / peak_step_scale
+    if not math.isfinite(ratio) or ratio < 0.0:
+        raise ValueError(
+            f"invalid schedule ratio for {group.get('name', 'group')}: {ratio}"
+        )
+    return ratio
+
+
+def group_scheduled_values(
+    group: dict, scheduled_step_scale: float
+) -> tuple[float, float, float, float]:
+    ratio = group_schedule_ratio(group, scheduled_step_scale)
+    shrink = float(group["peak_shrink"]) ** ratio
+    eta_unit = (1.0 - shrink) * float(group["rho"])
+    eta = float(group["peak_step_scale"]) * eta_unit
+    return shrink, eta_unit, eta, ratio
+
+
+def group_eta(group: dict, scheduled_step_scale: float) -> float:
+    return group_scheduled_values(group, scheduled_step_scale)[2]
 
 
 @torch.no_grad()
@@ -298,7 +342,6 @@ def optimizer_group(
     ulmo,
     args,
     delta_tau: int,
-    rms_correction: RMSCorrection,
 ) -> dict | None:
     if not params:
         return None
@@ -311,6 +354,8 @@ def optimizer_group(
         "params": params,
         "ulmo": ulmo,
         "rho": rho,
+        "peak_shrink": shrink,
+        "eta_unit": (1.0 - shrink) * rho,
         "step_scale": peak_step_scale,
         "peak_step_scale": peak_step_scale,
         "max_step_scale": peak_step_scale,
@@ -319,7 +364,6 @@ def optimizer_group(
         "shrink_half_life": shrink_half_life,
         "beta_half_life": args.beta_half_life,
         "count_increment": delta_tau,
-        "rms_correction": rms_correction,
     }
     group["lr"] = group_eta(group, peak_step_scale)
     return group
@@ -329,9 +373,6 @@ def optimizer_group(
 def build_optimizer(model: GPT, args, device: torch.device):
     delta_tau = count_increment(args)
     memory_beta = halving_factor(delta_tau, args.beta_half_life, "beta_half_life")
-    rms_correction = RMSCorrection(
-        momentum_factor=lionk_S(args.readout_mu, memory_beta, nesterov=True)
-    )
     work_dtype = torch.float16 if device.type == "cuda" else torch.float32
     groups = [
         optimizer_group(
@@ -340,7 +381,6 @@ def build_optimizer(model: GPT, args, device: torch.device):
             make_embed_ulmo(args),
             args,
             delta_tau,
-            rms_correction,
         ),
         optimizer_group(
             "hidden",
@@ -348,7 +388,6 @@ def build_optimizer(model: GPT, args, device: torch.device):
             make_hidden_ulmo(args, work_dtype),
             args,
             delta_tau,
-            rms_correction,
         ),
         optimizer_group(
             "out",
@@ -356,7 +395,6 @@ def build_optimizer(model: GPT, args, device: torch.device):
             make_out_ulmo(args),
             args,
             delta_tau,
-            rms_correction,
         ),
     ]
     groups = [group for group in groups if group is not None]
@@ -369,6 +407,36 @@ def build_optimizer(model: GPT, args, device: torch.device):
         readout_mu=args.readout_mu,
         memory_beta=memory_beta,
     )
+
+
+def configure_optimizer_actions(opt, args) -> None:
+    delta_tau = count_increment(args)
+    memory_beta = halving_factor(delta_tau, args.beta_half_life, "beta_half_life")
+    for group in opt.param_groups:
+        name = group.get("name")
+        if name not in DEFAULT_STEADY_RADII:
+            continue
+        peak_step_scale, min_step_scale = resolve_group_step_scale(args, name)
+        rho = resolve_group_rho(args, name)
+        shrink_half_life = resolve_group_shrink_half_life(args, name)
+        group.update(
+            rho=rho,
+            peak_step_scale=peak_step_scale,
+            max_step_scale=peak_step_scale,
+            min_step_scale=min_step_scale,
+            peak_shrink=halving_factor(
+                delta_tau, shrink_half_life, f"{name}_shrink_half_life"
+            ),
+            shrink_half_life=shrink_half_life,
+            beta_half_life=args.beta_half_life,
+            count_increment=delta_tau,
+            memory_beta=memory_beta,
+            readout_mu=args.readout_mu,
+        )
+        group["shrink"] = group["peak_shrink"]
+        group["eta_unit"] = (1.0 - group["shrink"]) * rho
+        group["step_scale"] = peak_step_scale
+        group["lr"] = group_eta(group, peak_step_scale)
 
 
 def group_ulmo(opt, name: str, cls):
@@ -471,8 +539,67 @@ def save_final_checkpoint(path: Path, model: GPT, dataset: CharDataset, args):
     save_checkpoint(final_path, model, dataset, args)
 
 
+def state_checkpoint_path(path: Path, args, step: int) -> Path:
+    if args.state_out_path:
+        return Path(args.state_out_path)
+    return path.with_name(f"{path.stem}_state_step{step:05d}{path.suffix}")
+
+
+def save_train_state(
+    path: Path,
+    model: GPT,
+    opt,
+    dataset: CharDataset,
+    args,
+    device: torch.device,
+    step: int,
+    total_opt_steps: int,
+    best_val: float,
+    max_val: float,
+    initial_val: float | None,
+    last_losses: dict[str, float],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "model_cfg": asdict(model.cfg),
+            "optimizer": opt.state_dict(),
+            "chars": dataset.chars,
+            "args": vars(args),
+            "rng": capture_rng(device),
+            "step": step,
+            "total_opt_steps": total_opt_steps,
+            "best_val": best_val,
+            "max_val": max_val,
+            "initial_val": initial_val,
+            "last_losses": dict(last_losses),
+        },
+        path,
+    )
+
+
+def load_torch_checkpoint(path: Path, device: torch.device):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def load_train_state(path: Path, model: GPT, opt, device: torch.device) -> dict:
+    ckpt = load_torch_checkpoint(path, device)
+    model.load_state_dict(ckpt["model"])
+    opt.load_state_dict(ckpt["optimizer"])
+    cpu_rng, cuda_rng = ckpt["rng"]
+    ckpt["rng"] = (
+        cpu_rng.cpu(),
+        cuda_rng.cpu() if cuda_rng is not None and device.type == "cuda" else None,
+    )
+    return ckpt
+
+
 def load_checkpoint(path: Path, device: torch.device):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = load_torch_checkpoint(path, device)
     chars = ckpt["chars"]
     stoi = {ch: i for i, ch in enumerate(chars)}
     itos = {i: ch for i, ch in enumerate(chars)}
@@ -566,16 +693,19 @@ def format_optimizer_schedule(opt) -> str:
         name = group.get("name", "group")
         peak_step_scale = group.get("peak_step_scale", group["step_scale"])
         min_step_scale = group.get("min_step_scale", 0.0)
-        peak_eta = group_eta(group, peak_step_scale)
-        min_eta = group_eta(group, min_step_scale)
+        peak_shrink, peak_eta_unit, peak_eta, _ = group_scheduled_values(
+            group, peak_step_scale
+        )
+        min_shrink, min_eta_unit, min_eta, _ = group_scheduled_values(
+            group, min_step_scale
+        )
         rho = group.get("rho", math.nan)
-        shrink = group.get("shrink", 1.0)
         shrink_half_life = group.get("shrink_half_life", math.inf)
-        rms_s = group["rms_correction"].momentum_factor
         parts.append(
             f"{name}=(rho={rho:g},s={peak_step_scale:.3g}->{min_step_scale:.3g},"
             f"eta={peak_eta:.3e}->{min_eta:.3e},h_shrink={shrink_half_life:.3g},"
-            f"zeta={shrink:.6f},S={rms_s:.3g})"
+            f"zeta={peak_shrink:.6f}->{min_shrink:.6f},"
+            f"eta_unit={peak_eta_unit:.3e}->{min_eta_unit:.3e})"
         )
     return ", ".join(parts)
 
@@ -595,8 +725,11 @@ def apply_scheduled_etas(
             warmup_steps,
             decay_steps,
         )
+        shrink, eta_unit, eta, ratio = group_scheduled_values(group, step_scale)
         group["step_scale"] = step_scale
-        eta = group_eta(group, step_scale)
+        group["schedule_ratio"] = ratio
+        group["shrink"] = shrink
+        group["eta_unit"] = eta_unit
         group["lr"] = eta
         current_etas[group.get("name", f"group{len(current_etas)}")] = eta
     return current_etas
@@ -666,6 +799,13 @@ def train(args):
         dataset.train, dataset.val, args.block_size, args.batch_size, device
     )
     opt = build_optimizer(raw_model, args, device)
+    resume_ckpt = (
+        load_train_state(Path(args.resume_state), raw_model, opt, device)
+        if args.resume_state
+        else None
+    )
+    if resume_ckpt is not None:
+        configure_optimizer_actions(opt, args)
     cov_ulmo = hidden_cov_ulmo(opt)
     if cov_ulmo is not None:
         register_hidden_cov_hooks(raw_model, cov_ulmo)
@@ -680,6 +820,8 @@ def train(args):
             print("compile_disabled_for_convergence_stats")
             args.compile = False
     model, compile_seconds = maybe_compile(raw_model, source, args, amp_dtype, device)
+    if resume_ckpt is not None:
+        restore_rng(resume_ckpt["rng"], device)
     if cov_ulmo is not None:
         cov_ulmo.cov_accums.clear()
     if compile_seconds:
@@ -709,17 +851,38 @@ def train(args):
     if line_curve_scales:
         print("line_curve_scales " + ",".join(f"{x:g}" for x in line_curve_scales))
 
-    total_opt_steps = 0
-    best_val = float("inf")
-    max_val = float("-inf")
-    last_losses = {"train": float("nan"), "val": float("nan")}
-    initial_val = None
+    start_step = int(resume_ckpt.get("step", 0)) if resume_ckpt is not None else 0
+    total_opt_steps = (
+        int(resume_ckpt.get("total_opt_steps", start_step))
+        if resume_ckpt is not None
+        else 0
+    )
+    best_val = (
+        float(resume_ckpt.get("best_val", float("inf")))
+        if resume_ckpt is not None
+        else float("inf")
+    )
+    max_val = (
+        float(resume_ckpt.get("max_val", float("-inf")))
+        if resume_ckpt is not None
+        else float("-inf")
+    )
+    last_losses = (
+        dict(resume_ckpt.get("last_losses", {})) if resume_ckpt is not None else {}
+    )
+    last_losses.setdefault("train", float("nan"))
+    last_losses.setdefault("val", float("nan"))
+    initial_val = resume_ckpt.get("initial_val") if resume_ckpt is not None else None
     diverged = False
     diverge_reason = ""
     train_start = sync_now(device)
     step_stat_accum = {}
+    decay_start = warmup_steps + stable_steps
+    saved_state_steps = set()
+    if resume_ckpt is not None:
+        print(f"resumed_state step={start_step} path={args.resume_state}")
 
-    for step in range(args.max_iters):
+    for step in range(start_step, args.max_iters):
         current_etas = apply_scheduled_etas(
             opt, step, args.max_iters, warmup_steps, decay_steps
         )
@@ -858,18 +1021,47 @@ def train(args):
                 amp_dtype,
                 device,
             )
+        if (
+            not args.no_save
+            and args.save_state_at == "decay-start"
+            and decay_steps > 0
+            and total_opt_steps == decay_start
+            and total_opt_steps not in saved_state_steps
+        ):
+            state_path = state_checkpoint_path(Path(args.out_path), args, total_opt_steps)
+            save_train_state(
+                state_path,
+                raw_model,
+                opt,
+                dataset,
+                args,
+                device,
+                total_opt_steps,
+                total_opt_steps,
+                best_val,
+                max_val,
+                initial_val,
+                last_losses,
+            )
+            saved_state_steps.add(total_opt_steps)
+            print(f"saved_train_state step={total_opt_steps} path={state_path}")
+            if args.stop_after_state_save:
+                break
 
     if not (args.skip_sample or diverged):
-        y = raw_model.generate(
-            torch.tensor(
-                [dataset.encode(args.prompt or "\n")], dtype=torch.long, device=device
-            ),
-            max_new_tokens=args.sample_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
+        prompt = args.prompt or "\n"
+        x = torch.tensor([dataset.encode(prompt)], dtype=torch.long, device=device)
+        texts = generate_texts(
+            raw_model,
+            x,
+            dataset.decode,
+            args.sample_count,
+            args.sample_tokens,
+            args.temperature,
+            args.top_k,
         )
-        print("\n--- sample ---\n")
-        print(dataset.decode(y[0].tolist()))
+        if not write_sample_report(args, texts):
+            print_samples(texts)
 
     for group in opt.param_groups:
         stats = getattr(group.get("ulmo"), "stats", None)
@@ -909,26 +1101,59 @@ def sample(args):
     if bad:
         raise ValueError(f"prompt contains unseen chars: {bad}")
     x = torch.tensor([[stoi[c] for c in prompt]], dtype=torch.long, device=device)
-    texts = []
-    for _ in range(args.sample_count):
-        y = model.generate(
-            x,
-            max_new_tokens=args.sample_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-        )
-        texts.append("".join(itos[int(i)] for i in y[0].tolist()))
+    texts = generate_texts(
+        model,
+        x,
+        lambda ids: "".join(itos[int(i)] for i in ids),
+        args.sample_count,
+        args.sample_tokens,
+        args.temperature,
+        args.top_k,
+    )
 
-    if args.sample_out:
-        path = Path(args.sample_out)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(sample_report(args, texts), encoding="utf-8")
-        print(f"wrote_samples {path}")
+    if write_sample_report(args, texts):
         return
 
+    print_samples(texts)
+
+
+def generate_texts(
+    model,
+    x: torch.Tensor,
+    decode,
+    sample_count: int,
+    sample_tokens: int,
+    temperature: float,
+    top_k: int,
+) -> list[str]:
+    texts = []
+    for _ in range(sample_count):
+        y = model.generate(
+            x,
+            max_new_tokens=sample_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        texts.append(decode(y[0].tolist()))
+    return texts
+
+
+def write_sample_report(args, texts: list[str]) -> bool:
+    if not args.sample_out:
+        return False
+    path = Path(args.sample_out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(sample_report(args, texts), encoding="utf-8")
+    print(f"wrote_samples {path}")
+    return True
+
+
+def print_samples(texts: list[str]) -> None:
     for i, text in enumerate(texts, start=1):
         if len(texts) > 1:
             print(f"\n--- sample {i} ---\n")
+        elif i == 1:
+            print("\n--- sample ---\n")
         print(text)
 
 
@@ -1020,19 +1245,44 @@ def make_parser():
     p.add_argument(
         "--step-scale",
         type=float,
-        default=1.0,
-        help="dimensionless peak action scale; raw additive eta is derived",
+        default=None,
+        help="linear dimensionless peak action scale; raw additive eta is derived",
+    )
+    p.add_argument(
+        "--log2-step-scale",
+        type=float,
+        default=None,
+        help="base-2 log of the dimensionless peak action scale",
     )
     p.add_argument(
         "--step-scale-embed", dest="step_scale_embed", type=float, default=None
     )
     p.add_argument(
+        "--log2-step-scale-embed",
+        dest="log2_step_scale_embed",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
         "--step-scale-hidden", dest="step_scale_hidden", type=float, default=None
+    )
+    p.add_argument(
+        "--log2-step-scale-hidden",
+        dest="log2_step_scale_hidden",
+        type=float,
+        default=None,
     )
     p.add_argument(
         "--step-scale-out",
         "--step-scale-unembed",
         dest="step_scale_out",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--log2-step-scale-out",
+        "--log2-step-scale-unembed",
+        dest="log2_step_scale_out",
         type=float,
         default=None,
     )
@@ -1147,12 +1397,33 @@ def make_parser():
     p.add_argument("--temperature", type=float, default=0.9)
     p.add_argument("--top-k", type=int, default=40)
     p.add_argument("--skip-sample", action="store_true")
+    p.add_argument(
+        "--resume-state",
+        default="",
+        help="resume training from a full train-state checkpoint",
+    )
     p.add_argument("--no-save", action="store_true")
     p.add_argument(
         "--save-interval",
         type=int,
         default=400,
         help="save eval checkpoints every N steps in addition to best/final",
+    )
+    p.add_argument(
+        "--save-state-at",
+        choices=["none", "decay-start"],
+        default="decay-start",
+        help="save a full train-state checkpoint at a branchable schedule point",
+    )
+    p.add_argument(
+        "--state-out-path",
+        default="",
+        help="optional explicit path for the full train-state checkpoint",
+    )
+    p.add_argument(
+        "--stop-after-state-save",
+        action="store_true",
+        help="stop training immediately after writing the requested train state",
     )
     p.add_argument(
         "--max-cuda-reserved-gb",
