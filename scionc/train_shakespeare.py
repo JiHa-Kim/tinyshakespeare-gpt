@@ -23,6 +23,7 @@ from scionc.optim import ScionC
 from scionc.optim.parametrization import (
     halving_factor,
     resolve_schedule,
+    scheduled_action,
     schedule_at_step,
 )
 from scionc.models import (
@@ -234,7 +235,13 @@ def apply_auto_group_step_scales(
         group["auto_l1"] = l1
 
         eta = args.auto_action_scale / l1
-        unit = (1.0 - float(group["peak_shrink"])) * float(group["rho"])
+        unit = scheduled_action(
+            float(group["rho"]),
+            float(group["peak_shrink"]),
+            1.0,
+            1.0,
+            name,
+        ).eta_unit
         step_scale = eta / unit
         step_scale = min(
             max(step_scale, group.get("min_step_scale", 0.0)),
@@ -287,30 +294,14 @@ def hidden_params(model: GPT) -> list[torch.Tensor]:
     return [p for p in model.parameters() if p.requires_grad and id(p) not in skip]
 
 
-def group_schedule_ratio(group: dict, scheduled_step_scale: float) -> float:
-    peak_step_scale = float(group["peak_step_scale"])
-    if peak_step_scale == 0.0:
-        return 0.0
-    ratio = scheduled_step_scale / peak_step_scale
-    if not math.isfinite(ratio) or ratio < 0.0:
-        raise ValueError(
-            f"invalid schedule ratio for {group.get('name', 'group')}: {ratio}"
-        )
-    return ratio
-
-
-def group_scheduled_values(
-    group: dict, scheduled_step_scale: float
-) -> tuple[float, float, float, float]:
-    ratio = group_schedule_ratio(group, scheduled_step_scale)
-    shrink = float(group["peak_shrink"]) ** ratio
-    eta_unit = (1.0 - shrink) * float(group["rho"])
-    eta = float(group["peak_step_scale"]) * eta_unit
-    return shrink, eta_unit, eta, ratio
-
-
-def group_eta(group: dict, scheduled_step_scale: float) -> float:
-    return group_scheduled_values(group, scheduled_step_scale)[2]
+def group_action(group: dict, scheduled_step_scale: float):
+    return scheduled_action(
+        rho=float(group["rho"]),
+        peak_shrink=float(group["peak_shrink"]),
+        peak_scale=float(group["peak_step_scale"]),
+        scheduled_scale=scheduled_step_scale,
+        name=group.get("name", "group"),
+    )
 
 
 @torch.no_grad()
@@ -336,6 +327,39 @@ def init_from_actions_(groups: list[dict]) -> None:
             init_like_ulmo_(p, ulmo, radius)
 
 
+def action_group_fields(name: str, args, delta_tau: int) -> dict:
+    peak_step_scale, min_step_scale = resolve_group_step_scale(args, name)
+    shrink_half_life = resolve_group_shrink_half_life(args, name)
+    peak_shrink = halving_factor(
+        delta_tau, shrink_half_life, f"{name}_shrink_half_life"
+    )
+    fields = {
+        "rho": resolve_group_rho(args, name),
+        "peak_step_scale": peak_step_scale,
+        "max_step_scale": peak_step_scale,
+        "min_step_scale": min_step_scale,
+        "peak_shrink": peak_shrink,
+        "shrink_half_life": shrink_half_life,
+        "beta_half_life": args.beta_half_life,
+        "count_increment": delta_tau,
+    }
+    action = scheduled_action(
+        fields["rho"],
+        peak_shrink,
+        peak_step_scale,
+        peak_step_scale,
+        name,
+    )
+    fields.update(
+        step_scale=peak_step_scale,
+        schedule_ratio=action.ratio,
+        shrink=action.shrink,
+        eta_unit=action.eta_unit,
+        lr=action.eta,
+    )
+    return fields
+
+
 def optimizer_group(
     name: str,
     params: list[torch.Tensor],
@@ -345,28 +369,12 @@ def optimizer_group(
 ) -> dict | None:
     if not params:
         return None
-    peak_step_scale, min_step_scale = resolve_group_step_scale(args, name)
-    rho = resolve_group_rho(args, name)
-    shrink_half_life = resolve_group_shrink_half_life(args, name)
-    shrink = halving_factor(delta_tau, shrink_half_life, f"{name}_shrink_half_life")
-    group = {
+    return {
         "name": name,
         "params": params,
         "ulmo": ulmo,
-        "rho": rho,
-        "peak_shrink": shrink,
-        "eta_unit": (1.0 - shrink) * rho,
-        "step_scale": peak_step_scale,
-        "peak_step_scale": peak_step_scale,
-        "max_step_scale": peak_step_scale,
-        "min_step_scale": min_step_scale,
-        "shrink": shrink,
-        "shrink_half_life": shrink_half_life,
-        "beta_half_life": args.beta_half_life,
-        "count_increment": delta_tau,
+        **action_group_fields(name, args, delta_tau),
     }
-    group["lr"] = group_eta(group, peak_step_scale)
-    return group
 
 
 @torch.no_grad()
@@ -416,27 +424,11 @@ def configure_optimizer_actions(opt, args) -> None:
         name = group.get("name")
         if name not in DEFAULT_STEADY_RADII:
             continue
-        peak_step_scale, min_step_scale = resolve_group_step_scale(args, name)
-        rho = resolve_group_rho(args, name)
-        shrink_half_life = resolve_group_shrink_half_life(args, name)
         group.update(
-            rho=rho,
-            peak_step_scale=peak_step_scale,
-            max_step_scale=peak_step_scale,
-            min_step_scale=min_step_scale,
-            peak_shrink=halving_factor(
-                delta_tau, shrink_half_life, f"{name}_shrink_half_life"
-            ),
-            shrink_half_life=shrink_half_life,
-            beta_half_life=args.beta_half_life,
-            count_increment=delta_tau,
+            action_group_fields(name, args, delta_tau),
             memory_beta=memory_beta,
             readout_mu=args.readout_mu,
         )
-        group["shrink"] = group["peak_shrink"]
-        group["eta_unit"] = (1.0 - group["shrink"]) * rho
-        group["step_scale"] = peak_step_scale
-        group["lr"] = group_eta(group, peak_step_scale)
 
 
 def group_ulmo(opt, name: str, cls):
@@ -693,19 +685,16 @@ def format_optimizer_schedule(opt) -> str:
         name = group.get("name", "group")
         peak_step_scale = group.get("peak_step_scale", group["step_scale"])
         min_step_scale = group.get("min_step_scale", 0.0)
-        peak_shrink, peak_eta_unit, peak_eta, _ = group_scheduled_values(
-            group, peak_step_scale
-        )
-        min_shrink, min_eta_unit, min_eta, _ = group_scheduled_values(
-            group, min_step_scale
-        )
+        peak_action = group_action(group, peak_step_scale)
+        min_action = group_action(group, min_step_scale)
         rho = group.get("rho", math.nan)
         shrink_half_life = group.get("shrink_half_life", math.inf)
         parts.append(
             f"{name}=(rho={rho:g},s={peak_step_scale:.3g}->{min_step_scale:.3g},"
-            f"eta={peak_eta:.3e}->{min_eta:.3e},h_shrink={shrink_half_life:.3g},"
-            f"zeta={peak_shrink:.6f}->{min_shrink:.6f},"
-            f"eta_unit={peak_eta_unit:.3e}->{min_eta_unit:.3e})"
+            f"eta={peak_action.eta:.3e}->{min_action.eta:.3e},"
+            f"h_shrink={shrink_half_life:.3g},"
+            f"zeta={peak_action.shrink:.6f}->{min_action.shrink:.6f},"
+            f"eta_unit={peak_action.eta_unit:.3e}->{min_action.eta_unit:.3e})"
         )
     return ", ".join(parts)
 
@@ -725,13 +714,13 @@ def apply_scheduled_etas(
             warmup_steps,
             decay_steps,
         )
-        shrink, eta_unit, eta, ratio = group_scheduled_values(group, step_scale)
+        action = group_action(group, step_scale)
         group["step_scale"] = step_scale
-        group["schedule_ratio"] = ratio
-        group["shrink"] = shrink
-        group["eta_unit"] = eta_unit
-        group["lr"] = eta
-        current_etas[group.get("name", f"group{len(current_etas)}")] = eta
+        group["schedule_ratio"] = action.ratio
+        group["shrink"] = action.shrink
+        group["eta_unit"] = action.eta_unit
+        group["lr"] = action.eta
+        current_etas[group.get("name", f"group{len(current_etas)}")] = action.eta
     return current_etas
 
 

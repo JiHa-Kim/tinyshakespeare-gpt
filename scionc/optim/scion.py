@@ -58,9 +58,19 @@ class ScionC(Optimizer):
             entries = self._collect_entries(group)
             if not entries:
                 continue
+            lr = float(group["lr"])
+            shrink = float(group["shrink"])
+            if lr == 0.0:
+                if shrink != 1.0:
+                    for p, _ in entries:
+                        p.mul_(shrink)
+                continue
+
             updates = self._updates(group["ulmo"], entries)
             for (p, _), u in zip(entries, updates, strict=True):
-                p.mul_(group["shrink"]).add_(u, alpha=group["lr"])
+                if shrink != 1.0:
+                    p.mul_(shrink)
+                p.add_(u, alpha=lr)
 
         return loss
 
