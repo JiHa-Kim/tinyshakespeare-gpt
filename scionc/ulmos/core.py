@@ -5,6 +5,9 @@ import torch.nn as nn
 
 from scionc.ulmos.streaming_svd import HiddenSVDFilterULMO, StreamingSVDULMO
 
+_GNSGroupKey = tuple[tuple[int, ...], torch.dtype, torch.device]
+_GNSGroupItem = tuple[int, torch.Tensor, torch.Tensor, bool]
+
 __all__ = [
     "ColNormULMO",
     "RowNormULMO",
@@ -210,7 +213,7 @@ class SignULMO:
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
         x = w.mT if self.transpose else w
-        x = x.sign().mul_(-1.0 / x.size(1))
+        x = x.sign_().mul_(-1.0 / x.size(1))
         return x.mT if self.transpose else x
 
 
@@ -246,25 +249,28 @@ class GramNewtonSchulzULMO:
         self, tensors: list[torch.Tensor], params: list[torch.Tensor]
     ) -> list[torch.Tensor]:
         out: list[torch.Tensor | None] = [None] * len(tensors)
-        groups: dict[tuple, list[tuple[int, torch.Tensor]]] = {}
+        groups: dict[_GNSGroupKey, list[_GNSGroupItem]] = {}
 
         for i, (x, _) in enumerate(zip(tensors, params, strict=True)):
             if x.ndim != 2:
                 out[i] = self(x)
                 continue
-            key = (tuple(x.shape), x.dtype, x.device)
-            groups.setdefault(key, []).append((i, x))
+            transposed = x.size(0) > x.size(1)
+            work = x.mT if transposed else x
+            key = (tuple(work.shape), work.dtype, work.device)
+            groups.setdefault(key, []).append((i, x, work, transposed))
 
         for items in groups.values():
             y_batch = gram_newton_schulz_uvt(
-                torch.stack([x for _, x in items]),
+                torch.stack([work for _, _, work, _ in items]),
                 self.steps,
                 self.eps,
                 self.work_dtype,
                 self.bound_safety,
             )
-            for j, (i, x) in enumerate(items):
-                out[i] = y_batch[j].mul_(-self._scale(x))
+            for j, (i, x, _, transposed) in enumerate(items):
+                y = y_batch[j].mT if transposed else y_batch[j]
+                out[i] = y.mul_(-self._scale(x))
 
         if any(x is None for x in out):
             raise RuntimeError("batched GramNewtonSchulzULMO missed an output")
