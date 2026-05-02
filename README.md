@@ -80,8 +80,7 @@ Current defaults:
 
 - optimizer: ScionC
 - hidden ULMO: Gram Newton-Schulz
-- input embedding ULMO: ColNorm
-- output head ULMO: Sign
+- input/output ULMOs: untied ColNorm + Sign; tied Sign + Sign on the shared table
 - batch size: 64
 - gradient accumulation: 1
 - block size: 256

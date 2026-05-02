@@ -273,7 +273,13 @@ def make_hidden_ulmo(args, work_dtype: torch.dtype):
     )
 
 
-def make_embed_ulmo(args):
+def input_output_tied(model: GPT) -> bool:
+    return model.tok_emb.weight is model.lm_head.weight
+
+
+def make_embed_ulmo(args, tied: bool = False):
+    if tied:
+        return SignULMO()
     if args.embed_ulmo == "sign":
         return SignULMO()
     if args.embed_ulmo == "rownorm":
@@ -377,30 +383,41 @@ def optimizer_group(
     }
 
 
+def input_output_groups(model: GPT, args, delta_tau: int) -> list[dict]:
+    tied = input_output_tied(model)
+    groups = [
+        optimizer_group(
+            "embed",
+            [model.tok_emb.weight],
+            make_embed_ulmo(args, tied),
+            args,
+            delta_tau,
+        )
+    ]
+    if not tied:
+        groups.append(
+            optimizer_group(
+                "out",
+                [model.lm_head.weight],
+                make_out_ulmo(args),
+                args,
+                delta_tau,
+            )
+        )
+    return [group for group in groups if group is not None]
+
+
 @torch.no_grad()
 def build_optimizer(model: GPT, args, device: torch.device):
     delta_tau = count_increment(args)
     memory_beta = halving_factor(delta_tau, args.beta_half_life, "beta_half_life")
     work_dtype = torch.float16 if device.type == "cuda" else torch.float32
     groups = [
-        optimizer_group(
-            "embed",
-            [model.tok_emb.weight],
-            make_embed_ulmo(args),
-            args,
-            delta_tau,
-        ),
+        *input_output_groups(model, args, delta_tau),
         optimizer_group(
             "hidden",
             hidden_params(model),
             make_hidden_ulmo(args, work_dtype),
-            args,
-            delta_tau,
-        ),
-        optimizer_group(
-            "out",
-            [model.lm_head.weight],
-            make_out_ulmo(args),
             args,
             delta_tau,
         ),
@@ -661,6 +678,7 @@ def build_model(args, dataset: CharDataset, device: torch.device) -> GPT:
         rope_base=args.rope_base,
         prenorm=args.prenorm,
         dropout=args.dropout,
+        tie_weights=args.tie_weights,
     )
     return GPT(cfg).to(device)
 
@@ -822,6 +840,7 @@ def train(args):
     readout_mu = first_group.get("readout_mu", args.readout_mu)
     memory_beta = first_group.get("memory_beta", math.nan)
     beta_half_life = first_group.get("beta_half_life", math.nan)
+    io_weights = "tied" if input_output_tied(raw_model) else "untied"
 
     print(
         "schedule "
@@ -831,7 +850,7 @@ def train(args):
         f"readout_mu={readout_mu:.3g} "
         f"optimizer=scionc prenorm={args.prenorm} dropout={args.dropout:.3f} "
         f"hidden_ulmo={args.hidden_ulmo} "
-        f"embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
+        f"io_weights={io_weights} embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
         f"qkv=split spi_iteration={args.spi_iteration} "
         f"eta_groups={format_optimizer_schedule(opt)}"
     )
@@ -1215,6 +1234,11 @@ def make_parser():
     p.add_argument("--rope-base", type=float, default=10000.0)
     p.add_argument("--prenorm", choices=["rmsnorm", "rmsball"], default="rmsnorm")
     p.add_argument("--dropout", type=float, default=0.15)
+    p.add_argument(
+        "--tie-weights",
+        action="store_true",
+        help="share input embedding and output head weights",
+    )
 
     p.add_argument("--max-iters", type=int, default=2000)
     p.add_argument("--eval-interval", type=int, default=100)
@@ -1333,7 +1357,7 @@ def make_parser():
         "--embed-ulmo",
         choices=["colnorm", "sign", "rownorm"],
         default="colnorm",
-        help="embedding-table ULMO",
+        help="embedding-table ULMO; tied weights force Sign",
     )
     p.add_argument(
         "--out-ulmo",

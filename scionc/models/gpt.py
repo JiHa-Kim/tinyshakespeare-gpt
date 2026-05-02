@@ -143,6 +143,7 @@ class GPTConfig:
     rope_base: float = 10000.0
     prenorm: str = "rmsnorm"
     dropout: float = 0.0
+    tie_weights: bool = False
 
     @property
     def hidden_dim(self) -> int:
@@ -170,6 +171,8 @@ class GPT(nn.Module):
         )
         self.norm_f = Norm(cfg.prenorm)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        if cfg.tie_weights:
+            self.lm_head.weight = self.tok_emb.weight
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.tok_emb(idx)
