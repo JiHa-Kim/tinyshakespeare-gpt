@@ -6,8 +6,8 @@ coordinates are:
 - additive direction scale `gamma`, stored in the PyTorch `lr` field,
 - momentum-state retention `beta2`,
 - readout blend `beta1`,
-- active-coordinate weight retention `zeta`,
-- optional target per-coordinate RMS radius `R_W`.
+- active-coordinate weight retention `zeta`, or
+- target per-coordinate RMS radius `R_W` plus online CCWD energy statistics.
 
 The optimizer uses only these retention/radius coordinates.
 
@@ -72,7 +72,59 @@ Here `zeta` is the active-coordinate retention. The additive scale is always
 `gamma`; the implied support radius is `rho=gamma/(1-zeta)` when
 `zeta < 1`.
 
-## RMS Match
+## Empirical RMS Match
+
+For CCWD, the production rule measures the one-step energy terms instead of
+assuming them away. Write `d=1-zeta`:
+
+```math
+w'=w-d(P\odot w)+\gamma u.
+```
+
+The exact one-step energy identity is:
+
+```math
+\|w'\|^2
+=
+\|w\|^2
+-d(2-d)\|P\odot w\|^2
++\gamma^2\|u\|^2
++2\gamma\langle w,u\rangle
+-2\gamma d\langle P\odot w,u\rangle.
+```
+
+For a per-coordinate target `R_W`, the group target energy is
+`R_W^2 * numel`. Equivalently, with:
+
+```math
+p_2=\frac{\|P\odot w\|^2}{\|w\|^2},
+\qquad
+h=\frac{\langle w,u\rangle}{\|w\|\|u\|},
+\qquad
+k=\frac{\langle P\odot w,u\rangle}{\|w\|\|u\|},
+```
+
+```math
+r=\frac{\|w\|}{R_W\sqrt{\mathrm{numel}}},
+\qquad
+\alpha=\frac{\gamma\|u\|}{R_W\sqrt{\mathrm{numel}}},
+```
+
+the target equation is:
+
+```math
+p_2r^2d^2-(2p_2r^2+2\alpha kr)d+
+(r^2-1+\alpha^2+2\alpha hr)=0.
+```
+
+`LionKCCWDPA` tracks EMAs of `p2`, `h`, and `k`, uses the current `r` and
+`alpha`, and applies the smaller valid root in `[0, 1]` after
+`energy_warmup` steps. Before warmup, or if the quadratic has no valid root,
+it falls back to the stationary prior below. This keeps the default adaptive
+to persistent gradients, output-layer cross terms, sign persistence, and mask
+structure, while still requiring only one scalar solve per optimizer group.
+
+## Stationary Prior
 
 For a stationary segment, write:
 
@@ -119,8 +171,8 @@ p\,d(2-d)=
 \frac{\gamma^2 c_u^2}{R_W^2}A_{1-pd}.
 ```
 
-This is the finite-retention equation used by the code. It avoids the
-small-step approximation and costs only a scalar solve per optimizer group.
+This finite-retention equation is the cold-start and ablation prior. It avoids
+the small-step approximation and costs only a scalar solve per optimizer group.
 
 ## Correlation Priors
 
@@ -177,22 +229,16 @@ A_a
 
 This keeps the correction scalar, cheap, and stable.
 
-## Practical Diagnostics
+## Optimizer Fields
 
-The group-level correction is intentionally cheap. For analysis runs, the
-exact one-step CCWD energy equation is useful:
+Important group fields:
 
-```math
-\|w'\|^2
-=
-\|w\|^2
--d(2-d)\|P\odot w\|^2
-+\gamma^2\|u\|^2
-+2\gamma\langle w,u\rangle
--2\gamma d\langle P\odot w,u\rangle.
-```
-
-Setting this equal to the target energy gives a quadratic in `d`. This is the
-right diagnostic when measuring whether a layer is currently over-retained or
-over-decayed, but it requires live reductions over weights and directions, so
-it is not the default optimizer path.
+- `lr`: additive direction scale `gamma`.
+- `rms_radius`: target per-coordinate `R_W`; if omitted, plain `weight_decay`
+  is used.
+- `weight_retention`: active `zeta`; if supplied by the caller it is fixed.
+- `decay_rule`: `auto`, `energy`, or `stationary`.
+- `energy_beta`: EMA retention for `p2`, `h`, and `k`.
+- `energy_warmup`: number of measured steps before the empirical root is used.
+- `energy_p2`, `energy_h`, `energy_k`, `energy_radius_ratio`,
+  `energy_step_ratio`: live diagnostics.

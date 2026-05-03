@@ -13,6 +13,7 @@ __all__ = [
 
 _ASIN_SERIES_TERMS = 48
 _SOLVE_ITERS = 56
+_ENERGY_EPS = 1e-30
 
 
 def sign_(x: torch.Tensor) -> torch.Tensor:
@@ -173,6 +174,26 @@ def _stationary_decay_complement(
     return decay, retention, corr
 
 
+def _small_valid_quadratic_root(
+    a: float, b: float, c: float, eps: float
+) -> float | None:
+    if abs(a) <= eps:
+        if abs(b) <= eps:
+            return 0.0 if c <= 0.0 else None
+        root = -c / b
+        return root if -eps <= root <= 1.0 + eps else None
+
+    disc = b * b - 4.0 * a * c
+    if disc < -eps:
+        return None
+    root_disc = math.sqrt(max(0.0, disc))
+    roots = sorted(((-b - root_disc) / (2.0 * a), (-b + root_disc) / (2.0 * a)))
+    for root in roots:
+        if -eps <= root <= 1.0 + eps:
+            return min(1.0, max(0.0, root))
+    return None
+
+
 class LionKCCWDPA(Optimizer):
     """
     Lion-K with retention/radius weight control, optional cautious masking,
@@ -202,6 +223,9 @@ class LionKCCWDPA(Optimizer):
         direction_sq: float = 1.0,
         mask_sq_fraction: float = 1.0,
         correlation: str = "auto",
+        decay_rule: str = "auto",
+        energy_beta: float = 0.95,
+        energy_warmup: int = 8,
         cwd: bool = False,
         nesterov: bool = True,
         eps: float = 1e-12,
@@ -225,6 +249,12 @@ class LionKCCWDPA(Optimizer):
             raise ValueError(f"invalid mask_sq_fraction: {mask_sq_fraction}")
         if correlation not in {"auto", "none", "linear", "sign"}:
             raise ValueError(f"invalid correlation mode: {correlation}")
+        if decay_rule not in {"auto", "stationary", "energy"}:
+            raise ValueError(f"invalid decay_rule: {decay_rule}")
+        if not (0.0 <= energy_beta < 1.0):
+            raise ValueError(f"invalid energy_beta: {energy_beta}")
+        if energy_warmup < 0:
+            raise ValueError(f"invalid energy_warmup: {energy_warmup}")
         if weight_decay < 0.0:
             raise ValueError(f"invalid weight_decay: {weight_decay}")
 
@@ -241,18 +271,33 @@ class LionKCCWDPA(Optimizer):
                 direction_sq=direction_sq,
                 mask_sq_fraction=mask_sq_fraction,
                 correlation=correlation,
+                decay_rule=decay_rule,
+                energy_beta=energy_beta,
+                energy_warmup=energy_warmup,
                 atom_correlation=math.nan,
+                energy_p2=math.nan,
+                energy_h=math.nan,
+                energy_k=math.nan,
+                energy_radius_ratio=math.nan,
+                energy_step_ratio=math.nan,
                 cwd=cwd,
                 nesterov=nesterov,
                 eps=eps,
                 weight_decay=weight_decay,
+                _energy_steps=0,
                 _pa_denom=0.0,
             ),
         )
         for group in self.param_groups:
             self._decay_complement(group)
 
-    def _decay_complement(self, group: dict) -> float:
+    def _decay_complement(
+        self,
+        group: dict,
+        entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]]
+        | None = None,
+        updates: list[torch.Tensor] | None = None,
+    ) -> float:
         fixed_retention = group.get("fixed_weight_retention")
         if fixed_retention is not None:
             _validate_weight_retention(float(fixed_retention))
@@ -285,7 +330,22 @@ class LionKCCWDPA(Optimizer):
             group["atom_correlation"] = 1.0
             return decay
 
+        if (
+            group.get("cwd", False)
+            and group["decay_rule"] in {"auto", "energy"}
+            and entries is not None
+            and updates is not None
+        ):
+            decay = self._energy_decay_complement(group, entries, updates)
+            if decay is not None:
+                return decay
+
         beta1, beta2 = group["betas"]
+        mask_sq_fraction = (
+            float(group["energy_p2"])
+            if group.get("cwd", False) and math.isfinite(float(group["energy_p2"]))
+            else float(group["mask_sq_fraction"])
+        )
         decay, retention, corr = _stationary_decay_complement(
             additive_scale=lr,
             rms_radius=float(rms_radius),
@@ -295,12 +355,85 @@ class LionKCCWDPA(Optimizer):
             nesterov=bool(group["nesterov"]),
             correlation=str(group["correlation"]),
             dir_fn=group["dir_fn"],
-            mask_sq_fraction=float(group["mask_sq_fraction"])
-            if group.get("cwd", False)
-            else 1.0,
+            mask_sq_fraction=mask_sq_fraction if group.get("cwd", False) else 1.0,
         )
         group["weight_retention"] = retention
         group["atom_correlation"] = corr
+        return decay
+
+    def _energy_decay_complement(
+        self,
+        group: dict,
+        entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]],
+        updates: list[torch.Tensor],
+    ) -> float | None:
+        totals = None
+        for (p, _, _, _), u in zip(entries, updates, strict=True):
+            w = p.detach().float()
+            direction = u.detach().float()
+            mask = (w * direction > 0).to(dtype=w.dtype)
+            values = torch.stack(
+                (
+                    w.square().sum(),
+                    direction.square().sum(),
+                    w.square().mul(mask).sum(),
+                    w.mul(direction).sum(),
+                    w.mul(direction).mul(mask).sum(),
+                    torch.tensor(float(p.numel()), device=w.device, dtype=w.dtype),
+                )
+            )
+            totals = values if totals is None else totals + values
+
+        if totals is None:
+            return None
+
+        w_sq, u_sq, mask_w_sq, wu, mask_wu, numel = (
+            float(x) for x in totals.double().cpu().tolist()
+        )
+        if w_sq <= 0.0 or u_sq <= 0.0 or mask_w_sq <= 0.0 or numel <= 0.0:
+            return None
+
+        target_sq = float(group["rms_radius"]) ** 2 * numel
+        if target_sq <= 0.0:
+            return None
+
+        denom = math.sqrt(max(w_sq * u_sq, _ENERGY_EPS))
+        raw_p2 = min(1.0, max(0.0, mask_w_sq / max(w_sq, _ENERGY_EPS)))
+        raw_h = max(-1.0, min(1.0, wu / denom))
+        raw_k = max(-1.0, min(1.0, mask_wu / denom))
+        radius_ratio = math.sqrt(w_sq / target_sq)
+        step_ratio = float(group["lr"]) * math.sqrt(u_sq / target_sq)
+
+        beta = float(group["energy_beta"])
+        steps = int(group["_energy_steps"])
+        if steps == 0 or not math.isfinite(float(group["energy_p2"])):
+            p2 = raw_p2
+            h = raw_h
+            k = raw_k
+        else:
+            p2 = beta * float(group["energy_p2"]) + (1.0 - beta) * raw_p2
+            h = beta * float(group["energy_h"]) + (1.0 - beta) * raw_h
+            k = beta * float(group["energy_k"]) + (1.0 - beta) * raw_k
+
+        group["_energy_steps"] = steps + 1
+        group["energy_p2"] = p2
+        group["energy_h"] = h
+        group["energy_k"] = k
+        group["energy_radius_ratio"] = radius_ratio
+        group["energy_step_ratio"] = step_ratio
+
+        if steps + 1 < int(group["energy_warmup"]):
+            return None
+
+        a = p2 * radius_ratio * radius_ratio
+        b = -(2.0 * p2 * radius_ratio * radius_ratio + 2.0 * step_ratio * k * radius_ratio)
+        c = radius_ratio * radius_ratio - 1.0 + step_ratio * step_ratio + 2.0 * step_ratio * h * radius_ratio
+        decay = _small_valid_quadratic_root(a, b, c, float(group["eps"]))
+        if decay is None:
+            return None
+
+        group["weight_retention"] = 1.0 - decay
+        group["atom_correlation"] = 1.0
         return decay
 
     @torch.no_grad()
@@ -319,7 +452,6 @@ class LionKCCWDPA(Optimizer):
             nesterov = bool(group["nesterov"])
             set_dir_param = getattr(dir_fn, "set_param", None)
             batch_dir = getattr(dir_fn, "batch", None)
-            decay = self._decay_complement(group)
 
             if phi:
                 group["_pa_denom"] += lr * lr
@@ -383,6 +515,7 @@ class LionKCCWDPA(Optimizer):
                     [p for p, _, _, _ in entries],
                 )
 
+            decay = self._decay_complement(group, entries, updates)
             for (p, _, z, state), u in zip(entries, updates, strict=True):
                 if decay:
                     if cwd:
