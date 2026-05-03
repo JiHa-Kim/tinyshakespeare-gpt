@@ -8,14 +8,16 @@ class ScionC(Optimizer):
     """
     Minimal ScionC optimizer.
 
-    Each group supplies a ULMO. The step uses action
-    coordinates directly:
+    Each group supplies a ULMO. The default constrained SCG update is:
 
-        p <- shrink * p + eta * ulmo(readout)
+        m <- beta * m + (1 - beta) * grad
+        p <- zeta * p + (1 - zeta) * rho * ulmo(m)
 
-    The additive scale is stored in `lr` to match PyTorch optimizer
-    conventions. `memory_beta` is the EMA retention and `readout_mu` is the
-    Nesterov readout blend between the current gradient and stored EMA.
+    Internally, the additive scale `(1 - zeta) * rho` is stored in `lr` to
+    match PyTorch optimizer conventions. The group field `weight_retention`
+    stores `zeta`. `memory_beta` is the momentum-state retention. `readout_mu`
+    optionally blends the current gradient and the updated momentum state before
+    the ULMO.
     """
 
     def __init__(
@@ -25,16 +27,16 @@ class ScionC(Optimizer):
         memory_beta: float = 0.95,
         readout_mu: float = 1.0,
         ulmo=None,
-        shrink: float = 1.0,
+        weight_retention: float = 1.0,
     ):
-        if lr <= 0.0:
+        if lr < 0.0:
             raise ValueError(f"invalid lr: {lr}")
         if not (0.0 <= memory_beta < 1.0):
             raise ValueError(f"invalid memory_beta: {memory_beta}")
         if not (0.0 <= readout_mu <= 1.0):
             raise ValueError(f"invalid readout_mu: {readout_mu}")
-        if not (0.0 < shrink <= 1.0):
-            raise ValueError(f"invalid shrink: {shrink}")
+        if not (0.0 < weight_retention <= 1.0):
+            raise ValueError(f"invalid weight_retention: {weight_retention}")
 
         super().__init__(
             params,
@@ -43,7 +45,7 @@ class ScionC(Optimizer):
                 memory_beta=memory_beta,
                 readout_mu=readout_mu,
                 ulmo=ulmo,
-                shrink=shrink,
+                weight_retention=weight_retention,
             ),
         )
 
@@ -59,17 +61,17 @@ class ScionC(Optimizer):
             if not entries:
                 continue
             lr = float(group["lr"])
-            shrink = float(group["shrink"])
+            weight_retention = float(group["weight_retention"])
             if lr == 0.0:
-                if shrink != 1.0:
+                if weight_retention != 1.0:
                     for p, _ in entries:
-                        p.mul_(shrink)
+                        p.mul_(weight_retention)
                 continue
 
             updates = self._updates(group["ulmo"], entries)
             for (p, _), u in zip(entries, updates, strict=True):
-                if shrink != 1.0:
-                    p.mul_(shrink)
+                if weight_retention != 1.0:
+                    p.mul_(weight_retention)
                 p.add_(u, alpha=lr)
 
         return loss

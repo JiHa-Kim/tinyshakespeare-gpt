@@ -2,41 +2,28 @@ import math
 from dataclasses import dataclass
 
 __all__ = [
-    "InvariantAction",
-    "RMSCorrection",
+    "RMSMatchedAction",
+    "ema_atom_correlation_factor",
     "halving_factor",
-    "invariant_eta_unit",
-    "rms_additive_eta",
-    "rms_eta_unit",
-    "scheduled_invariant_action",
-    "scheduled_ratio",
-    "scheduled_shrink",
     "resolve_schedule",
+    "rms_matched_eta",
+    "rms_matched_radius",
     "schedule_at_step",
+    "scheduled_rms_matched_action",
+    "scheduled_weight_retention",
+    "validate_step_scale",
+    "weight_retention_for_rms_eta",
 ]
 
 
-@dataclass(frozen=True)
-class RMSCorrection:
-    atom_sq: float = 1.0
-    keep_fraction: float = 1.0
-    momentum_factor: float = 1.0
-
-    def validate(self) -> None:
-        if self.atom_sq <= 0.0:
-            raise ValueError(f"invalid RMS atom scale: {self.atom_sq}")
-        if self.keep_fraction <= 0.0:
-            raise ValueError(f"invalid RMS keep fraction: {self.keep_fraction}")
-        if self.momentum_factor <= 0.0:
-            raise ValueError(f"invalid RMS momentum factor: {self.momentum_factor}")
-
-
 @dataclass(frozen=True, slots=True)
-class InvariantAction:
-    shrink: float
-    eta_unit: float
+class RMSMatchedAction:
+    rms_radius: float
+    rho: float
+    weight_retention: float
     eta: float
-    ratio: float
+    step_scale: float
+    atom_correlation: float
 
 
 def halving_factor(delta_tau: float, half_life: float, name: str) -> float:
@@ -87,82 +74,148 @@ def schedule_at_step(
     return peak + (floor - peak) * progress
 
 
-def scheduled_ratio(
+def validate_step_scale(scale: float, name: str = "step_scale") -> float:
+    if not math.isfinite(scale) or scale < 0.0:
+        raise ValueError(f"invalid {name}: {scale}; expected {name} >= 0")
+    return scale
+
+
+def _active_step_scale(
     scheduled_scale: float, peak_scale: float, name: str = "schedule"
 ) -> float:
-    if not math.isfinite(scheduled_scale) or scheduled_scale < 0.0:
-        raise ValueError(f"invalid {name} scheduled scale: {scheduled_scale}")
-    if not math.isfinite(peak_scale) or peak_scale < 0.0:
-        raise ValueError(f"invalid {name} peak scale: {peak_scale}")
+    scheduled_scale = validate_step_scale(scheduled_scale, f"{name} scheduled scale")
+    peak_scale = validate_step_scale(peak_scale, f"{name} peak scale")
     if peak_scale == 0.0:
+        if scheduled_scale != 0.0:
+            raise ValueError(
+                f"invalid {name} schedule: scheduled scale exceeds zero peak"
+            )
         return 0.0
-    ratio = scheduled_scale / peak_scale
-    if not math.isfinite(ratio):
-        raise ValueError(f"invalid {name} schedule ratio: {ratio}")
-    return ratio
+    if scheduled_scale > peak_scale * (1.0 + 1e-12):
+        raise ValueError(
+            f"invalid {name} scheduled scale {scheduled_scale}; "
+            f"expected <= peak {peak_scale}"
+        )
+    return scheduled_scale
 
 
-def scheduled_shrink(peak_shrink: float, ratio: float, name: str = "shrink") -> float:
-    if not (0.0 < peak_shrink <= 1.0):
-        raise ValueError(f"invalid {name} peak shrink: {peak_shrink}")
-    if not math.isfinite(ratio) or ratio < 0.0:
-        raise ValueError(f"invalid {name} schedule ratio: {ratio}")
-    return peak_shrink**ratio
+def scheduled_weight_retention(
+    peak_weight_retention: float, step_scale: float, name: str = "weight_retention"
+) -> float:
+    if not (0.0 < peak_weight_retention <= 1.0):
+        raise ValueError(
+            f"invalid {name} peak weight retention: {peak_weight_retention}"
+        )
+    step_scale = validate_step_scale(step_scale, f"{name} step scale")
+    return peak_weight_retention**step_scale
 
 
-def invariant_eta_unit(rho: float, shrink: float) -> float:
-    if rho <= 0.0:
-        raise ValueError(f"invalid reference radius: {rho}")
-    if not (0.0 < shrink <= 1.0):
-        raise ValueError(f"invalid shrink: {shrink}")
-    return (1.0 - shrink) * rho
+def ema_atom_correlation_factor(
+    momentum_retention: float, weight_retention: float
+) -> float:
+    if not (0.0 <= momentum_retention <= 1.0):
+        raise ValueError(f"invalid momentum-state retention: {momentum_retention}")
+    if not (0.0 < weight_retention <= 1.0):
+        raise ValueError(f"invalid weight retention: {weight_retention}")
+    product = momentum_retention * weight_retention
+    if product >= 1.0:
+        return math.inf
+    return (1.0 + product) / (1.0 - product)
 
 
-def scheduled_invariant_action(
-    rho: float,
-    peak_shrink: float,
+def rms_matched_radius(
+    rms_radius: float,
+    momentum_retention: float,
+    weight_retention: float,
+    atom_sq: float = 1.0,
+) -> tuple[float, float]:
+    if rms_radius <= 0.0 or not math.isfinite(rms_radius):
+        raise ValueError(f"invalid target RMS radius: {rms_radius}")
+    if atom_sq <= 0.0 or not math.isfinite(atom_sq):
+        raise ValueError(f"invalid atom squared-norm scale: {atom_sq}")
+    atom_correlation = ema_atom_correlation_factor(
+        momentum_retention, weight_retention
+    )
+    if weight_retention >= 1.0:
+        return math.inf, atom_correlation
+    denom = (1.0 - weight_retention) * atom_sq * atom_correlation
+    return rms_radius * math.sqrt((1.0 + weight_retention) / denom), atom_correlation
+
+
+def rms_matched_eta(
+    rms_radius: float,
+    momentum_retention: float,
+    weight_retention: float,
+    atom_sq: float = 1.0,
+) -> float:
+    if weight_retention >= 1.0:
+        return 0.0
+    if rms_radius <= 0.0 or not math.isfinite(rms_radius):
+        raise ValueError(f"invalid target RMS radius: {rms_radius}")
+    if atom_sq <= 0.0 or not math.isfinite(atom_sq):
+        raise ValueError(f"invalid atom squared-norm scale: {atom_sq}")
+    atom_correlation = ema_atom_correlation_factor(
+        momentum_retention, weight_retention
+    )
+    return rms_radius * math.sqrt(
+        ((1.0 - weight_retention) * (1.0 + weight_retention))
+        / (atom_sq * atom_correlation)
+    )
+
+
+def weight_retention_for_rms_eta(
+    rms_radius: float,
+    momentum_retention: float,
+    eta: float,
+    atom_sq: float = 1.0,
+) -> float:
+    if eta <= 0.0:
+        return 1.0
+    if rms_radius <= 0.0 or not math.isfinite(rms_radius):
+        raise ValueError(f"invalid target RMS radius: {rms_radius}")
+    if atom_sq <= 0.0 or not math.isfinite(atom_sq):
+        raise ValueError(f"invalid atom squared-norm scale: {atom_sq}")
+    if eta >= rms_radius / math.sqrt(atom_sq):
+        return 0.0
+    if not (0.0 <= momentum_retention <= 1.0):
+        raise ValueError(f"invalid momentum-state retention: {momentum_retention}")
+
+    lo = 0.0
+    hi = 1.0
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if rms_matched_eta(rms_radius, momentum_retention, mid, atom_sq) > eta:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+def scheduled_rms_matched_action(
+    rms_radius: float,
+    momentum_retention: float,
+    peak_weight_retention: float,
     peak_scale: float,
     scheduled_scale: float,
+    atom_sq: float = 1.0,
     name: str = "group",
-) -> InvariantAction:
-    ratio = scheduled_ratio(scheduled_scale, peak_scale, name)
-    shrink = scheduled_shrink(peak_shrink, ratio, name)
-    eta_unit = invariant_eta_unit(rho, shrink)
-    return InvariantAction(
-        shrink=shrink,
-        eta_unit=eta_unit,
-        eta=peak_scale * eta_unit,
-        ratio=ratio,
+) -> RMSMatchedAction:
+    step_scale = _active_step_scale(scheduled_scale, peak_scale, name)
+    weight_retention = scheduled_weight_retention(
+        peak_weight_retention, step_scale, name
     )
-
-
-def rms_eta_unit(
-    rho: float,
-    shrink: float,
-    correction: RMSCorrection,
-    eps: float = 1e-12,
-) -> float:
-    if rho <= 0.0:
-        raise ValueError(f"invalid RMS radius: {rho}")
-    if not (0.0 < shrink < 1.0):
-        raise ValueError(
-            f"cannot derive additive eta from shrink={shrink}; "
-            "use a finite shrink half-life"
-        )
-    correction.validate()
-    variance = (
-        correction.keep_fraction
-        * max(1.0 - shrink * shrink, eps)
-        / (correction.atom_sq * correction.momentum_factor)
+    rho, atom_correlation = rms_matched_radius(
+        rms_radius,
+        momentum_retention,
+        weight_retention,
+        atom_sq,
     )
-    return rho * math.sqrt(variance)
-
-
-def rms_additive_eta(
-    rho: float,
-    shrink: float,
-    step_scale: float,
-    correction: RMSCorrection,
-    eps: float = 1e-12,
-) -> float:
-    return step_scale * rms_eta_unit(rho, shrink, correction, eps)
+    eta = (1.0 - weight_retention) * rho if math.isfinite(rho) else 0.0
+    return RMSMatchedAction(
+        rms_radius=rms_radius,
+        rho=rho,
+        weight_retention=weight_retention,
+        eta=eta,
+        step_scale=step_scale,
+        atom_correlation=atom_correlation,
+    )

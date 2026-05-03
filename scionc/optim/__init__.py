@@ -1,12 +1,17 @@
-from scionc.optim.lionk import LionKCCWDPA, corrected_eta, lionk_S, sign_
-from scionc.optim.parametrization import RMSCorrection
+from scionc.optim.lionk import (
+    LionKCCWDPA,
+    lionk_effective_readout,
+    lionk_linear_correlation_factor,
+    lionk_sign_correlation_factor,
+    sign_,
+)
 from scionc.optim.scion import ScionC
 
 __all__ = [
     "LionKCCWDPA",
-    "RMSCorrection",
     "ScionC",
-    "corrected_eta",
-    "lionk_S",
+    "lionk_effective_readout",
+    "lionk_linear_correlation_factor",
+    "lionk_sign_correlation_factor",
     "sign_",
 ]

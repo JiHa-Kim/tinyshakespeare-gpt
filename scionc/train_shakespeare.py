@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import time
 from contextlib import nullcontext
@@ -23,8 +24,10 @@ from scionc.optim import ScionC
 from scionc.optim.parametrization import (
     halving_factor,
     resolve_schedule,
-    scheduled_invariant_action,
     schedule_at_step,
+    scheduled_rms_matched_action,
+    validate_step_scale,
+    weight_retention_for_rms_eta,
 )
 from scionc.models import (
     GPT,
@@ -52,19 +55,24 @@ from scionc.probes.optimizer_stats import (
     consume_step_stats,
 )
 
-DEFAULT_REFERENCE_RADII = {
+DEFAULT_RMS_RADII = {
     "embed": 1.0,
     "hidden": 3.0,
     "out": 10.0,
 }
 DEFAULT_COUNT_INCREMENT = 64 * 256
-DEFAULT_REFERENCE_ETA = 3.5e-2
-DEFAULT_REFERENCE_BETA = 0.95
-DEFAULT_BETA_HALF_LIFE = -DEFAULT_COUNT_INCREMENT / math.log2(DEFAULT_REFERENCE_BETA)
-DEFAULT_SHRINK_HALF_LIVES = {
-    name: -DEFAULT_COUNT_INCREMENT
-    / math.log2(1.0 - DEFAULT_REFERENCE_ETA / rho)
-    for name, rho in DEFAULT_REFERENCE_RADII.items()
+DEFAULT_MOMENTUM_RETENTION = 0.95
+DEFAULT_BETA_HALF_LIFE = -DEFAULT_COUNT_INCREMENT / math.log2(
+    DEFAULT_MOMENTUM_RETENTION
+)
+DEFAULT_WEIGHT_RETENTIONS = {
+    "embed": 0.965,
+    "hidden": 0.9883333333333333,
+    "out": 0.9965,
+}
+DEFAULT_WEIGHT_RETENTION_HALF_LIVES = {
+    name: -DEFAULT_COUNT_INCREMENT / math.log2(retention)
+    for name, retention in DEFAULT_WEIGHT_RETENTIONS.items()
 }
 DEFAULT_STEP_SCALE = 1.0
 
@@ -95,6 +103,43 @@ def cuda_memory_text(device: torch.device) -> str:
         f" | cuda_reserved {stats['reserved_gb']:.2f}G"
         f" | cuda_max_reserved {stats['max_reserved_gb']:.2f}G"
     )
+
+
+def jsonable(value):
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    return str(value)
+
+
+class MetricsLogger:
+    def __init__(self, path: str, run_name: str = "") -> None:
+        self.run_name = run_name
+        self.file = None
+        if path:
+            metrics_path = Path(path)
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            self.file = metrics_path.open("a", encoding="utf-8", buffering=1)
+
+    def write(self, event: str, **values) -> None:
+        if self.file is None:
+            return
+        record = {"event": event, "run_name": self.run_name, **values}
+        self.file.write(json.dumps(jsonable(record), separators=(",", ":")) + "\n")
+
+    def close(self) -> None:
+        if self.file is not None:
+            self.file.close()
+            self.file = None
 
 
 def step_stats_text(stats: dict[str, dict]) -> str:
@@ -147,11 +192,66 @@ def estimate_loss(
     return out
 
 
+def update_logit_stats(acc: dict[str, float], logits: torch.Tensor, targets: torch.Tensor) -> None:
+    values = logits.detach().float()
+    token_count = values.numel() // values.size(-1)
+    centered = values - values.mean(dim=-1, keepdim=True)
+    log_probs = torch.log_softmax(values, dim=-1)
+    probs = log_probs.exp()
+    top2 = torch.topk(values, k=min(2, values.size(-1)), dim=-1).values
+    top_margin = (
+        top2[..., 0] - top2[..., 1] if top2.size(-1) > 1 else torch.zeros_like(top2[..., 0])
+    )
+    target_probs = probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+
+    acc["tokens"] += float(token_count)
+    acc["logit_var"] += float(centered.square().mean(dim=-1).sum())
+    acc["logit_margin"] += float(top_margin.sum())
+    acc["softmax_entropy"] += float((-(probs * log_probs).sum(dim=-1)).sum())
+    acc["softmax_max_prob"] += float(probs.max(dim=-1).values.sum())
+    acc["target_prob"] += float(target_probs.sum())
+
+
+def finalize_logit_stats(acc: dict[str, float]) -> dict[str, float]:
+    tokens = max(acc.get("tokens", 0.0), 1.0)
+    return {
+        "logit_std": math.sqrt(max(0.0, acc["logit_var"] / tokens)),
+        "logit_margin": acc["logit_margin"] / tokens,
+        "softmax_entropy": acc["softmax_entropy"] / tokens,
+        "softmax_max_prob": acc["softmax_max_prob"] / tokens,
+        "target_prob": acc["target_prob"] / tokens,
+    }
+
+
 @torch.inference_mode()
-def estimate_val_loss(
-    model: GPT, source: BatchSource, eval_iters: int, amp_dtype: torch.dtype | None
-) -> float:
-    return estimate_loss(model, source, eval_iters, amp_dtype, splits=("val",))["val"]
+def estimate_val_metrics(
+    model: GPT,
+    source: BatchSource,
+    eval_iters: int,
+    amp_dtype: torch.dtype | None,
+    collect_logit_stats: bool = False,
+) -> tuple[float, dict[str, float]]:
+    was_training = model.training
+    model.eval()
+    total = 0.0
+    logit_acc = {
+        "tokens": 0.0,
+        "logit_var": 0.0,
+        "logit_margin": 0.0,
+        "softmax_entropy": 0.0,
+        "softmax_max_prob": 0.0,
+        "target_prob": 0.0,
+    }
+    with amp_ctx(amp_dtype):
+        for _ in range(eval_iters):
+            xb, yb = source.get("val")
+            logits, loss = model(xb, yb)
+            total += float(loss)
+            if collect_logit_stats:
+                update_logit_stats(logit_acc, logits, yb)
+    model.train(was_training)
+    stats = finalize_logit_stats(logit_acc) if collect_logit_stats else {}
+    return total / eval_iters, stats
 
 
 def scale_from_coordinate(
@@ -192,33 +292,57 @@ def resolve_group_step_scale(args, group: str) -> tuple[float, float]:
         raise ValueError(f"invalid {group} step scale: {peak}")
     if not math.isfinite(floor) or floor < 0.0:
         raise ValueError(f"invalid {group} minimum step scale: {floor}")
+    validate_step_scale(peak, f"{group} step scale")
+    validate_step_scale(floor, f"{group} minimum step scale")
+    if floor > peak:
+        raise ValueError(
+            f"invalid {group} minimum step scale: {floor}; expected <= peak {peak}"
+        )
     return peak, floor
 
 
-def resolve_group_rho(args, group: str) -> float:
-    rho = getattr(args, f"rho_{group}", None)
-    if rho is None:
-        rho = args.rho
-    if rho is None:
-        rho = DEFAULT_REFERENCE_RADII[group]
-    if rho <= 0.0:
-        raise ValueError(f"invalid {group} reference radius: {rho}")
-    return rho
+def resolve_group_rms_radius(args, group: str) -> float:
+    radius = getattr(args, f"rms_radius_{group}", None)
+    if radius is None:
+        radius = getattr(args, "rms_radius", None)
+    if radius is None:
+        radius = DEFAULT_RMS_RADII[group]
+    if radius <= 0.0:
+        raise ValueError(f"invalid {group} target RMS radius: {radius}")
+    return radius
 
 
 def count_increment(args) -> int:
     return args.batch_size * args.block_size * args.grad_accum
 
 
-def resolve_group_shrink_half_life(args, group: str) -> float:
-    half_life = getattr(args, f"shrink_half_life_{group}", None)
+def resolve_group_weight_retention_half_life(args, group: str) -> float:
+    half_life = getattr(args, f"weight_retention_half_life_{group}", None)
     if half_life is None:
-        half_life = args.shrink_half_life
+        half_life = args.weight_retention_half_life
     if half_life is None:
-        half_life = DEFAULT_SHRINK_HALF_LIVES[group]
+        half_life = DEFAULT_WEIGHT_RETENTION_HALF_LIVES[group]
     if half_life <= 0.0:
-        raise ValueError(f"invalid {group} shrink half-life: {half_life}")
+        raise ValueError(f"invalid {group} weight-retention half-life: {half_life}")
     return half_life
+
+
+def step_scale_for_additive_eta(
+    rms_radius: float,
+    momentum_retention: float,
+    peak_weight_retention: float,
+    eta: float,
+) -> float:
+    if eta <= 0.0:
+        return 0.0
+    if rms_radius <= 0.0:
+        raise ValueError(f"invalid target RMS radius: {rms_radius}")
+    if not (0.0 < peak_weight_retention < 1.0):
+        return 0.0
+    zeta = weight_retention_for_rms_eta(rms_radius, momentum_retention, eta)
+    if zeta <= 0.0:
+        return math.inf
+    return math.log(zeta) / math.log(peak_weight_retention)
 
 
 def apply_auto_group_step_scales(
@@ -235,14 +359,12 @@ def apply_auto_group_step_scales(
         group["auto_l1"] = l1
 
         eta = args.auto_action_scale / l1
-        unit = scheduled_invariant_action(
-            float(group["rho"]),
-            float(group["peak_shrink"]),
-            1.0,
-            1.0,
-            name,
-        ).eta_unit
-        step_scale = eta / unit
+        step_scale = step_scale_for_additive_eta(
+            float(group["rms_radius"]),
+            float(group["memory_beta"]),
+            float(group["peak_weight_retention"]),
+            eta,
+        )
         step_scale = min(
             max(step_scale, group.get("min_step_scale", 0.0)),
             group.get("max_step_scale", step_scale),
@@ -301,9 +423,10 @@ def hidden_params(model: GPT) -> list[torch.Tensor]:
 
 
 def group_action(group: dict, scheduled_step_scale: float):
-    return scheduled_invariant_action(
-        rho=float(group["rho"]),
-        peak_shrink=float(group["peak_shrink"]),
+    return scheduled_rms_matched_action(
+        rms_radius=float(group["rms_radius"]),
+        momentum_retention=float(group["memory_beta"]),
+        peak_weight_retention=float(group["peak_weight_retention"]),
         peak_scale=float(group["peak_step_scale"]),
         scheduled_scale=scheduled_step_scale,
         name=group.get("name", "group"),
@@ -327,40 +450,47 @@ def init_like_ulmo_(p: torch.Tensor, ulmo, radius: float) -> None:
 @torch.no_grad()
 def init_from_actions_(groups: list[dict]) -> None:
     for group in groups:
-        radius = float(group["rho"])
+        radius = float(group["rms_radius"])
         ulmo = group["ulmo"]
         for p in group["params"]:
             init_like_ulmo_(p, ulmo, radius)
 
 
-def action_group_fields(name: str, args, delta_tau: int) -> dict:
+def action_group_fields(
+    name: str, args, delta_tau: int, memory_beta: float
+) -> dict:
     peak_step_scale, min_step_scale = resolve_group_step_scale(args, name)
-    shrink_half_life = resolve_group_shrink_half_life(args, name)
-    peak_shrink = halving_factor(
-        delta_tau, shrink_half_life, f"{name}_shrink_half_life"
+    weight_retention_half_life = resolve_group_weight_retention_half_life(args, name)
+    peak_weight_retention = halving_factor(
+        delta_tau,
+        weight_retention_half_life,
+        f"{name}_weight_retention_half_life",
     )
+    rms_radius = resolve_group_rms_radius(args, name)
     fields = {
-        "rho": resolve_group_rho(args, name),
+        "rms_radius": rms_radius,
+        "memory_beta": memory_beta,
         "peak_step_scale": peak_step_scale,
         "max_step_scale": peak_step_scale,
         "min_step_scale": min_step_scale,
-        "peak_shrink": peak_shrink,
-        "shrink_half_life": shrink_half_life,
+        "peak_weight_retention": peak_weight_retention,
+        "weight_retention_half_life": weight_retention_half_life,
         "beta_half_life": args.beta_half_life,
         "count_increment": delta_tau,
     }
-    action = scheduled_invariant_action(
-        fields["rho"],
-        peak_shrink,
-        peak_step_scale,
-        peak_step_scale,
-        name,
+    action = scheduled_rms_matched_action(
+        rms_radius,
+        memory_beta,
+        peak_weight_retention=peak_weight_retention,
+        peak_scale=peak_step_scale,
+        scheduled_scale=peak_step_scale,
+        name=name,
     )
     fields.update(
+        rho=action.rho,
+        atom_correlation=action.atom_correlation,
         step_scale=peak_step_scale,
-        schedule_ratio=action.ratio,
-        shrink=action.shrink,
-        eta_unit=action.eta_unit,
+        weight_retention=action.weight_retention,
         lr=action.eta,
     )
     return fields
@@ -372,6 +502,7 @@ def optimizer_group(
     ulmo,
     args,
     delta_tau: int,
+    memory_beta: float,
 ) -> dict | None:
     if not params:
         return None
@@ -379,7 +510,7 @@ def optimizer_group(
         "name": name,
         "params": params,
         "ulmo": ulmo,
-        **action_group_fields(name, args, delta_tau),
+        **action_group_fields(name, args, delta_tau, memory_beta),
     }
 
 
@@ -409,7 +540,7 @@ def build_optimizer(model: GPT, args, device: torch.device):
     work_dtype = torch.float16 if device.type == "cuda" else torch.float32
     groups = []
     for name, params, ulmo in optimizer_group_specs(model, args, work_dtype):
-        group = optimizer_group(name, params, ulmo, args, delta_tau)
+        group = optimizer_group(name, params, ulmo, args, delta_tau, memory_beta)
         if group is not None:
             groups.append(group)
     init_from_actions_(groups)
@@ -428,10 +559,10 @@ def configure_optimizer_actions(opt, args) -> None:
     memory_beta = halving_factor(delta_tau, args.beta_half_life, "beta_half_life")
     for group in opt.param_groups:
         name = group.get("name")
-        if name not in DEFAULT_REFERENCE_RADII:
+        if name not in DEFAULT_RMS_RADII:
             continue
         group.update(
-            action_group_fields(name, args, delta_tau),
+            action_group_fields(name, args, delta_tau, memory_beta),
             memory_beta=memory_beta,
             readout_mu=args.readout_mu,
         )
@@ -541,6 +672,16 @@ def state_checkpoint_path(path: Path, args, step: int) -> Path:
     if args.state_out_path:
         return Path(args.state_out_path)
     return path.with_name(f"{path.stem}_state_step{step:05d}{path.suffix}")
+
+
+def train_state_save_step(args, decay_start: int, decay_steps: int) -> int | None:
+    if args.save_state_at == "none":
+        return None
+    if args.save_state_at == "decay-start":
+        return decay_start if decay_steps > 0 else None
+    if args.state_save_step < 0:
+        raise ValueError("--state-save-step must be nonnegative with --save-state-at step")
+    return args.state_save_step
 
 
 def save_train_state(
@@ -694,14 +835,18 @@ def format_optimizer_schedule(opt) -> str:
         min_step_scale = group.get("min_step_scale", 0.0)
         peak_action = group_action(group, peak_step_scale)
         min_action = group_action(group, min_step_scale)
-        rho = group.get("rho", math.nan)
-        shrink_half_life = group.get("shrink_half_life", math.inf)
+        rms_radius = group.get("rms_radius", math.nan)
+        weight_half_life = group.get("weight_retention_half_life", math.inf)
         parts.append(
-            f"{name}=(rho={rho:g},s={peak_step_scale:.3g}->{min_step_scale:.3g},"
+            f"{name}=(rw={rms_radius:g},"
+            f"rho={peak_action.rho:.3g}->{min_action.rho:.3g},"
+            f"s={peak_step_scale:.3g}->{min_step_scale:.3g},"
             f"eta={peak_action.eta:.3e}->{min_action.eta:.3e},"
-            f"h_shrink={shrink_half_life:.3g},"
-            f"zeta={peak_action.shrink:.6f}->{min_action.shrink:.6f},"
-            f"eta_unit={peak_action.eta_unit:.3e}->{min_action.eta_unit:.3e})"
+            f"h_weight={weight_half_life:.3g},"
+            f"zeta={peak_action.weight_retention:.6f}->"
+            f"{min_action.weight_retention:.6f},"
+            f"A={peak_action.atom_correlation:.3g}->"
+            f"{min_action.atom_correlation:.3g})"
         )
     return ", ".join(parts)
 
@@ -723,10 +868,10 @@ def apply_scheduled_etas(
         )
         action = group_action(group, step_scale)
         group["step_scale"] = step_scale
-        group["schedule_ratio"] = action.ratio
-        group["shrink"] = action.shrink
-        group["eta_unit"] = action.eta_unit
+        group["weight_retention"] = action.weight_retention
         group["lr"] = action.eta
+        group["rho"] = action.rho
+        group["atom_correlation"] = action.atom_correlation
         current_etas[group.get("name", f"group{len(current_etas)}")] = action.eta
     return current_etas
 
@@ -785,6 +930,7 @@ def run_line_probe(
 
 def train(args):
     device, amp_dtype = configure_runtime(args)
+    metrics = MetricsLogger(args.metrics_jsonl, args.run_name)
     line_curve_scales = parse_line_scales(args.line_curve_scales)
     if line_curve_scales:
         args.track_line_probe = True
@@ -831,6 +977,7 @@ def train(args):
     beta_half_life = first_group.get("beta_half_life", math.nan)
     io_weights = "tied" if input_output_tied(raw_model) else "untied"
 
+    eta_groups = format_optimizer_schedule(opt)
     print(
         "schedule "
         f"warmup_steps={warmup_steps} stable_steps={stable_steps} decay_steps={decay_steps} "
@@ -841,7 +988,34 @@ def train(args):
         f"hidden_ulmo={args.hidden_ulmo} "
         f"io_weights={io_weights} embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
         f"qkv=split spi_iteration={args.spi_iteration} "
-        f"eta_groups={format_optimizer_schedule(opt)}"
+        f"eta_groups={eta_groups}"
+    )
+    metrics.write(
+        "config",
+        args=vars(args),
+        schedule={
+            "warmup_steps": warmup_steps,
+            "stable_steps": stable_steps,
+            "decay_steps": decay_steps,
+            "count_increment": effective_tokens,
+        },
+        optimizer={
+            "name": "scionc",
+            "beta_half_life": beta_half_life,
+            "beta": memory_beta,
+            "readout_mu": readout_mu,
+            "eta_groups": eta_groups,
+        },
+        model={
+            "prenorm": args.prenorm,
+            "dropout": args.dropout,
+            "hidden_ulmo": args.hidden_ulmo,
+            "io_weights": io_weights,
+            "embed_ulmo": args.embed_ulmo,
+            "out_ulmo": args.out_ulmo,
+            "qkv": "split",
+            "spi_iteration": args.spi_iteration,
+        },
     )
     if args.track_line_probe and args.grad_accum != 1:
         print("line_probe_disabled_requires_grad_accum_1")
@@ -875,6 +1049,7 @@ def train(args):
     train_start = sync_now(device)
     step_stat_accum = {}
     decay_start = warmup_steps + stable_steps
+    requested_state_step = train_state_save_step(args, decay_start, decay_steps)
     saved_state_steps = set()
     if resume_ckpt is not None:
         print(f"resumed_state step={start_step} path={args.resume_state}")
@@ -887,7 +1062,13 @@ def train(args):
 
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
             train_loss = last_losses["train"]
-            val_loss = estimate_val_loss(model, source, args.eval_iters, amp_dtype)
+            val_loss, logit_stats = estimate_val_metrics(
+                model,
+                source,
+                args.eval_iters,
+                amp_dtype,
+                args.track_logit_stats,
+            )
             last_losses["val"] = val_loss
             opt_stats = (
                 consume_step_stats(step_stat_accum) if args.track_step_stats else {}
@@ -920,13 +1101,37 @@ def train(args):
             elapsed = max(sync_now(device) - train_start, 1e-9)
             mem_text = cuda_memory_text(device)
             opt_text = step_stats_text(opt_stats)
+            logit_text = (
+                " | logits "
+                f"std={logit_stats['logit_std']:.3f},"
+                f"H={logit_stats['softmax_entropy']:.3f},"
+                f"pmax={logit_stats['softmax_max_prob']:.3f}"
+                if logit_stats
+                else ""
+            )
             print(
                 f"step {step:5d} | eta {eta:.3e} | train {train_loss:.4f} | val {val_loss:.4f} | "
                 f"best_val {best_val:.4f} | train_seconds {elapsed:.3f} | "
                 f"tok/s {(total_opt_steps * effective_tokens) / elapsed:.0f}"
-                f"{mem_text}{opt_text}"
+                f"{mem_text}{logit_text}{opt_text}"
             )
             memory = cuda_memory_stats(device)
+            metrics.write(
+                "eval",
+                step=step,
+                total_opt_steps=total_opt_steps,
+                eta=eta,
+                etas=current_etas,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                best_val=best_val,
+                max_val=max_val,
+                train_seconds=elapsed,
+                tokens_per_second=(total_opt_steps * effective_tokens) / elapsed,
+                cuda_memory=memory,
+                logit_stats=logit_stats,
+                step_stats=opt_stats,
+            )
             if (
                 args.max_cuda_reserved_gb > 0
                 and memory
@@ -976,6 +1181,13 @@ def train(args):
             conv_text = conv_probe.capture(step, current_etas)
             if conv_text:
                 print(conv_text)
+                metrics.write(
+                    "convergence",
+                    step=step,
+                    total_opt_steps=total_opt_steps,
+                    etas=current_etas,
+                    groups=conv_probe.summary,
+                )
                 if (
                     args.auto_step_scale_from_stats
                     and warmup_steps <= step < warmup_steps + stable_steps
@@ -1020,9 +1232,8 @@ def train(args):
             )
         if (
             not args.no_save
-            and args.save_state_at == "decay-start"
-            and decay_steps > 0
-            and total_opt_steps == decay_start
+            and requested_state_step is not None
+            and total_opt_steps == requested_state_step
             and total_opt_steps not in saved_state_steps
         ):
             state_path = state_checkpoint_path(Path(args.out_path), args, total_opt_steps)
@@ -1068,7 +1279,7 @@ def train(args):
                 + " ".join(f"{k}={v}" for k, v in stats.items())
             )
 
-    return {
+    result = {
         "best_val": best_val,
         "final_train": last_losses["train"],
         "final_val": last_losses["val"],
@@ -1081,6 +1292,9 @@ def train(args):
         "stable_steps": stable_steps,
         "decay_steps": decay_steps,
     }
+    metrics.write("final", **result)
+    metrics.close()
+    return result
 
 
 @torch.inference_mode()
@@ -1248,13 +1462,15 @@ def make_parser():
         "--step-scale",
         type=float,
         default=None,
-        help="linear dimensionless peak action scale; raw additive eta is derived",
+        help=(
+            "linear peak weight-retention rate multiplier; raw additive eta is derived"
+        ),
     )
     p.add_argument(
         "--log2-step-scale",
         type=float,
         default=None,
-        help="base-2 log of the dimensionless peak action scale",
+        help="base-2 log of the peak weight-retention rate multiplier",
     )
     p.add_argument(
         "--step-scale-embed", dest="step_scale_embed", type=float, default=None
@@ -1292,7 +1508,7 @@ def make_parser():
         "--min-step-scale",
         type=float,
         default=0.0,
-        help="dimensionless decay floor for action scale",
+        help="decay floor for the weight-retention rate multiplier; must be <= peak",
     )
     p.add_argument(
         "--min-step-scale-embed",
@@ -1314,27 +1530,42 @@ def make_parser():
         default=None,
     )
     p.add_argument(
-        "--rho",
+        "--rms-radius",
+        dest="rms_radius",
         type=float,
         default=None,
-        help="reference radius for all optimizer groups",
+        help="target stationary RMS radius for all optimizer groups",
     )
-    p.add_argument("--rho-embed", dest="rho_embed", type=float, default=None)
-    p.add_argument("--rho-hidden", dest="rho_hidden", type=float, default=None)
     p.add_argument(
-        "--rho-out", "--rho-unembed", dest="rho_out", type=float, default=None
+        "--rms-radius-embed",
+        dest="rms_radius_embed",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--rms-radius-hidden",
+        dest="rms_radius_hidden",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--rms-radius-out",
+        "--rms-radius-unembed",
+        dest="rms_radius_out",
+        type=float,
+        default=None,
     )
     p.add_argument(
         "--beta-half-life",
         type=float,
         default=DEFAULT_BETA_HALF_LIFE,
-        help="EMA memory half-life in processed tokens",
+        help="momentum-state retention half-life in processed tokens",
     )
     p.add_argument(
         "--readout-mu",
         type=float,
         default=1.0,
-        help="dimensionless Nesterov readout blend",
+        help="ULMO readout blend between current gradient and momentum state",
     )
     p.add_argument(
         "--hidden-ulmo",
@@ -1367,27 +1598,27 @@ def make_parser():
     p.add_argument("--spi-refresh-interval", type=int, default=100)
     p.add_argument("--spi-refresh-threshold", type=float, default=0.10)
     p.add_argument(
-        "--shrink-half-life",
+        "--weight-retention-half-life",
         type=float,
         default=None,
-        help="direct shrink half-life in processed tokens for all groups",
+        help="weight-retention half-life in processed tokens for all groups",
     )
     p.add_argument(
-        "--shrink-half-life-embed",
-        dest="shrink_half_life_embed",
-        type=float,
-        default=None,
-    )
-    p.add_argument(
-        "--shrink-half-life-hidden",
-        dest="shrink_half_life_hidden",
+        "--weight-retention-half-life-embed",
+        dest="weight_retention_half_life_embed",
         type=float,
         default=None,
     )
     p.add_argument(
-        "--shrink-half-life-out",
-        "--shrink-half-life-unembed",
-        dest="shrink_half_life_out",
+        "--weight-retention-half-life-hidden",
+        dest="weight_retention_half_life_hidden",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--weight-retention-half-life-out",
+        "--weight-retention-half-life-unembed",
+        dest="weight_retention_half_life_out",
         type=float,
         default=None,
     )
@@ -1413,9 +1644,15 @@ def make_parser():
     )
     p.add_argument(
         "--save-state-at",
-        choices=["none", "decay-start"],
+        choices=["none", "decay-start", "step"],
         default="decay-start",
         help="save a full train-state checkpoint at a branchable schedule point",
+    )
+    p.add_argument(
+        "--state-save-step",
+        type=int,
+        default=-1,
+        help="optimizer step for --save-state-at step",
     )
     p.add_argument(
         "--state-out-path",
@@ -1437,6 +1674,21 @@ def make_parser():
         "--track-step-stats",
         action="store_true",
         help="accumulate optimizer group stats and print them on eval lines",
+    )
+    p.add_argument(
+        "--track-logit-stats",
+        action="store_true",
+        help="log cheap validation-batch softmax/logit statistics on eval lines",
+    )
+    p.add_argument(
+        "--metrics-jsonl",
+        default="",
+        help="append structured config/eval/convergence/final records to this JSONL path",
+    )
+    p.add_argument(
+        "--run-name",
+        default="",
+        help="optional run label included in structured metrics records",
     )
     p.add_argument(
         "--track-convergence-stats",

@@ -16,7 +16,7 @@ __all__ = [
 class StepStatSnapshot:
     group: str
     lr: float
-    eta: float | None
+    retention_complement: float | None
     items: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]]
 
 
@@ -25,13 +25,13 @@ def capture_step_stats(optimizer: Optimizer) -> list[StepStatSnapshot]:
     for group in optimizer.param_groups:
         items = []
         lr = float(group["lr"])
-        eta = group.get("eta")
+        retention_complement = None
         if group.get("cwd", False) or group.get("phi", 0.0):
-            eta = None
-        elif group.get("shrink") is not None:
-            eta = 1.0 - float(group["shrink"])
-        elif eta is None and group.get("theta2") is None:
-            eta = lr * float(group.get("weight_decay", 0.0))
+            retention_complement = None
+        elif group.get("weight_retention") is not None:
+            retention_complement = 1.0 - float(group["weight_retention"])
+        elif retention_complement is None:
+            retention_complement = lr * float(group.get("weight_decay", 0.0))
         for p in group["params"]:
             g = p.grad
             if g is None:
@@ -46,7 +46,9 @@ def capture_step_stats(optimizer: Optimizer) -> list[StepStatSnapshot]:
             )
         if items:
             snapshots.append(
-                StepStatSnapshot(group.get("name", "group"), lr, eta, items)
+                StepStatSnapshot(
+                    group.get("name", "group"), lr, retention_complement, items
+                )
             )
     return snapshots
 
@@ -75,8 +77,11 @@ def accumulate_step_stats(
             momentum = state.get("m")
             mom = momentum.detach().float() if momentum is not None else None
             atom = None
-            if snapshot.eta is not None and snapshot.lr > 0.0:
-                atom = delta.add(p32, alpha=float(snapshot.eta)) / snapshot.lr
+            if snapshot.retention_complement is not None and snapshot.lr > 0.0:
+                atom = (
+                    delta.add(p32, alpha=float(snapshot.retention_complement))
+                    / snapshot.lr
+                )
 
             update_sq = delta.square().sum()
             grad_sq = grad.square().sum()

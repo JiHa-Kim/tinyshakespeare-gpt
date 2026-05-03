@@ -18,9 +18,9 @@ from scionc.models import GPT
 class ConvergenceItem:
     name: str
     group: str
+    opt_group: dict
     param: torch.Tensor
     ulmo: object
-    rho: float
 
 
 _SpectralPowerKey = tuple[int, str]
@@ -246,8 +246,8 @@ class ConvergenceProbe:
         groups = {
             id(p): (
                 group.get("name", "group"),
+                group,
                 group["ulmo"],
-                float(group.get("rho", 1.0)),
             )
             for group in opt.param_groups
             for p in group["params"]
@@ -259,8 +259,8 @@ class ConvergenceProbe:
                 continue
             if keep is not None and name not in keep:
                 continue
-            group, ulmo, rho = groups[id(p)]
-            items.append(ConvergenceItem(name, group, p, ulmo, rho))
+            group, opt_group, ulmo = groups[id(p)]
+            items.append(ConvergenceItem(name, group, opt_group, p, ulmo))
         return items
 
     def _probe_names(self, model: GPT) -> set[str]:
@@ -465,11 +465,12 @@ class ConvergenceProbe:
                     current_param = item.param.detach().float().cpu()
                     param_primal = primal_norm(current_param, item.ulmo, self.eps)
                 eta = current_etas.get(item.group, float("nan"))
+                rho = float(item.opt_group.get("rho", 1.0))
                 self._append(stats, "gdual", grad_dual)
-                self._append(stats, "grel", item.rho * grad_dual)
-                self._append(stats, "xrel", param_primal / max(item.rho, self.eps))
+                self._append(stats, "grel", rho * grad_dual)
+                self._append(stats, "xrel", param_primal / max(rho, self.eps))
                 self._append(stats, "eta", eta)
-                self._append(stats, "eta_rel", eta / max(item.rho, self.eps))
+                self._append(stats, "eta_rel", eta / max(rho, self.eps))
 
                 if self._has_previous(item):
                     dgrad = spectral_dgrad.get(id(item.param))
@@ -504,7 +505,7 @@ class ConvergenceProbe:
                         and grad_dual > self.eps
                     ):
                         l1hat = (dgrad / dparam) / grad_dual
-                        lrel = item.rho * l1hat
+                        lrel = rho * l1hat
                         self._append(stats, "l1", l1hat)
                         self._append(stats, "lrel", lrel)
                         self._append(
@@ -556,33 +557,47 @@ class ConvergenceProbe:
         parts = []
         self.summary = {}
         for name, stats in grouped.items():
-            fields = [f"eta={median(stats.get('eta', [])):.2e}"]
+            group_summary: dict[str, float] = {}
+            eta = median(stats.get("eta", []))
+            group_summary["eta"] = eta
+            fields = [f"eta={eta:.2e}"]
             if stats.get("eta_rel"):
-                fields.append(f"eta/r={median(stats['eta_rel']):.2e}")
+                eta_rel = median(stats["eta_rel"])
+                group_summary["eta_rel"] = eta_rel
+                fields.append(f"eta/r={eta_rel:.2e}")
             if stats.get("xrel"):
-                fields.append(f"x/r={median(stats['xrel']):.2f}")
+                xrel = median(stats["xrel"])
+                group_summary["xrel"] = xrel
+                fields.append(f"x/r={xrel:.2f}")
             if stats.get("l1"):
                 l1 = median(stats["l1"])
                 lrel = median(stats["lrel"])
                 action_eff = median(stats["action_eff"])
                 eta_pred = median(stats["eta_pred"])
-                self.summary[name] = {
-                    "l1": l1,
-                    "lrel": lrel,
-                    "action_eff": action_eff,
-                    "eta_pred": eta_pred,
-                }
+                group_summary.update(
+                    {
+                        "l1": l1,
+                        "lrel": lrel,
+                        "action_eff": action_eff,
+                        "eta_pred": eta_pred,
+                    }
+                )
                 fields.append(f"L1={l1:.2e}")
                 fields.append(f"Lrel={lrel:.2e}")
                 fields.append(f"act={action_eff:.2f}")
                 fields.append(f"eta*={eta_pred:.2e}")
-            fields.append(f"g*={median(stats.get('gdual', [])):.2e}")
+            gdual = median(stats.get("gdual", []))
+            group_summary["gdual"] = gdual
+            fields.append(f"g*={gdual:.2e}")
             if stats.get("grel"):
-                fields.append(f"grel={median(stats['grel']):.2e}")
+                grel = median(stats["grel"])
+                group_summary["grel"] = grel
+                fields.append(f"grel={grel:.2e}")
             if stats.get("spec_ratio"):
                 spec_ratio = median(stats["spec_ratio"])
-                self.summary.setdefault(name, {})["spec_ratio"] = spec_ratio
+                group_summary["spec_ratio"] = spec_ratio
                 fields.append(f"Rspec={spec_ratio:.2f}")
+            self.summary[name] = group_summary
             parts.append(f"{name}: " + ",".join(fields))
         if not parts:
             return ""
