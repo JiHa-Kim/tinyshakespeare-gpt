@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import torch
 
-from scionc.ulmos.core import gram_newton_schulz_uvt
+from scionc.ulmos.core import gram_newton_schulz_polar
 from scionc.models.gpt import GPT
 
 
@@ -155,7 +155,7 @@ def spectral_nuclear_support_batch(
     eps: float = 1e-7,
     work_dtype: torch.dtype | None = torch.float16,
 ) -> torch.Tensor:
-    polar = gram_newton_schulz_uvt(batch, steps, eps, work_dtype, 1.05).float()
+    polar = gram_newton_schulz_polar(batch, steps, eps, work_dtype, 1.05).float()
     return (batch.float() * polar).sum(dim=(-2, -1)).abs()
 
 

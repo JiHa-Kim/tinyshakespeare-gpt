@@ -220,109 +220,7 @@ _scale_gram_and_first_poly_cuda = torch.compile(
 )
 
 
-def _gram_newton_schulz_core(
-    x: torch.Tensor,
-    steps: int,
-    eps: float,
-    bound_safety: float,
-    gns_coeffs: tuple[tuple[float, float, float], ...] = _GNS_COEFFS,
-    gns_resets: frozenset[int] = _GNS_RESETS,
-    fp32_eps: float = _FP32_EPS,
-    refine_steps: int = _MOMENT4_REFINE_STEPS,
-    feas_tol: float = _MOMENT4_FEAS_TOL,
-) -> torch.Tensor:
-    if steps <= 0:
-        return x
-
-    gram = torch.bmm(x, x.mT)
-    gram_square = torch.bmm(gram, gram)
-    scale_gram = (
-        _scale_gram_and_first_poly_cuda if x.is_cuda else _scale_gram_and_first_poly
-    )
-    gram, z, x_scale = scale_gram(
-        x,
-        gram,
-        gram_square,
-        eps,
-        bound_safety,
-        fp32_eps,
-        refine_steps,
-        feas_tol,
-        gns_coeffs,
-    )
-    a0, _, _ = gns_coeffs[0]
-    eye = torch.eye(gram.size(-1), dtype=x.dtype, device=x.device).expand_as(gram)
-    q = z + a0 * eye
-
-    if steps > 1 and 1 not in gns_resets:
-        rz = torch.baddbmm(gram, gram, z, beta=a0)
-        gram = torch.baddbmm(rz, z, rz, beta=a0)
-
-    for i in range(1, steps):
-        a, b, c = _gns_coeff(i, gns_coeffs)
-        reset = i in gns_resets
-        if reset:
-            if x_scale is not None:
-                q = q * x_scale
-                x_scale = None
-            x = torch.bmm(q, x)
-            gram = torch.bmm(x, x.mT)
-
-        z = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
-        q = z + a * eye if reset else torch.baddbmm(q, q, z, beta=a)
-
-        if i == steps - 1 or i + 1 in gns_resets:
-            continue
-        rz = torch.baddbmm(gram, gram, z, beta=a)
-        gram = torch.baddbmm(rz, z, rz, beta=a)
-
-    if x_scale is not None:
-        q = q * x_scale
-    return torch.bmm(q, x)
-
-
-def _standard_newton_schulz_core(
-    x: torch.Tensor,
-    steps: int,
-    eps: float,
-    bound_safety: float,
-    gns_coeffs: tuple[tuple[float, float, float], ...] = _GNS_COEFFS,
-    fp32_eps: float = _FP32_EPS,
-    refine_steps: int = _MOMENT4_REFINE_STEPS,
-    feas_tol: float = _MOMENT4_FEAS_TOL,
-) -> torch.Tensor:
-    if steps <= 0:
-        return x
-
-    gram = torch.bmm(x, x.mT)
-    gram_square = torch.bmm(gram, gram)
-    scale_gram = (
-        _scale_gram_and_first_poly_cuda if x.is_cuda else _scale_gram_and_first_poly
-    )
-    _, update, x_scale = scale_gram(
-        x,
-        gram,
-        gram_square,
-        eps,
-        bound_safety,
-        fp32_eps,
-        refine_steps,
-        feas_tol,
-        gns_coeffs,
-    )
-    a0, _, _ = gns_coeffs[0]
-    x = torch.baddbmm(x, update, x, beta=a0)
-    x = x * x_scale
-
-    for i in range(1, steps):
-        a, b, c = _gns_coeff(i, gns_coeffs)
-        gram = torch.bmm(x, x.mT)
-        update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
-        x = torch.baddbmm(x, update, x, beta=a)
-    return x
-
-
-def gram_newton_schulz_uvt(
+def gram_newton_schulz_polar(
     g: torch.Tensor,
     steps: int = 5,
     eps: float = 1e-7,
@@ -335,7 +233,9 @@ def gram_newton_schulz_uvt(
     feas_tol: float = _MOMENT4_FEAS_TOL,
 ) -> torch.Tensor:
     if g.ndim < 2:
-        raise ValueError("gram_newton_schulz_uvt expects a matrix or batch of matrices")
+        raise ValueError(
+            "gram_newton_schulz_polar expects a matrix or batch of matrices"
+        )
 
     original_shape = g.shape
     original_dtype = g.dtype
@@ -350,14 +250,54 @@ def gram_newton_schulz_uvt(
 
     x = x / (torch.linalg.vector_norm(x, dim=(-2, -1), keepdim=True) + eps)
     x = x.to(_gns_work_dtype(g, work_dtype))
-    if max(x.shape[-2:]) > min(x.shape[-2:]):
-        x = _gram_newton_schulz_core(
-            x, steps, eps, bound_safety, gns_coeffs, gns_resets, fp32_eps, refine_steps, feas_tol
+    if steps > 0:
+        gram = torch.bmm(x, x.mT)
+        gram_square = torch.bmm(gram, gram)
+        scale_gram = (
+            _scale_gram_and_first_poly_cuda
+            if x.is_cuda
+            else _scale_gram_and_first_poly
         )
-    else:
-        x = _standard_newton_schulz_core(
-            x, steps, eps, bound_safety, gns_coeffs, fp32_eps, refine_steps, feas_tol
+        gram, z, x_scale = scale_gram(
+            x,
+            gram,
+            gram_square,
+            eps,
+            bound_safety,
+            fp32_eps,
+            refine_steps,
+            feas_tol,
+            gns_coeffs,
         )
+        a0, _, _ = gns_coeffs[0]
+        eye = torch.eye(gram.size(-1), dtype=x.dtype, device=x.device).expand_as(gram)
+        q = z + a0 * eye
+
+        if steps > 1 and 1 not in gns_resets:
+            rz = torch.baddbmm(gram, gram, z, beta=a0)
+            gram = torch.baddbmm(rz, z, rz, beta=a0)
+
+        for i in range(1, steps):
+            a, b, c = _gns_coeff(i, gns_coeffs)
+            reset = i in gns_resets
+            if reset:
+                if x_scale is not None:
+                    q = q * x_scale
+                    x_scale = None
+                x = torch.bmm(q, x)
+                gram = torch.bmm(x, x.mT)
+
+            z = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+            q = z + a * eye if reset else torch.baddbmm(q, q, z, beta=a)
+
+            if i == steps - 1 or i + 1 in gns_resets:
+                continue
+            rz = torch.baddbmm(gram, gram, z, beta=a)
+            gram = torch.baddbmm(rz, z, rz, beta=a)
+
+        if x_scale is not None:
+            q = q * x_scale
+        x = torch.bmm(q, x)
 
     if transposed:
         x = x.mT
@@ -536,7 +476,7 @@ class GramNewtonSchulzULMO:
     def __call__(self, v: torch.Tensor) -> torch.Tensor:
         if v.ndim != 2:
             raise ValueError("GramNewtonSchulzULMO expects a 2D tensor")
-        return gram_newton_schulz_uvt(
+        return gram_newton_schulz_polar(
             v,
             self.steps,
             self.eps,
@@ -565,7 +505,7 @@ class GramNewtonSchulzULMO:
             groups.setdefault(key, []).append((i, x, work, transposed))
 
         for items in groups.values():
-            y_batch = gram_newton_schulz_uvt(
+            y_batch = gram_newton_schulz_polar(
                 torch.stack([work for _, _, work, _ in items]),
                 self.steps,
                 self.eps,
