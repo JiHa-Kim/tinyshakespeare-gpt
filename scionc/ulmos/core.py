@@ -240,7 +240,8 @@ def gram_newton_schulz_polar(
     original_shape = g.shape
     original_dtype = g.dtype
     x = g.reshape(-1, *g.shape[-2:]) if g.ndim > 3 else g
-    if x.ndim == 2:
+    unbatched = x.ndim == 2
+    if unbatched:
         x = x.unsqueeze(0)
 
     x = x.to(torch.float32)
@@ -250,61 +251,62 @@ def gram_newton_schulz_polar(
 
     x = x / (torch.linalg.vector_norm(x, dim=(-2, -1), keepdim=True) + eps)
     x = x.to(_gns_work_dtype(g, work_dtype))
-    if steps > 0:
-        gram = torch.bmm(x, x.mT)
-        gram_square = torch.bmm(gram, gram)
-        scale_gram = (
-            _scale_gram_and_first_poly_cuda
-            if x.is_cuda
-            else _scale_gram_and_first_poly
-        )
-        gram, z, x_scale = scale_gram(
-            x,
-            gram,
-            gram_square,
-            eps,
-            bound_safety,
-            fp32_eps,
-            refine_steps,
-            feas_tol,
-            gns_coeffs,
-        )
-        a0, _, _ = gns_coeffs[0]
-        eye = torch.eye(gram.size(-1), dtype=x.dtype, device=x.device).expand_as(gram)
-        q = z + a0 * eye
+    if steps <= 0:
+        if transposed:
+            x = x.mT
+        x = x.to(original_dtype)
+        return x.squeeze(0) if unbatched else x.reshape(original_shape)
 
-        if steps > 1 and 1 not in gns_resets:
-            rz = torch.baddbmm(gram, gram, z, beta=a0)
-            gram = torch.baddbmm(rz, z, rz, beta=a0)
+    gram = torch.bmm(x, x.mT)
+    gram_square = torch.bmm(gram, gram)
+    scale_gram = (
+        _scale_gram_and_first_poly_cuda if x.is_cuda else _scale_gram_and_first_poly
+    )
+    gram, z, x_scale = scale_gram(
+        x,
+        gram,
+        gram_square,
+        eps,
+        bound_safety,
+        fp32_eps,
+        refine_steps,
+        feas_tol,
+        gns_coeffs,
+    )
+    a0, _, _ = gns_coeffs[0]
+    eye = torch.eye(gram.size(-1), dtype=x.dtype, device=x.device).expand_as(gram)
+    q = z + a0 * eye
 
-        for i in range(1, steps):
-            a, b, c = _gns_coeff(i, gns_coeffs)
-            reset = i in gns_resets
-            if reset:
-                if x_scale is not None:
-                    q = q * x_scale
-                    x_scale = None
-                x = torch.bmm(q, x)
-                gram = torch.bmm(x, x.mT)
+    if steps > 1 and 1 not in gns_resets:
+        rz = torch.baddbmm(gram, gram, z, beta=a0)
+        gram = torch.baddbmm(rz, z, rz, beta=a0)
 
-            z = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
-            q = z + a * eye if reset else torch.baddbmm(q, q, z, beta=a)
-
-            if i == steps - 1 or i + 1 in gns_resets:
-                continue
-            rz = torch.baddbmm(gram, gram, z, beta=a)
-            gram = torch.baddbmm(rz, z, rz, beta=a)
-
-        if x_scale is not None:
+    for i in range(1, steps):
+        a, b, c = _gns_coeff(i, gns_coeffs)
+        reset = i in gns_resets
+        if reset and x_scale is not None:
             q = q * x_scale
-        x = torch.bmm(q, x)
+            x_scale = None
+        if reset:
+            x = torch.bmm(q, x)
+            gram = torch.bmm(x, x.mT)
+
+        z = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+        q = z + a * eye if reset else torch.baddbmm(q, q, z, beta=a)
+
+        if i == steps - 1 or i + 1 in gns_resets:
+            continue
+        rz = torch.baddbmm(gram, gram, z, beta=a)
+        gram = torch.baddbmm(rz, z, rz, beta=a)
+
+    if x_scale is not None:
+        q = q * x_scale
+    x = torch.bmm(q, x)
 
     if transposed:
         x = x.mT
     x = x.to(original_dtype)
-    if len(original_shape) == 2:
-        return x.squeeze(0)
-    return x.reshape(original_shape)
+    return x.squeeze(0) if unbatched else x.reshape(original_shape)
 
 
 class ColNormULMO:

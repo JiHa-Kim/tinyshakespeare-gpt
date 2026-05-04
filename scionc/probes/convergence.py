@@ -280,22 +280,20 @@ class ConvergenceProbe:
 
         return hook
 
-    def _streaming_primal_norms(
-        self, records: list[_ConvergenceRecord]
-    ) -> dict[int, float]:
-        requests: list[tuple[_SpectralPowerKey, torch.Tensor]] = []
-        scales: dict[_SpectralPowerKey, float] = {}
-        for item, _, _ in records:
-            if not self._can_stream_spectral_norm(item, item.param):
-                continue
-            key = (id(item.param), "param")
-            requests.append((key, item.param.detach()))
-            scales[key] = spectral_ulmo_scale(item.param, item.ulmo)
-        estimates = self.spectral_norms.estimate(requests)
-        return {
-            key[0]: value / max(scales[key], self.eps)
-            for key, value in estimates.items()
-        }
+    def _previous_tensor(
+        self,
+        item: ConvergenceItem,
+        previous: _PrevState,
+        index: int,
+        shape: torch.Size,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        previous_gpu = self.prev_gpu.get(id(item.param))
+        if previous_gpu is not None and previous_gpu[index].shape == shape:
+            return previous_gpu[index]
+        if previous is None or previous[index].shape != shape:
+            return None
+        return previous[index].to(device, non_blocking=True)
 
     def _streaming_dparam_norms(
         self, records: list[_ConvergenceRecord]
@@ -306,17 +304,12 @@ class ConvergenceProbe:
             if not self._can_stream_spectral_norm(item, item.param):
                 continue
             key = (id(item.param), "dparam")
-            previous_gpu = self.prev_gpu.get(id(item.param))
-            if previous_gpu is not None and previous_gpu[1].shape == item.param.shape:
-                prev_param_gpu = previous_gpu[1]
-            elif previous is not None:
-                _, prev_param = previous
-                if prev_param.shape != item.param.shape:
-                    continue
-                prev_param_gpu = prev_param.to(item.param.device, non_blocking=True)
-            else:
+            prev_param = self._previous_tensor(
+                item, previous, 1, item.param.shape, item.param.device
+            )
+            if prev_param is None:
                 continue
-            requests.append((key, item.param.detach().float() - prev_param_gpu))
+            requests.append((key, item.param.detach().float() - prev_param))
             scales[key] = spectral_ulmo_scale(item.param, item.ulmo)
         estimates = self.spectral_norms.estimate(requests)
         return {
@@ -341,19 +334,10 @@ class ConvergenceProbe:
         for item, grad, previous in records:
             if not self._can_stream_spectral_norm(item, grad):
                 continue
-            previous_gpu = self.prev_gpu.get(id(item.param))
-            if previous_gpu is not None and previous_gpu[0].shape == grad.shape:
-                prev_grad_gpu = previous_gpu[0]
-            elif previous is not None:
-                prev_grad, _ = previous
-                if prev_grad.shape != grad.shape:
-                    continue
-                prev_grad_gpu = prev_grad.to(grad.device, non_blocking=True)
-            else:
+            prev_grad = self._previous_tensor(item, previous, 0, grad.shape, grad.device)
+            if prev_grad is None:
                 continue
-            requests.append(
-                (id(item.param), item, grad.detach().float() - prev_grad_gpu)
-            )
+            requests.append((id(item.param), item, grad.detach().float() - prev_grad))
         return self._spectral_dual_norms(requests)
 
     def _spectral_dual_norms(
@@ -398,6 +382,134 @@ class ConvergenceProbe:
         key = id(item.param)
         return key in self.prev or key in self.prev_gpu
 
+    def _cpu_tensor(
+        self, x: torch.Tensor, current: torch.Tensor | None
+    ) -> torch.Tensor:
+        return current if current is not None else x.detach().float().cpu()
+
+    def _append_change_stats(
+        self,
+        stats: dict[str, list[float]],
+        item: ConvergenceItem,
+        grad: torch.Tensor,
+        previous: _PrevState,
+        grad_dual: float,
+        eta: float,
+        spectral_dgrad: dict[int, float],
+        streaming_dparam: dict[int, float],
+        current_grad: torch.Tensor | None,
+        current_param: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if not self._has_previous(item):
+            return current_grad, current_param
+
+        key = id(item.param)
+        dgrad = spectral_dgrad.get(key)
+        if dgrad is None and previous is not None:
+            prev_grad, _ = previous
+            current_grad = self._cpu_tensor(grad, current_grad)
+            dgrad = dual_norm(
+                current_grad - prev_grad,
+                item.ulmo,
+                self.eps,
+                item.param,
+            )
+
+        dparam = streaming_dparam.get(key)
+        if dparam is None and previous is not None:
+            _, prev_param = previous
+            current_param = self._cpu_tensor(item.param, current_param)
+            dparam = primal_norm(current_param - prev_param, item.ulmo, self.eps)
+
+        if dgrad is None or dparam is None or dparam <= self.eps or grad_dual <= self.eps:
+            return current_grad, current_param
+
+        l1hat = (dgrad / dparam) / grad_dual
+        self._append(stats, "l1", l1hat)
+        self._append(stats, "eta_pred", self.action_scale / l1hat)
+        self._append(stats, "action_eff", eta * l1hat)
+        return current_grad, current_param
+
+    def _append_spec_ratio(
+        self,
+        stats: dict[str, list[float]],
+        item: ConvergenceItem,
+        grad: torch.Tensor,
+        grad_dual: float,
+    ) -> None:
+        input_sr = self.input_sr.get(id(item.param))
+        if input_sr is None or grad.ndim != 2 or not is_spectral_ulmo(item.ulmo):
+            return
+
+        scale = max(spectral_ulmo_scale(grad, item.ulmo), self.eps)
+        fro_sq = float(grad.detach().float().square().sum().clamp_min(self.eps))
+        nuc = grad_dual / scale
+        self._append(stats, "spec_ratio", (nuc * nuc / fro_sq) / max(input_sr, self.eps))
+
+    def _append_report_stats(
+        self,
+        grouped: dict[str, dict[str, list[float]]],
+        item: ConvergenceItem,
+        grad: torch.Tensor,
+        previous: _PrevState,
+        current_etas: dict[str, float],
+        streaming_dparam: dict[int, float],
+        spectral_gdual: dict[int, float],
+        spectral_dgrad: dict[int, float],
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        key = id(item.param)
+        stats = grouped.setdefault(item.group, {})
+        current_grad = None
+        current_param = None
+        grad_dual = spectral_gdual.get(key)
+        if grad_dual is None:
+            current_grad = self._cpu_tensor(grad, current_grad)
+            grad_dual = dual_norm(current_grad, item.ulmo, self.eps, item.param)
+
+        eta = current_etas.get(item.group, float("nan"))
+        self._append(stats, "gdual", grad_dual)
+        self._append(stats, "eta", eta)
+        current_grad, current_param = self._append_change_stats(
+            stats,
+            item,
+            grad,
+            previous,
+            grad_dual,
+            eta,
+            spectral_dgrad,
+            streaming_dparam,
+            current_grad,
+            current_param,
+        )
+        self._append_spec_ratio(stats, item, grad, grad_dual)
+        return current_grad, current_param
+
+    def _store_previous(
+        self,
+        item: ConvergenceItem,
+        grad: torch.Tensor,
+        streamable: bool,
+        current_grad: torch.Tensor | None,
+        current_param: torch.Tensor | None,
+    ) -> None:
+        key = id(item.param)
+        if self.keep_prev_gpu and streamable:
+            self.prev_gpu[key] = (
+                grad.detach().float().clone(),
+                item.param.detach().float().clone(),
+            )
+            self.prev.pop(key, None)
+            return
+
+        self.prev_gpu.pop(key, None)
+        if not self.keep_prev:
+            self.prev.pop(key, None)
+            return
+
+        current_grad = self._cpu_tensor(grad, current_grad)
+        current_param = self._cpu_tensor(item.param, current_param)
+        self.prev[key] = (current_grad.clone(), current_param.clone())
+
     def capture(self, step: int, current_etas: dict[str, float]) -> str:
         report = self.active
         if not report and not self.keep_prev:
@@ -415,7 +527,6 @@ class ConvergenceProbe:
                 continue
             records.append((item, grad, self.prev.get(id(item.param))))
 
-        streaming_primal = self._streaming_primal_norms(records) if report else {}
         streaming_dparam = self._streaming_dparam_norms(records) if report else {}
         spectral_gdual = self._spectral_grad_dual_norms(records) if report else {}
         spectral_dgrad = self._spectral_dgrad_dual_norms(records) if report else {}
@@ -426,91 +537,18 @@ class ConvergenceProbe:
             current_param = None
 
             if report:
-                stats = grouped.setdefault(item.group, {})
-                grad_dual = spectral_gdual.get(id(item.param))
-                if grad_dual is None:
-                    current_grad = grad.detach().float().cpu()
-                    grad_dual = dual_norm(current_grad, item.ulmo, self.eps, item.param)
-                param_primal = streaming_primal.get(id(item.param))
-                if param_primal is None:
-                    current_param = item.param.detach().float().cpu()
-                    param_primal = primal_norm(current_param, item.ulmo, self.eps)
-                eta = current_etas.get(item.group, float("nan"))
-                self._append(stats, "gdual", grad_dual)
-                self._append(stats, "eta", eta)
-
-                if self._has_previous(item):
-                    dgrad = spectral_dgrad.get(id(item.param))
-                    if dgrad is None:
-                        if previous is None:
-                            dgrad = None
-                        else:
-                            prev_grad, _ = previous
-                            if current_grad is None:
-                                current_grad = grad.detach().float().cpu()
-                            dgrad = dual_norm(
-                                current_grad - prev_grad,
-                                item.ulmo,
-                                self.eps,
-                                item.param,
-                            )
-                    dparam = streaming_dparam.get(id(item.param))
-                    if dparam is None:
-                        if previous is None:
-                            dparam = None
-                        else:
-                            _, prev_param = previous
-                            if current_param is None:
-                                current_param = item.param.detach().float().cpu()
-                            dparam = primal_norm(
-                                current_param - prev_param, item.ulmo, self.eps
-                            )
-                    if (
-                        dgrad is not None
-                        and dparam is not None
-                        and dparam > self.eps
-                        and grad_dual > self.eps
-                    ):
-                        l1hat = (dgrad / dparam) / grad_dual
-                        self._append(stats, "l1", l1hat)
-                        self._append(
-                            stats, "eta_pred", self.action_scale / l1hat
-                        )
-                        self._append(stats, "action_eff", eta * l1hat)
-
-                input_sr = self.input_sr.get(id(item.param))
-                if (
-                    input_sr is not None
-                    and grad.ndim == 2
-                    and is_spectral_ulmo(item.ulmo)
-                ):
-                    scale = max(spectral_ulmo_scale(grad, item.ulmo), self.eps)
-                    fro_sq = float(
-                        grad.detach().float().square().sum().clamp_min(self.eps)
-                    )
-                    nuc = grad_dual / scale
-                    ratio = (nuc * nuc / fro_sq) / max(input_sr, self.eps)
-                    self._append(stats, "spec_ratio", ratio)
-
-            if self.keep_prev_gpu and streamable:
-                self.prev_gpu[id(item.param)] = (
-                    grad.detach().float().clone(),
-                    item.param.detach().float().clone(),
+                current_grad, current_param = self._append_report_stats(
+                    grouped,
+                    item,
+                    grad,
+                    previous,
+                    current_etas,
+                    streaming_dparam,
+                    spectral_gdual,
+                    spectral_dgrad,
                 )
-                self.prev.pop(id(item.param), None)
-            else:
-                self.prev_gpu.pop(id(item.param), None)
-                if self.keep_prev:
-                    if current_grad is None:
-                        current_grad = grad.detach().float().cpu()
-                    if current_param is None:
-                        current_param = item.param.detach().float().cpu()
-                    self.prev[id(item.param)] = (
-                        current_grad.clone(),
-                        current_param.clone(),
-                    )
-                else:
-                    self.prev.pop(id(item.param), None)
+
+            self._store_previous(item, grad, streamable, current_grad, current_param)
         self.active = False
         return self._format(step, grouped) if report else ""
 
