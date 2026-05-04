@@ -1,7 +1,8 @@
 import math
 
 
-def halving_factor(delta_tau: float, half_life: float, name: str) -> float:
+def direction_retention(delta_tau: float, half_life: float, name: str = "direction_half_life") -> float:
+    """Compute q = 2^{-Δτ/h}, the per-update direction retention."""
     if delta_tau <= 0.0:
         raise ValueError(f"invalid count increment: {delta_tau}")
     if half_life <= 0.0:
@@ -9,6 +10,16 @@ def halving_factor(delta_tau: float, half_life: float, name: str) -> float:
     if math.isinf(half_life):
         return 1.0
     return 2.0 ** (-delta_tau / half_life)
+
+
+def angular_step(q: float) -> float:
+    """Compute ε = √(1 − q²), the relative movement per update."""
+    return math.sqrt(max(0.0, 1.0 - q * q))
+
+
+def angular_angle(q: float) -> float:
+    """Compute θ = arccos(q), the angular step per update."""
+    return math.acos(min(q, 1.0))
 
 
 def resolve_schedule(
@@ -30,6 +41,7 @@ def schedule_at_step(
     warmup_steps: int,
     decay_steps: int,
 ) -> float:
+    """WSD schedule scalar at a given step."""
     warmup_steps, stable_steps, decay_steps = resolve_schedule(
         max_steps, warmup_steps, decay_steps
     )
@@ -48,7 +60,21 @@ def schedule_at_step(
     return peak + (floor - peak) * progress
 
 
-def validate_step_scale(scale: float, name: str = "step_scale") -> float:
-    if not math.isfinite(scale) or scale < 0.0:
-        raise ValueError(f"invalid {name}: {scale}; expected {name} >= 0")
-    return scale
+def scheduled_retention(
+    q_peak: float,
+    schedule_ratio: float,
+) -> float:
+    """Apply a WSD schedule ratio to the peak retention.
+
+    The halving exponent H = -log2(q_peak) is scaled by schedule_ratio:
+
+        q(t) = 2^{-schedule_ratio * H} = q_peak^{schedule_ratio}
+
+    At schedule_ratio=1, q = q_peak (peak movement).
+    At schedule_ratio=0, q = 1 (no movement).
+    """
+    if schedule_ratio <= 0.0:
+        return 1.0
+    if schedule_ratio >= 1.0:
+        return q_peak
+    return q_peak ** schedule_ratio

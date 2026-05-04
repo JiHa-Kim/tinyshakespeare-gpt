@@ -9,12 +9,11 @@ from pathlib import Path
 import torch
 
 from scionc.compile_env import ensure_compile_env
-from scionc.optim.parametrization import resolve_schedule
+from scionc.optim.parametrization import angular_step, resolve_schedule
 from scionc.optim.setup import (
-    DEFAULT_BETA_HALF_LIFE,
+    DEFAULT_DIRECTION_HALF_LIFE,
     GROUP_NAMES,
-    apply_auto_group_step_scales,
-    apply_scheduled_etas,
+    apply_scheduled_q,
     build_optimizer,
     count_increment,
     format_optimizer_schedule,
@@ -407,7 +406,7 @@ def train(args):
     opt = build_optimizer(raw_model, args, device)
     conv_probe = (
         ConvergenceProbe(raw_model, opt, args)
-        if args.track_convergence_stats or args.auto_step_scale_from_stats
+        if args.track_convergence_stats
         else None
     )
     if conv_probe is not None:
@@ -422,24 +421,21 @@ def train(args):
     warmup_steps, stable_steps, decay_steps = resolve_training_schedule(args)
     effective_tokens = count_increment(args)
     first_group = opt.param_groups[0]
-    readout_mu = first_group.get("readout_mu", args.readout_mu)
-    memory_beta = first_group.get("memory_beta", math.nan)
-    beta_half_life = first_group.get("beta_half_life", math.nan)
+    q_peak = float(first_group.get("q_peak", first_group["q"]))
+    direction_half_life = first_group.get("direction_half_life", math.nan)
     io_weights = optimizer_io_label(raw_model)
 
-    eta_groups = format_optimizer_schedule(opt)
+    group_text = format_optimizer_schedule(opt)
     print(
         "schedule "
         f"warmup_steps={warmup_steps} stable_steps={stable_steps} decay_steps={decay_steps} "
         f"count_increment={effective_tokens} "
-        f"beta_half_life={beta_half_life:.3g} beta={memory_beta:.6f} "
-        f"readout_mu={readout_mu:.3g} "
-        f"optimizer=scionc dropout={args.dropout:.3f} "
+        f"direction_half_life={direction_half_life:.3g} q_peak={q_peak:.6f} "
+        f"optimizer=rms_sphere dropout={args.dropout:.3f} "
         f"hidden_ulmo={args.hidden_ulmo} "
         f"io_weights={io_weights} embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
         f"qkv=split spi_iteration={args.spi_iteration} "
-        f"rms_solve={args.rms_solve} "
-        f"eta_groups={eta_groups}"
+        f"groups={group_text}"
     )
     metrics.write(
         "config",
@@ -451,12 +447,10 @@ def train(args):
             "count_increment": effective_tokens,
         },
         optimizer={
-            "name": "scionc",
-            "beta_half_life": beta_half_life,
-            "beta": memory_beta,
-            "readout_mu": readout_mu,
-            "rms_solve": args.rms_solve,
-            "eta_groups": eta_groups,
+            "name": "rms_sphere",
+            "direction_half_life": direction_half_life,
+            "q_peak": q_peak,
+            "groups": group_text,
         },
         model={
             "dropout": args.dropout,
@@ -485,10 +479,12 @@ def train(args):
     step_stat_accum = {}
 
     for step in range(args.max_iters):
-        current_etas = apply_scheduled_etas(
-            opt, step, args.max_iters, warmup_steps, decay_steps
+        current_qs = apply_scheduled_q(
+            opt, step, args.max_iters, warmup_steps, decay_steps,
+            args.schedule_floor,
         )
-        eta = current_etas.get("hidden", next(iter(current_etas.values())))
+        q = current_qs.get("hidden", next(iter(current_qs.values())))
+        eps_move = angular_step(q)
 
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
             train_loss = float(last_train_loss)
@@ -545,7 +541,7 @@ def train(args):
                 else ""
             )
             print(
-                f"step {step:5d} | eta {eta:.3e} | train {train_loss:.4f} | val {val_loss:.4f} | "
+                f"step {step:5d} | q {q:.6f} eps {eps_move:.6f} | train {train_loss:.4f} | val {val_loss:.4f} | "
                 f"best_val {best_val:.4f} | train_seconds {elapsed:.3f} | "
                 f"tok/s {(total_opt_steps * effective_tokens) / elapsed:.0f}"
                 f"{mem_text}{logit_text}{rms_text}{opt_text}"
@@ -555,8 +551,8 @@ def train(args):
                 "eval",
                 step=step,
                 total_opt_steps=total_opt_steps,
-                eta=eta,
-                etas=current_etas,
+                q=q,
+                qs=current_qs,
                 train_loss=train_loss,
                 val_loss=val_loss,
                 best_val=best_val,
@@ -611,25 +607,16 @@ def train(args):
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
         if conv_probe is not None:
-            conv_text = conv_probe.capture(step, current_etas)
+            conv_text = conv_probe.capture(step, current_qs)
             if conv_text:
                 print(conv_text)
                 metrics.write(
                     "convergence",
                     step=step,
                     total_opt_steps=total_opt_steps,
-                    etas=current_etas,
+                    qs=current_qs,
                     groups=conv_probe.summary,
                 )
-                if (
-                    args.auto_step_scale_from_stats
-                    and warmup_steps <= step < warmup_steps + stable_steps
-                ):
-                    auto_text = apply_auto_group_step_scales(
-                        opt, conv_probe.summary, args
-                    )
-                    if auto_text:
-                        print(auto_text)
         line_params_before = (
             capture_params(raw_model.parameters())
             if line_active and line_curve_scales
@@ -847,52 +834,31 @@ def make_parser():
     p.add_argument("--decay-frac", type=float, default=0.15)
 
     p.add_argument(
-        "--step-scale",
+        "--direction-half-life",
         type=float,
-        default=None,
-        help="linear peak eta multiplier; peak eta is 0.035 times this value",
-    )
-    p.add_argument(
-        "--log2-step-scale",
-        type=float,
-        default=None,
-        help="base-2 log of the peak eta multiplier",
+        default=DEFAULT_DIRECTION_HALF_LIFE,
+        help="direction-retention half-life in processed tokens",
     )
     for group in GROUP_NAMES:
-        p.add_argument(f"--step-scale-{group}", type=float, default=None)
-        p.add_argument(f"--log2-step-scale-{group}", type=float, default=None)
+        p.add_argument(f"--direction-half-life-{group}", type=float, default=None)
     p.add_argument(
-        "--min-step-scale",
+        "--schedule-floor",
         type=float,
         default=0.0,
-        help="decay floor for the eta multiplier; must be <= peak",
+        help="WSD schedule floor for the halving exponent ratio (0 = no movement at decay end)",
     )
-    for group in GROUP_NAMES:
-        p.add_argument(f"--min-step-scale-{group}", type=float, default=None)
     p.add_argument(
         "--target-rms",
         dest="target_rms",
         type=float,
         default=None,
         help=(
-            "actual entrywise weight RMS target for all optimizer groups; "
+            "initialization RMS target for all optimizer groups; "
             "defaults are embed=0.70, hidden=0.051, out=0.022"
         ),
     )
     for group in GROUP_NAMES:
         p.add_argument(f"--target-rms-{group}", type=float, default=None)
-    p.add_argument(
-        "--beta-half-life",
-        type=float,
-        default=DEFAULT_BETA_HALF_LIFE,
-        help="momentum-state retention half-life in processed tokens",
-    )
-    p.add_argument(
-        "--readout-mu",
-        type=float,
-        default=1.0,
-        help="ULMO readout blend between current gradient and momentum state",
-    )
     p.add_argument(
         "--hidden-ulmo",
         choices=["streaming-svd", "gram-ns"],
@@ -922,20 +888,6 @@ def make_parser():
     )
     p.add_argument("--spi-refresh-interval", type=int, default=100)
     p.add_argument("--spi-refresh-threshold", type=float, default=0.10)
-    p.add_argument(
-        "--shrink-half-life",
-        type=float,
-        default=None,
-        help="weight shrink half-life in processed tokens for all groups",
-    )
-    for group in GROUP_NAMES:
-        p.add_argument(f"--shrink-half-life-{group}", type=float, default=None)
-    p.add_argument(
-        "--rms-solve",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="solve eta per step to target RMS, capped by the eta schedule",
-    )
 
     p.add_argument("--prompt", default="To be, or not to be")
     p.add_argument("--sample-tokens", type=int, default=400)
@@ -1023,26 +975,7 @@ def make_parser():
         default=7,
         help="Gram-NS polar-support steps for spectral dual stats",
     )
-    p.add_argument(
-        "--auto-step-scale-from-stats",
-        dest="auto_step_scale_from_stats",
-        action="store_true",
-        help="set group peak step scales from convergence L1 estimates after warmup",
-    )
-    p.add_argument(
-        "--auto-action-scale",
-        dest="auto_action_scale",
-        type=float,
-        default=1.25,
-        help="target normalized action scale eta * L1",
-    )
-    p.add_argument(
-        "--auto-l1-beta",
-        dest="auto_l1_beta",
-        type=float,
-        default=0.8,
-        help="EMA beta for L1 estimates used by --auto-step-scale-from-stats",
-    )
+
     return p
 
 

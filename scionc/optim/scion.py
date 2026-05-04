@@ -1,95 +1,30 @@
+import math
+
 import torch
 from torch.optim import Optimizer
 
 
-def _rms_solved_group_eta(
-    params: list[torch.Tensor],
-    updates: list[torch.Tensor],
-    shrink: float,
-    target_rms: float,
-    lr: float,
-) -> torch.Tensor:
-    total = sum(p.numel() for p in params)
-    if total <= 0:
-        return torch.zeros((), device=updates[0].device, dtype=updates[0].dtype)
-
-    s = sum(
-        (p * u).sum(dtype=torch.float32)
-        for p, u in zip(params, updates, strict=True)
-    )
-    w_sq = torch.stack(torch._foreach_norm(params)).square().sum()
-    v_sq = torch.stack(torch._foreach_norm(updates)).square().sum().clamp_min(1e-15)
-    s = s / total
-    w_sq = w_sq / total
-    v_sq = v_sq / total
-    target_sq = target_rms * target_rms
-    shrink_sq = shrink * shrink
-    d = shrink_sq * s * s - v_sq * (shrink_sq * w_sq - target_sq)
-
-    root = d.clamp_min(0.0).sqrt()
-    eta = (-shrink * s + root) / v_sq
-    alternate = (-shrink * s - root) / v_sq
-    eta = torch.where((shrink_sq * w_sq > target_sq) & (s < 0.0), alternate, eta)
-    eta = torch.where(d < 0.0, -shrink * s / v_sq, eta)
-    return eta.clamp(0.0, lr)
-
-
-def _readout(
-    grad: torch.Tensor, momentum: torch.Tensor, readout_mu: float
-) -> torch.Tensor:
-    if readout_mu == 1.0:
-        return momentum
-    if readout_mu == 0.0:
-        return grad
-    return torch.lerp(grad, momentum, readout_mu)
-
-
-class ScionC(Optimizer):
+class RMSSphere(Optimizer):
     """
-    Minimal ScionC optimizer.
+    RMS-Sphere optimizer.
 
-    Each group supplies a ULMO. The default constrained SCG update is:
+    Each controlled block lives on a fixed-radius RMS sphere.  The radius
+    R = ‖W₀‖_rms is frozen on the first optimizer step.  A single direction
+    retention q sets the angular movement; momentum retention β = q.
 
-        m <- beta * m + (1 - beta) * grad
-        p <- shrink * p + eta * ulmo(m)
+    The spherical update is:
 
-    The additive scale `eta` is taken from `lr` (step-scale form). If
-    `rms_solve` and `target_rms` are set on a group, `eta` is dynamically
-    solved via the one-step RMS solve and capped by `lr`.
+        Ŵ_{t+1} = q Ŵ_t + √(1 − q²) U_t
+
+    where U_t is the unit RMS tangent descent direction obtained by projecting
+    the ULMO atom of the momentum state onto the tangent space of the sphere.
     """
 
-    def __init__(
-        self,
-        params,
-        lr: float = 1e-4,
-        memory_beta: float = 0.95,
-        readout_mu: float = 1.0,
-        ulmo=None,
-        shrink: float = 1.0,
-        target_rms: float | None = None,
-        rms_solve: bool = False,
-    ):
-        if lr < 0.0:
-            raise ValueError(f"invalid lr: {lr}")
-        if not (0.0 <= memory_beta < 1.0):
-            raise ValueError(f"invalid memory_beta: {memory_beta}")
-        if not (0.0 <= readout_mu <= 1.0):
-            raise ValueError(f"invalid readout_mu: {readout_mu}")
-        if not (0.0 < shrink <= 1.0):
-            raise ValueError(f"invalid shrink: {shrink}")
+    def __init__(self, params, q: float = 0.99, ulmo=None):
+        if not (0.0 < q <= 1.0):
+            raise ValueError(f"invalid q: {q}")
 
-        super().__init__(
-            params,
-            dict(
-                lr=lr,
-                memory_beta=memory_beta,
-                readout_mu=readout_mu,
-                ulmo=ulmo,
-                shrink=shrink,
-                target_rms=target_rms,
-                rms_solve=rms_solve,
-            ),
-        )
+        super().__init__(params, dict(q=q, ulmo=ulmo))
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -103,70 +38,79 @@ class ScionC(Optimizer):
             if not entries:
                 continue
 
-            target_rms = group.get("target_rms") if group.get("rms_solve") else None
-            lr = float(group["lr"])
-            shrink = float(group["shrink"])
-            if lr == 0.0:
-                if shrink != 1.0:
-                    for _, p, _ in entries:
-                        p.mul_(shrink)
+            q = float(group["q"])
+            eps_move = math.sqrt(max(0.0, 1.0 - q * q))
+            if eps_move == 0.0:
                 continue
 
             updates = self._updates(group["ulmo"], entries)
-            params = [p for _, p, _ in entries]
-            if target_rms is None:
-                if shrink != 1.0:
-                    torch._foreach_mul_(params, shrink)
-                torch._foreach_add_(params, updates, alpha=lr)
-            else:
-                eta = _rms_solved_group_eta(
-                    params, updates, shrink, float(target_rms), lr
-                )
-                if shrink != 1.0:
-                    torch._foreach_mul_(params, shrink)
-                torch._foreach_mul_(updates, eta)
-                torch._foreach_add_(params, updates)
+
+            for (_, p, _), u in zip(entries, updates, strict=True):
+                state = self.state[p]
+                R = state["R"]
+                if R <= 0.0:
+                    continue
+
+                d = p.numel()
+                w_hat = p.data / R
+
+                # Tangent projection: D = u − ⟨u, ŵ⟩_rms ŵ
+                inner_rms = (u * w_hat).sum() / d
+                D = u - inner_rms * w_hat
+                D_rms = (D.square().sum() / d).sqrt()
+
+                if float(D_rms) > 0.0:
+                    U = D / D_rms
+                    w_hat = q * w_hat + eps_move * U
+                    # Numerical re-projection to the constraint manifold
+                    w_hat_rms = (w_hat.square().sum() / d).sqrt()
+                    w_hat = w_hat / w_hat_rms
+                    p.data.copy_(R * w_hat)
 
         return loss
 
     def _collect_entries(
         self, group
     ) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
-        memory_beta = group["memory_beta"]
-        readout_mu = group["readout_mu"]
+        q = float(group["q"])  # β = q (tied)
         entries = []
         for param_index, p in enumerate(group["params"]):
             g = p.grad
             if g is None:
                 continue
             if g.is_sparse:
-                raise RuntimeError("ScionC does not support sparse gradients")
+                raise RuntimeError("RMSSphere does not support sparse gradients")
 
             state = self.state[p]
-            if not state:
+            if "m" not in state:
                 state["m"] = torch.zeros_like(
                     g, memory_format=torch.preserve_format
                 )
+                # Freeze radius on first step: R = ‖W₀‖_rms
+                d = p.numel()
+                state["R"] = float((p.data.square().sum() / d).sqrt())
 
             m = state["m"]
-            m.lerp_(g, 1.0 - memory_beta)
-            entries.append((param_index, p, _readout(g, m, readout_mu)))
+            m.lerp_(g, 1.0 - q)
+            entries.append((param_index, p, m))
         return entries
 
     def _updates(
         self, ulmo, entries: list[tuple[int, torch.Tensor, torch.Tensor]]
     ) -> list[torch.Tensor]:
         if ulmo is None:
-            raise ValueError("ScionC requires a ULMO for every parameter group")
+            # Euclidean direction: just return momentum (ULMO negation handled
+            # by the projection step — the ULMO convention is descent direction)
+            return [m.clone() for _, _, m in entries]
 
         batch_dir = getattr(ulmo, "batch", None)
         if batch_dir is not None:
-            return batch_dir([g for _, _, g in entries], [p for _, p, _ in entries])
+            return batch_dir([m for _, _, m in entries], [p for _, p, _ in entries])
 
         set_ulmo_param = getattr(ulmo, "set_param", None)
         updates = []
-        for _, p, g in entries:
+        for _, p, m in entries:
             if set_ulmo_param is not None:
                 set_ulmo_param(p)
-            updates.append(ulmo(g))
+            updates.append(ulmo(m))
         return updates
