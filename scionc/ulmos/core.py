@@ -374,10 +374,9 @@ class ColNormULMO:
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
         x = w.mT if self.transpose else w
-        x = x.div_(
-            torch.linalg.vector_norm(x, dim=0, keepdim=True).clamp_min_(self.eps)
-        ).mul_(-math.sqrt(x.size(0)))
-        return x.mT if self.transpose else x
+        y = x / torch.linalg.vector_norm(x, dim=0, keepdim=True).clamp_min(self.eps)
+        y = y * -math.sqrt(x.size(0))
+        return y.mT if self.transpose else y
 
     def atom_sq(self, p: torch.Tensor) -> float:
         return 1.0
@@ -403,10 +402,9 @@ class RowNormULMO:
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
         x = w.mT if self.transpose else w
-        x = x.div_(
-            torch.linalg.vector_norm(x, dim=1, keepdim=True).clamp_min_(self.eps)
-        ).mul_(-1.0 / math.sqrt(x.size(1)))
-        return x.mT if self.transpose else x
+        y = x / torch.linalg.vector_norm(x, dim=1, keepdim=True).clamp_min(self.eps)
+        y = y * (-1.0 / math.sqrt(x.size(1)))
+        return y.mT if self.transpose else y
 
     def atom_sq(self, p: torch.Tensor) -> float:
         _, cols = _view_shape(p, self.transpose)
@@ -430,8 +428,8 @@ class SignULMO:
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
         x = w.mT if self.transpose else w
-        x = x.sign_().mul_(-1.0 / x.size(1))
-        return x.mT if self.transpose else x
+        y = x.sign() * (-1.0 / x.size(1))
+        return y.mT if self.transpose else y
 
     def atom_sq(self, p: torch.Tensor) -> float:
         _, cols = _view_shape(p, self.transpose)

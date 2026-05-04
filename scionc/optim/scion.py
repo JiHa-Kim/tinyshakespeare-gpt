@@ -34,6 +34,16 @@ def _rms_solved_group_eta(
     return eta.clamp(0.0, lr)
 
 
+def _readout(
+    grad: torch.Tensor, momentum: torch.Tensor, readout_mu: float
+) -> torch.Tensor:
+    if readout_mu == 1.0:
+        return momentum
+    if readout_mu == 0.0:
+        return grad
+    return torch.lerp(grad, momentum, readout_mu)
+
+
 class ScionC(Optimizer):
     """
     Minimal ScionC optimizer.
@@ -140,11 +150,7 @@ class ScionC(Optimizer):
 
             m = state["m"]
             m.lerp_(g, 1.0 - memory_beta)
-            if readout_mu == 1.0:
-                g.copy_(m)
-            elif readout_mu != 0.0:
-                g.lerp_(m, readout_mu)
-            entries.append((param_index, p, g))
+            entries.append((param_index, p, _readout(g, m, readout_mu)))
         return entries
 
     def _updates(
