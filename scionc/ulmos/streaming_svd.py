@@ -6,13 +6,10 @@ _SVDGroupKey = tuple[tuple[int, ...], torch.dtype, torch.device]
 _SVDItem = tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, bool, float]
 
 
-def _column_inverse_scale(x: torch.Tensor, eps: float) -> torch.Tensor:
-    norms = torch.linalg.vector_norm(x, dim=-2, keepdim=True).clamp_min(eps)
-    return norms.reciprocal()
-
-
 def _normalize_columns(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
-    inv_scale = _column_inverse_scale(x, eps)
+    inv_scale = torch.linalg.vector_norm(x, dim=-2, keepdim=True).clamp_min(
+        eps
+    ).reciprocal()
     return x * inv_scale, inv_scale
 
 
@@ -184,15 +181,6 @@ class StreamingSVDULMO:
             return self._v_step_norm_power(m, v, check_refresh)
         return self._v_step_scqr2(m, v, check_refresh)
 
-    def _output_scale(
-        self,
-        items: list[_SVDItem],
-        v_batch: torch.Tensor,
-        mv: torch.Tensor,
-        sigma: torch.Tensor,
-    ) -> torch.Tensor:
-        return sigma.reciprocal()
-
     def _basis_for(self, p: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
         key = (id(p), tuple(m.shape), m.dtype, m.device)
         v = self.states.get(key)
@@ -239,8 +227,7 @@ class StreamingSVDULMO:
 
             mv = m_batch @ v_batch
             sigma = torch.linalg.vector_norm(mv, dim=-2).clamp_min(self.eps)
-            mv_scale = self._output_scale(items, v_batch, mv, sigma)
-            y_batch = (mv * mv_scale.unsqueeze(-2)) @ v_batch.mT
+            y_batch = (mv * sigma.reciprocal().unsqueeze(-2)) @ v_batch.mT
 
             for j, (i, x, p, m, transposed, scale) in enumerate(items):
                 v = v_batch[j]
