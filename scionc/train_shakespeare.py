@@ -14,10 +14,6 @@ from scionc.ulmos.core import (
     GramNewtonSchulzULMO,
     RowNormULMO,
     SignULMO,
-    init_colnorm_,
-    init_rownorm_,
-    init_sign_,
-    init_spectral_,
 )
 from scionc.ulmos.streaming_svd import StreamingSVDULMO
 from scionc.optim.scion import ScionC
@@ -402,34 +398,6 @@ def group_action(group: dict, scheduled_step_scale: float) -> tuple[float, float
     return shrink, float(group["base_eta"]) * scheduled_step_scale
 
 
-def _view_shape(p: torch.Tensor, transpose: bool = False) -> tuple[int, int]:
-    if p.ndim != 2:
-        return p.numel(), 1
-    rows, cols = p.shape
-    return (cols, rows) if transpose else (rows, cols)
-
-
-def spectral_atom_sq(p: torch.Tensor, input_like: bool = False) -> float:
-    rows, cols = _view_shape(p)
-    if rows <= 0 or cols <= 0:
-        return 0.0
-    scale_sq = rows / cols
-    if input_like:
-        scale_sq = max(1.0, scale_sq)
-    return min(rows, cols) * scale_sq / (rows * cols)
-
-
-def ulmo_atom_sq(p: torch.Tensor, ulmo) -> float:
-    if isinstance(ulmo, ColNormULMO):
-        return 1.0
-    if isinstance(ulmo, (RowNormULMO, SignULMO)):
-        _, cols = _view_shape(p, getattr(ulmo, "transpose", False))
-        return 1.0 / (cols * cols)
-    if isinstance(ulmo, (GramNewtonSchulzULMO, StreamingSVDULMO)):
-        return spectral_atom_sq(p, getattr(ulmo, "input_like", False))
-    return 1.0 / max(p.numel(), 1)
-
-
 @torch.no_grad()
 def current_group_rms(group: dict) -> float:
     params = [p.detach().float() for p in group["params"] if p.numel()]
@@ -441,33 +409,11 @@ def current_group_rms(group: dict) -> float:
 
 
 @torch.no_grad()
-def init_like_ulmo_(p: torch.Tensor, ulmo, radius: float) -> None:
-    if isinstance(ulmo, ColNormULMO):
-        init_colnorm_(p, radius=radius, transpose=ulmo.transpose)
-    elif isinstance(ulmo, RowNormULMO):
-        init_rownorm_(p, radius=radius, transpose=ulmo.transpose)
-    elif isinstance(ulmo, SignULMO):
-        init_sign_(p, radius=radius, transpose=ulmo.transpose)
-    elif isinstance(ulmo, (GramNewtonSchulzULMO, StreamingSVDULMO)):
-        init_spectral_(p, radius=radius, input_like=getattr(ulmo, "input_like", False))
-    else:
-        raise TypeError(f"unsupported ULMO init: {type(ulmo).__name__}")
-
-
-def init_radius_for_target_rms(p: torch.Tensor, ulmo, target_rms: float) -> float:
-    atom_sq = ulmo_atom_sq(p, ulmo)
-    if atom_sq <= 0.0:
-        return target_rms
-    return target_rms / math.sqrt(atom_sq)
-
-
-@torch.no_grad()
 def init_from_actions_(groups: list[dict]) -> None:
     for group in groups:
         ulmo = group["ulmo"]
         for p in group["params"]:
-            radius = init_radius_for_target_rms(p, ulmo, float(group["target_rms"]))
-            init_like_ulmo_(p, ulmo, radius)
+            ulmo.init_(p, float(group["target_rms"]))
 
 
 def action_group_fields(

@@ -159,6 +159,27 @@ def _spectral_bounds_from_gram(
     return lower, upper
 
 
+def _view_shape(p: torch.Tensor, transpose: bool = False) -> tuple[int, int]:
+    if p.ndim != 2:
+        return p.numel(), 1
+    rows, cols = p.shape
+    return (cols, rows) if transpose else (rows, cols)
+
+
+def _spectral_atom_sq(p: torch.Tensor, input_like: bool = False) -> float:
+    rows, cols = _view_shape(p)
+    if rows <= 0 or cols <= 0:
+        return 0.0
+    scale_sq = rows / cols
+    if input_like:
+        scale_sq = max(1.0, scale_sq)
+    return min(rows, cols) * scale_sq / (rows * cols)
+
+
+def _target_radius(p: torch.Tensor, atom_sq: float, target_rms: float) -> float:
+    return target_rms if atom_sq <= 0.0 else target_rms / math.sqrt(atom_sq)
+
+
 def _scale_gram_and_first_poly(
     x: torch.Tensor,
     gram: torch.Tensor,
@@ -358,6 +379,18 @@ class ColNormULMO:
         ).mul_(-math.sqrt(x.size(0)))
         return x.mT if self.transpose else x
 
+    def atom_sq(self, p: torch.Tensor) -> float:
+        return 1.0
+
+    @torch.no_grad()
+    def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
+        return init_colnorm_(
+            p,
+            radius=_target_radius(p, self.atom_sq(p), target_rms),
+            eps=self.eps,
+            transpose=self.transpose,
+        )
+
 
 class RowNormULMO:
     __slots__ = ("eps", "transpose")
@@ -375,6 +408,19 @@ class RowNormULMO:
         ).mul_(-1.0 / math.sqrt(x.size(1)))
         return x.mT if self.transpose else x
 
+    def atom_sq(self, p: torch.Tensor) -> float:
+        _, cols = _view_shape(p, self.transpose)
+        return 0.0 if cols <= 0 else 1.0 / (cols * cols)
+
+    @torch.no_grad()
+    def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
+        return init_rownorm_(
+            p,
+            radius=_target_radius(p, self.atom_sq(p), target_rms),
+            eps=self.eps,
+            transpose=self.transpose,
+        )
+
 
 class SignULMO:
     __slots__ = ("transpose",)
@@ -386,6 +432,18 @@ class SignULMO:
         x = w.mT if self.transpose else w
         x = x.sign_().mul_(-1.0 / x.size(1))
         return x.mT if self.transpose else x
+
+    def atom_sq(self, p: torch.Tensor) -> float:
+        _, cols = _view_shape(p, self.transpose)
+        return 0.0 if cols <= 0 else 1.0 / (cols * cols)
+
+    @torch.no_grad()
+    def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
+        return init_sign_(
+            p,
+            radius=_target_radius(p, self.atom_sq(p), target_rms),
+            transpose=self.transpose,
+        )
 
 
 class GramNewtonSchulzULMO:
@@ -429,6 +487,17 @@ class GramNewtonSchulzULMO:
     def _scale(self, x: torch.Tensor) -> float:
         scale = math.sqrt(x.size(-2) / x.size(-1))
         return max(1.0, scale) if self.input_like else scale
+
+    def atom_sq(self, p: torch.Tensor) -> float:
+        return _spectral_atom_sq(p, self.input_like)
+
+    @torch.no_grad()
+    def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
+        return init_spectral_(
+            p,
+            radius=_target_radius(p, self.atom_sq(p), target_rms),
+            input_like=self.input_like,
+        )
 
     def __call__(self, v: torch.Tensor) -> torch.Tensor:
         if v.ndim != 2:

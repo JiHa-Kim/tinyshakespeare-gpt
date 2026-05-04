@@ -2,6 +2,8 @@ import math
 
 import torch
 
+from scionc.ulmos.core import _spectral_atom_sq, _target_radius, init_spectral_
+
 _SVDGroupKey = tuple[tuple[int, ...], torch.dtype, torch.device]
 _SVDItem = tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, bool, float]
 
@@ -84,6 +86,17 @@ class StreamingSVDULMO:
         if x.dtype in {torch.float16, torch.bfloat16}:
             return torch.float32
         return x.dtype
+
+    def atom_sq(self, p: torch.Tensor) -> float:
+        return _spectral_atom_sq(p, self.input_like)
+
+    @torch.no_grad()
+    def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
+        return init_spectral_(
+            p,
+            radius=_target_radius(p, self.atom_sq(p), target_rms),
+            input_like=self.input_like,
+        )
 
     def _ridge_scale(self, gram: torch.Tensor) -> torch.Tensor:
         scale = gram[..., 0, 0].abs()
