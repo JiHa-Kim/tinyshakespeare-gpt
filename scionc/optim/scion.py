@@ -6,6 +6,30 @@ from torch.optim import Optimizer
 __all__ = ["ScionC"]
 
 
+def _rms_solved_eta(
+    p: torch.Tensor,
+    u: torch.Tensor,
+    shrink: float,
+    target_radius: float,
+    lr: float,
+) -> float:
+    s = (p * u).mean().item()
+    w_sq = p.square().mean().item()
+    v_sq = max(u.square().mean().item(), 1e-15)
+    r_sq = target_radius * target_radius
+    shrink_sq = shrink * shrink
+    d = shrink_sq * s * s - v_sq * (shrink_sq * w_sq - r_sq)
+
+    if d < 0.0:
+        return min(max(0.0, -shrink * s / v_sq), lr)
+
+    root = math.sqrt(d)
+    eta = (-shrink * s + root) / v_sq
+    if shrink_sq * w_sq > r_sq and s < 0.0:
+        eta = (-shrink * s - root) / v_sq
+    return min(max(0.0, eta), lr)
+
+
 class ScionC(Optimizer):
     """
     Minimal ScionC optimizer.
@@ -84,28 +108,7 @@ class ScionC(Optimizer):
                     target_radius = float(rms_radius)
 
                 if target_radius is not None:
-                    s = (p * u).mean().item()
-                    w_sq = p.square().mean().item()
-                    v_sq = max(u.square().mean().item(), 1e-15)
-                    r_sq = target_radius * target_radius
-                    d = (
-                        shrink * shrink * s * s
-                        - v_sq * (shrink * shrink * w_sq - r_sq)
-                    )
-                    if d >= 0.0:
-                        root = math.sqrt(d)
-                        roots = [
-                            value
-                            for value in (
-                                (-shrink * s - root) / v_sq,
-                                (-shrink * s + root) / v_sq,
-                            )
-                            if value >= 0.0
-                        ]
-                        eta = min(roots) if roots else 0.0
-                    else:
-                        eta = max(0.0, -shrink * s / v_sq)
-                    eta = min(eta, lr)
+                    eta = _rms_solved_eta(p, u, shrink, target_radius, lr)
                 else:
                     eta = lr
 

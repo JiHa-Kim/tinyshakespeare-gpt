@@ -1,20 +1,11 @@
 import math
-from dataclasses import dataclass
 
 __all__ = [
-    "ScheduledAction",
     "halving_factor",
     "resolve_schedule",
     "schedule_at_step",
     "validate_step_scale",
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class ScheduledAction:
-    shrink: float
-    eta: float
-    step_scale: float
 
 
 def halving_factor(delta_tau: float, half_life: float, name: str) -> float:

@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 
+from scionc.compile_env import ensure_compile_env
 from scionc.ulmos.streaming_svd import HiddenSVDFilterULMO, StreamingSVDULMO
 
 _GNSGroupKey = tuple[tuple[int, ...], torch.dtype, torch.device]
@@ -58,7 +59,9 @@ _MOMENT4_REFINE_STEPS = 8
 _MOMENT4_FEAS_TOL = 0.25 * _FP32_EPS
 
 
-def _gns_coeff(i: int, coeffs: tuple[tuple[float, float, float], ...]) -> tuple[float, float, float]:
+def _gns_coeff(
+    i: int, coeffs: tuple[tuple[float, float, float], ...]
+) -> tuple[float, float, float]:
     return coeffs[i if i < len(coeffs) else -1]
 
 
@@ -209,7 +212,7 @@ def spectral_moment_bounds_sq(
     return lower.reshape(batch_shape), upper.reshape(batch_shape)
 
 
-def _scale_gram_and_first_poly_eager(
+def _scale_gram_and_first_poly(
     x: torch.Tensor,
     gram: torch.Tensor,
     gram_square: torch.Tensor,
@@ -239,29 +242,10 @@ def _scale_gram_and_first_poly_eager(
     return gram, first_poly, x_scale
 
 
-_scale_gram_and_first_poly_compiled = torch.compile(
-    _scale_gram_and_first_poly_eager, fullgraph=True, dynamic=False
+ensure_compile_env()
+_scale_gram_and_first_poly_cuda = torch.compile(
+    _scale_gram_and_first_poly, fullgraph=True, dynamic=False
 )
-
-
-def _scale_gram_and_first_poly(
-    x: torch.Tensor,
-    gram: torch.Tensor,
-    gram_square: torch.Tensor,
-    eps: float,
-    safety: float,
-    fp32_eps: float = _FP32_EPS,
-    refine_steps: int = _MOMENT4_REFINE_STEPS,
-    feas_tol: float = _MOMENT4_FEAS_TOL,
-    gns_coeffs: tuple[tuple[float, float, float], ...] = _GNS_COEFFS,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if x.is_cuda:
-        return _scale_gram_and_first_poly_compiled(
-            x, gram, gram_square, eps, safety, fp32_eps, refine_steps, feas_tol, gns_coeffs
-        )
-    return _scale_gram_and_first_poly_eager(
-        x, gram, gram_square, eps, safety, fp32_eps, refine_steps, feas_tol, gns_coeffs
-    )
 
 
 def _gram_newton_schulz_core(
@@ -280,8 +264,19 @@ def _gram_newton_schulz_core(
 
     gram = torch.bmm(x, x.mT)
     gram_square = torch.bmm(gram, gram)
-    gram, z, x_scale = _scale_gram_and_first_poly(
-        x, gram, gram_square, eps, bound_safety, fp32_eps, refine_steps, feas_tol, gns_coeffs
+    scale_gram = (
+        _scale_gram_and_first_poly_cuda if x.is_cuda else _scale_gram_and_first_poly
+    )
+    gram, z, x_scale = scale_gram(
+        x,
+        gram,
+        gram_square,
+        eps,
+        bound_safety,
+        fp32_eps,
+        refine_steps,
+        feas_tol,
+        gns_coeffs,
     )
     a0, _, _ = gns_coeffs[0]
     eye = torch.eye(gram.size(-1), dtype=x.dtype, device=x.device).expand_as(gram)
@@ -329,8 +324,19 @@ def _standard_newton_schulz_core(
 
     gram = torch.bmm(x, x.mT)
     gram_square = torch.bmm(gram, gram)
-    _, update, x_scale = _scale_gram_and_first_poly(
-        x, gram, gram_square, eps, bound_safety, fp32_eps, refine_steps, feas_tol, gns_coeffs
+    scale_gram = (
+        _scale_gram_and_first_poly_cuda if x.is_cuda else _scale_gram_and_first_poly
+    )
+    _, update, x_scale = scale_gram(
+        x,
+        gram,
+        gram_square,
+        eps,
+        bound_safety,
+        fp32_eps,
+        refine_steps,
+        feas_tol,
+        gns_coeffs,
     )
     a0, _, _ = gns_coeffs[0]
     x = torch.baddbmm(x, update, x, beta=a0)

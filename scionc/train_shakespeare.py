@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 
+from scionc.compile_env import ensure_compile_env
 from scionc.ulmos import (
     ColNormULMO,
     GramNewtonSchulzULMO,
@@ -22,7 +23,6 @@ from scionc.ulmos import (
 )
 from scionc.optim import ScionC
 from scionc.optim.parametrization import (
-    ScheduledAction,
     halving_factor,
     resolve_schedule,
     schedule_at_step,
@@ -423,7 +423,7 @@ def group_schedule_ratio(group: dict, scheduled_step_scale: float) -> float:
     return ratio
 
 
-def group_action(group: dict, scheduled_step_scale: float) -> ScheduledAction:
+def group_action(group: dict, scheduled_step_scale: float) -> tuple[float, float]:
     peak_scale = float(group["peak_step_scale"])
     validate_step_scale(scheduled_step_scale, f"{group.get('name', 'group')} schedule")
     if peak_scale > 0.0 and scheduled_step_scale > peak_scale * (1.0 + 1e-12):
@@ -439,12 +439,7 @@ def group_action(group: dict, scheduled_step_scale: float) -> ScheduledAction:
         if group.get("shrink_schedule") == "constant"
         else peak_shrink**ratio
     )
-    eta = float(group["base_eta"]) * scheduled_step_scale
-    return ScheduledAction(
-        shrink=shrink,
-        eta=eta,
-        step_scale=scheduled_step_scale,
-    )
+    return shrink, float(group["base_eta"]) * scheduled_step_scale
 
 
 def _view_shape(p: torch.Tensor, transpose: bool = False) -> tuple[int, int]:
@@ -546,11 +541,11 @@ def action_group_fields(
         "beta_half_life": args.beta_half_life,
         "count_increment": delta_tau,
     }
-    action = group_action(fields, peak_step_scale)
+    shrink, eta = group_action(fields, peak_step_scale)
     fields.update(
         step_scale=peak_step_scale,
-        shrink=action.shrink,
-        lr=action.eta,
+        shrink=shrink,
+        lr=eta,
     )
     return fields
 
@@ -820,6 +815,7 @@ def maybe_compile(
 ):
     if not (args.compile and hasattr(torch, "compile")):
         return model, 0.0
+    ensure_compile_env()
     model = torch.compile(model)
     xb, yb = source.get("train")
     t0 = sync_now(device)
@@ -895,17 +891,17 @@ def format_optimizer_schedule(opt) -> str:
         name = group.get("name", "group")
         peak_step_scale = group.get("peak_step_scale", group["step_scale"])
         min_step_scale = group.get("min_step_scale", 0.0)
-        peak_action = group_action(group, peak_step_scale)
-        min_action = group_action(group, min_step_scale)
+        peak_shrink, peak_eta = group_action(group, peak_step_scale)
+        min_shrink, min_eta = group_action(group, min_step_scale)
         rms_radius = group.get("rms_radius", math.nan)
         shrink_half_life = group.get("shrink_half_life", math.inf)
         parts.append(
             f"{name}=(rw={rms_radius:g},"
             f"s={peak_step_scale:.3g}->{min_step_scale:.3g},"
-            f"eta={peak_action.eta:.3e}->{min_action.eta:.3e},"
+            f"eta={peak_eta:.3e}->{min_eta:.3e},"
             f"h_shrink={shrink_half_life:.3g},"
             f"shrink_sched={group.get('shrink_schedule', 'scheduled')},"
-            f"shrink={peak_action.shrink:.6f}->{min_action.shrink:.6f})"
+            f"shrink={peak_shrink:.6f}->{min_shrink:.6f})"
         )
     return ", ".join(parts)
 
@@ -950,11 +946,11 @@ def apply_scheduled_etas(
             warmup_steps,
             decay_steps,
         )
-        action = group_action(group, step_scale)
+        shrink, eta = group_action(group, step_scale)
         group["step_scale"] = step_scale
-        group["shrink"] = action.shrink
-        group["lr"] = action.eta
-        current_etas[group.get("name", f"group{len(current_etas)}")] = action.eta
+        group["shrink"] = shrink
+        group["lr"] = eta
+        current_etas[group.get("name", f"group{len(current_etas)}")] = eta
     return current_etas
 
 
@@ -1577,14 +1573,12 @@ def make_parser():
     )
     p.add_argument(
         "--step-scale-out",
-        "--step-scale-unembed",
         dest="step_scale_out",
         type=float,
         default=None,
     )
     p.add_argument(
         "--log2-step-scale-out",
-        "--log2-step-scale-unembed",
         dest="log2_step_scale_out",
         type=float,
         default=None,
@@ -1609,7 +1603,6 @@ def make_parser():
     )
     p.add_argument(
         "--min-step-scale-out",
-        "--min-step-scale-unembed",
         dest="min_step_scale_out",
         type=float,
         default=None,
@@ -1638,7 +1631,6 @@ def make_parser():
     )
     p.add_argument(
         "--rms-radius-out",
-        "--rms-radius-unembed",
         dest="rms_radius_out",
         type=float,
         default=None,
