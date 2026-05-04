@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import torch
 
-from scionc.ulmos import (
+from scionc.ulmos.core import (
     ColNormULMO,
     GramNewtonSchulzULMO,
     RowNormULMO,
@@ -11,7 +11,7 @@ from scionc.ulmos import (
     StreamingSVDULMO,
     gram_newton_schulz_uvt,
 )
-from scionc.models import GPT
+from scionc.models.gpt import GPT
 
 
 @dataclass

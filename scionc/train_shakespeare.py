@@ -9,26 +9,25 @@ from pathlib import Path
 import torch
 
 from scionc.compile_env import ensure_compile_env
-from scionc.ulmos import (
+from scionc.ulmos.core import (
     ColNormULMO,
     GramNewtonSchulzULMO,
-    HiddenSVDFilterULMO,
     RowNormULMO,
     SignULMO,
-    StreamingSVDULMO,
     init_colnorm_,
     init_rownorm_,
     init_sign_,
     init_spectral_,
 )
-from scionc.optim import ScionC
+from scionc.ulmos.streaming_svd import HiddenSVDFilterULMO, StreamingSVDULMO
+from scionc.optim.scion import ScionC
 from scionc.optim.parametrization import (
     halving_factor,
     resolve_schedule,
     schedule_at_step,
     validate_step_scale,
 )
-from scionc.models import (
+from scionc.models.gpt import (
     GPT,
     MLP,
     BatchSource,
