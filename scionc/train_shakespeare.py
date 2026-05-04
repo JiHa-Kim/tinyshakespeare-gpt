@@ -561,14 +561,13 @@ def build_optimizer(model: GPT, args, device: torch.device):
     )
 
 
-def save_checkpoint(path: Path, model: GPT, dataset: CharDataset, args):
+def save_checkpoint(path: Path, model: GPT, dataset: CharDataset):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model": model.state_dict(),
             "model_cfg": asdict(model.cfg),
             "chars": dataset.chars,
-            "args": vars(args),
         },
         path,
     )
@@ -587,7 +586,7 @@ def save_eval_checkpoint(
     eval_path = path.with_name(
         f"{path.stem}_step{step:05d}_val{val_loss:.4f}{path.suffix}"
     )
-    save_checkpoint(eval_path, model, dataset, args)
+    save_checkpoint(eval_path, model, dataset)
 
 
 def load_checkpoint(path: Path, device: torch.device):
@@ -925,7 +924,7 @@ def train(args):
                         f"val_loss_exceeded_{args.diverge_mult:.2f}x_initial"
                     )
                 if not args.no_save and val_loss < prev_best:
-                    save_checkpoint(Path(args.out_path), raw_model, dataset, args)
+                    save_checkpoint(Path(args.out_path), raw_model, dataset)
                 if not args.no_save:
                     save_eval_checkpoint(
                         Path(args.out_path), step, val_loss, raw_model, dataset, args
@@ -936,7 +935,6 @@ def train(args):
                             path.with_name(f"{path.stem}_final{path.suffix}"),
                             raw_model,
                             dataset,
-                            args,
                         )
 
             elapsed = max(sync_now(device) - train_start, 1e-9)
