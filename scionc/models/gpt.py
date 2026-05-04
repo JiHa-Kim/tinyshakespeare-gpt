@@ -10,15 +10,6 @@ import torch.nn.functional as F
 
 TINY_SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 
-__all__ = [
-    "TINY_SHAKESPEARE_URL",
-    "GPTConfig",
-    "GPT",
-    "CharDataset",
-    "BatchSource",
-    "maybe_download_tiny_shakespeare",
-]
-
 
 def rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)

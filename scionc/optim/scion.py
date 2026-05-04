@@ -1,8 +1,6 @@
 import torch
 from torch.optim import Optimizer
 
-__all__ = ["ScionC"]
-
 
 def _rms_solved_group_eta(
     params: list[torch.Tensor],

@@ -8,17 +8,6 @@ from scionc.compile_env import ensure_compile_env
 _GNSGroupKey = tuple[tuple[int, ...], torch.dtype, torch.device]
 _GNSGroupItem = tuple[int, torch.Tensor, torch.Tensor, bool]
 
-__all__ = [
-    "ColNormULMO",
-    "RowNormULMO",
-    "GramNewtonSchulzULMO",
-    "SignULMO",
-    "init_colnorm_",
-    "init_rownorm_",
-    "init_spectral_",
-    "init_sign_",
-]
-
 
 _GNS_COEFFS = (
     (

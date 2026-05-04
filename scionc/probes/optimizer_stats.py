@@ -4,13 +4,6 @@ from dataclasses import dataclass
 import torch
 from torch.optim import Optimizer
 
-__all__ = [
-    "StepStatSnapshot",
-    "accumulate_step_stats",
-    "capture_step_stats",
-    "consume_step_stats",
-]
-
 
 @dataclass
 class StepStatSnapshot:

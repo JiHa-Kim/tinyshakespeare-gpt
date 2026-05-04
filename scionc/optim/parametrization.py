@@ -1,12 +1,5 @@
 import math
 
-__all__ = [
-    "halving_factor",
-    "resolve_schedule",
-    "schedule_at_step",
-    "validate_step_scale",
-]
-
 
 def halving_factor(delta_tau: float, half_life: float, name: str) -> float:
     if delta_tau <= 0.0:
