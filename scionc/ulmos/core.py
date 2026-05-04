@@ -53,14 +53,13 @@ _GNS_COEFFS = (
     ),
 )
 _GNS_RESETS = frozenset({2})
-_GNS_A0, _GNS_B0, _GNS_C0 = _GNS_COEFFS[0]
 _FP32_EPS = torch.finfo(torch.float32).eps
 _MOMENT4_REFINE_STEPS = 8
 _MOMENT4_FEAS_TOL = 0.25 * _FP32_EPS
 
 
-def _gns_coeff(i: int) -> tuple[float, float, float]:
-    return _GNS_COEFFS[i if i < len(_GNS_COEFFS) else -1]
+def _gns_coeff(i: int, coeffs: tuple[tuple[float, float, float], ...]) -> tuple[float, float, float]:
+    return coeffs[i if i < len(coeffs) else -1]
 
 
 def _gns_work_dtype(x: torch.Tensor, work_dtype: torch.dtype | None) -> torch.dtype:
@@ -74,8 +73,8 @@ def _moment2_beta_from_m2(m2: torch.Tensor, n: int) -> torch.Tensor:
     return 1.0 / n + torch.sqrt(((n - 1.0) / n) * v)
 
 
-def _dot_roundoff_gamma(dot_dim: int) -> float:
-    dim_eps = dot_dim * _FP32_EPS
+def _dot_roundoff_gamma(dot_dim: int, eps: float = _FP32_EPS) -> float:
+    dim_eps = dot_dim * eps
     return dim_eps / (1.0 - dim_eps)
 
 
@@ -113,6 +112,8 @@ def _moment4_upper_beta(
     n: int,
     eps: float,
     beta2: torch.Tensor,
+    refine_steps: int = _MOMENT4_REFINE_STEPS,
+    feas_tol: float = _MOMENT4_FEAS_TOL,
 ) -> torch.Tensor:
     if n <= 1:
         return beta2.clamp(eps, 1.0)
@@ -127,14 +128,14 @@ def _moment4_upper_beta(
     d1 = 2.0 * (m4 - m2 * m3)
     d0 = (n_f - 1.0) * (m2 * m4 - m3.square()) - m2 * m2.square() + 2.0 * m2 * m3 - m4
 
-    for _ in range(_MOMENT4_REFINE_STEPS):
+    for _ in range(refine_steps):
         t = 0.5 * (lower + upper)
         t2 = t.square()
 
         p_t = (((d4 * t + d3) * t + d2) * t + d1) * t + d0
         e0 = (m2 - t2) * (m4 - t2.square()) - (m3 - t2 * t).square()
 
-        feasible = torch.minimum(e0, p_t) >= -_MOMENT4_FEAS_TOL
+        feasible = torch.minimum(e0, p_t) >= -feas_tol
         lower = torch.where(feasible, t, lower)
         upper = torch.where(feasible, upper, t)
 
@@ -148,10 +149,11 @@ def _spectral_bound_from_beta(
     eps: float,
     safety: float,
     dot_dim: int,
+    fp32_eps: float = _FP32_EPS,
 ) -> torch.Tensor:
     beta = beta.clamp(eps, 1.0)
     # Squared-norm padding: gamma_dot * tr(G), with dot_dim from the Gram dot.
-    bound = (t1 * beta + _dot_roundoff_gamma(dot_dim) * t1).mul(safety)
+    bound = (t1 * beta + _dot_roundoff_gamma(dot_dim, fp32_eps) * t1).mul(safety)
     bound = bound.clamp_min(eps)
     return torch.where(active, bound, torch.ones_like(bound))
 
@@ -166,16 +168,23 @@ def _spectral_bounds_from_moments(
     eps: float,
     safety: float,
     dot_dim: int,
+    fp32_eps: float = _FP32_EPS,
+    refine_steps: int = _MOMENT4_REFINE_STEPS,
+    feas_tol: float = _MOMENT4_FEAS_TOL,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     beta2 = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
-    upper_beta = _moment4_upper_beta(m2, m3, m4, n, eps, beta2)
+    upper_beta = _moment4_upper_beta(
+        m2, m3, m4, n, eps, beta2, refine_steps, feas_tol
+    )
     upper_beta = torch.minimum(beta2, upper_beta.to(beta2.dtype)).clamp(eps, 1.0)
     
     lower_beta = torch.sqrt(torch.sqrt(m4.clamp_min(eps)))
     lower_beta = torch.minimum(lower_beta.to(beta2.dtype), upper_beta)
 
     lower = torch.where(active, (t1 * lower_beta).clamp_min(0.0), torch.zeros_like(t1))
-    upper = _spectral_bound_from_beta(active, t1, upper_beta, eps, safety, dot_dim)
+    upper = _spectral_bound_from_beta(
+        active, t1, upper_beta, eps, safety, dot_dim, fp32_eps
+    )
     return lower, upper
 
 
@@ -185,25 +194,33 @@ def _spectral_bound_from_gram(
     safety: float,
     gram_square: torch.Tensor | None = None,
     dot_dim: int | None = None,
+    fp32_eps: float = _FP32_EPS,
+    refine_steps: int = _MOMENT4_REFINE_STEPS,
+    feas_tol: float = _MOMENT4_FEAS_TOL,
 ) -> torch.Tensor:
     n = gram.size(-1)
     dot_dim = n if dot_dim is None else dot_dim
     if gram_square is None:
         active, t1, m2 = _moment2_from_gram(gram, eps)
         beta = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
-        return _spectral_bound_from_beta(active, t1, beta, eps, safety, dot_dim)
+        return _spectral_bound_from_beta(active, t1, beta, eps, safety, dot_dim, fp32_eps)
 
     active, t1, m2, m3, m4 = _moment4_from_gram_square(gram, gram_square, eps)
     beta2 = _moment2_beta_from_m2(m2, n).clamp(eps, 1.0)
-    beta4 = _moment4_upper_beta(m2, m3, m4, n, eps, beta2)
+    beta4 = _moment4_upper_beta(
+        m2, m3, m4, n, eps, beta2, refine_steps, feas_tol
+    )
     beta = torch.minimum(beta2, beta4.to(beta2.dtype)).clamp(eps, 1.0)
-    return _spectral_bound_from_beta(active, t1, beta, eps, safety, dot_dim)
+    return _spectral_bound_from_beta(active, t1, beta, eps, safety, dot_dim, fp32_eps)
 
 
 def spectral_moment_bounds_sq(
     x: torch.Tensor,
     eps: float = 1e-7,
     safety: float = 1.0,
+    fp32_eps: float = _FP32_EPS,
+    refine_steps: int = _MOMENT4_REFINE_STEPS,
+    feas_tol: float = _MOMENT4_FEAS_TOL,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.ndim < 2 or x.numel() == 0:
         norm_sq = x.float().square().sum()
@@ -218,7 +235,7 @@ def spectral_moment_bounds_sq(
     gram_square = torch.bmm(gram, gram)
     active, t1, m2, m3, m4 = _moment4_from_gram_square(gram, gram_square, eps)
     lower, upper = _spectral_bounds_from_moments(
-        active, t1, m2, m3, m4, gram.size(-1), eps, safety, y.size(-1)
+        active, t1, m2, m3, m4, gram.size(-1), eps, safety, y.size(-1), fp32_eps, refine_steps, feas_tol
     )
     fro_sq = gram.diagonal(dim1=-2, dim2=-1).sum(-1, dtype=torch.float32)
     upper = torch.where(active, upper, fro_sq)
@@ -233,13 +250,20 @@ def _scale_gram_and_first_poly_eager(
     gram_square: torch.Tensor,
     eps: float,
     safety: float,
+    fp32_eps: float = _FP32_EPS,
+    refine_steps: int = _MOMENT4_REFINE_STEPS,
+    feas_tol: float = _MOMENT4_FEAS_TOL,
+    gns_coeffs: tuple[tuple[float, float, float], ...] = _GNS_COEFFS,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    bound = _spectral_bound_from_gram(gram, eps, safety, gram_square, x.size(-1))
+    bound = _spectral_bound_from_gram(
+        gram, eps, safety, gram_square, x.size(-1), fp32_eps, refine_steps, feas_tol
+    )
     x_scale = torch.rsqrt(bound).reshape(-1, 1, 1).to(x.dtype)
     scale2 = x_scale.square()
     scale4 = scale2.square()
     gram = gram * scale2
-    first_poly = _GNS_B0 * gram + _GNS_C0 * (gram_square * scale4)
+    _, b0, c0 = gns_coeffs[0]
+    first_poly = b0 * gram + c0 * (gram_square * scale4)
     return gram, first_poly, x_scale
 
 
@@ -254,14 +278,30 @@ def _scale_gram_and_first_poly(
     gram_square: torch.Tensor,
     eps: float,
     safety: float,
+    fp32_eps: float = _FP32_EPS,
+    refine_steps: int = _MOMENT4_REFINE_STEPS,
+    feas_tol: float = _MOMENT4_FEAS_TOL,
+    gns_coeffs: tuple[tuple[float, float, float], ...] = _GNS_COEFFS,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if x.is_cuda:
-        return _scale_gram_and_first_poly_compiled(x, gram, gram_square, eps, safety)
-    return _scale_gram_and_first_poly_eager(x, gram, gram_square, eps, safety)
+        return _scale_gram_and_first_poly_compiled(
+            x, gram, gram_square, eps, safety, fp32_eps, refine_steps, feas_tol, gns_coeffs
+        )
+    return _scale_gram_and_first_poly_eager(
+        x, gram, gram_square, eps, safety, fp32_eps, refine_steps, feas_tol, gns_coeffs
+    )
 
 
 def _gram_newton_schulz_core(
-    x: torch.Tensor, steps: int, eps: float, bound_safety: float
+    x: torch.Tensor,
+    steps: int,
+    eps: float,
+    bound_safety: float,
+    gns_coeffs: tuple[tuple[float, float, float], ...] = _GNS_COEFFS,
+    gns_resets: frozenset[int] = _GNS_RESETS,
+    fp32_eps: float = _FP32_EPS,
+    refine_steps: int = _MOMENT4_REFINE_STEPS,
+    feas_tol: float = _MOMENT4_FEAS_TOL,
 ) -> torch.Tensor:
     if steps <= 0:
         return x
@@ -269,18 +309,19 @@ def _gram_newton_schulz_core(
     gram = torch.bmm(x, x.mT)
     gram_square = torch.bmm(gram, gram)
     gram, z, x_scale = _scale_gram_and_first_poly(
-        x, gram, gram_square, eps, bound_safety
+        x, gram, gram_square, eps, bound_safety, fp32_eps, refine_steps, feas_tol, gns_coeffs
     )
+    a0, _, _ = gns_coeffs[0]
     eye = torch.eye(gram.size(-1), dtype=x.dtype, device=x.device).expand_as(gram)
-    q = z + _GNS_A0 * eye
+    q = z + a0 * eye
 
-    if steps > 1 and 1 not in _GNS_RESETS:
-        rz = torch.baddbmm(gram, gram, z, beta=_GNS_A0)
-        gram = torch.baddbmm(rz, z, rz, beta=_GNS_A0)
+    if steps > 1 and 1 not in gns_resets:
+        rz = torch.baddbmm(gram, gram, z, beta=a0)
+        gram = torch.baddbmm(rz, z, rz, beta=a0)
 
     for i in range(1, steps):
-        a, b, c = _gns_coeff(i)
-        reset = i in _GNS_RESETS
+        a, b, c = _gns_coeff(i, gns_coeffs)
+        reset = i in gns_resets
         if reset:
             if x_scale is not None:
                 q = q * x_scale
@@ -291,7 +332,7 @@ def _gram_newton_schulz_core(
         z = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
         q = z + a * eye if reset else torch.baddbmm(q, q, z, beta=a)
 
-        if i == steps - 1 or i + 1 in _GNS_RESETS:
+        if i == steps - 1 or i + 1 in gns_resets:
             continue
         rz = torch.baddbmm(gram, gram, z, beta=a)
         gram = torch.baddbmm(rz, z, rz, beta=a)
@@ -302,7 +343,14 @@ def _gram_newton_schulz_core(
 
 
 def _standard_newton_schulz_core(
-    x: torch.Tensor, steps: int, eps: float, bound_safety: float
+    x: torch.Tensor,
+    steps: int,
+    eps: float,
+    bound_safety: float,
+    gns_coeffs: tuple[tuple[float, float, float], ...] = _GNS_COEFFS,
+    fp32_eps: float = _FP32_EPS,
+    refine_steps: int = _MOMENT4_REFINE_STEPS,
+    feas_tol: float = _MOMENT4_FEAS_TOL,
 ) -> torch.Tensor:
     if steps <= 0:
         return x
@@ -310,13 +358,14 @@ def _standard_newton_schulz_core(
     gram = torch.bmm(x, x.mT)
     gram_square = torch.bmm(gram, gram)
     _, update, x_scale = _scale_gram_and_first_poly(
-        x, gram, gram_square, eps, bound_safety
+        x, gram, gram_square, eps, bound_safety, fp32_eps, refine_steps, feas_tol, gns_coeffs
     )
-    x = torch.baddbmm(x, update, x, beta=_GNS_A0)
+    a0, _, _ = gns_coeffs[0]
+    x = torch.baddbmm(x, update, x, beta=a0)
     x = x * x_scale
 
     for i in range(1, steps):
-        a, b, c = _gns_coeff(i)
+        a, b, c = _gns_coeff(i, gns_coeffs)
         gram = torch.bmm(x, x.mT)
         update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
         x = torch.baddbmm(x, update, x, beta=a)
@@ -329,6 +378,11 @@ def gram_newton_schulz_uvt(
     eps: float = 1e-7,
     work_dtype: torch.dtype | None = None,
     bound_safety: float = 1.05,
+    gns_coeffs: tuple[tuple[float, float, float], ...] = _GNS_COEFFS,
+    gns_resets: frozenset[int] = _GNS_RESETS,
+    fp32_eps: float = _FP32_EPS,
+    refine_steps: int = _MOMENT4_REFINE_STEPS,
+    feas_tol: float = _MOMENT4_FEAS_TOL,
 ) -> torch.Tensor:
     if g.ndim < 2:
         raise ValueError("gram_newton_schulz_uvt expects a matrix or batch of matrices")
@@ -347,9 +401,13 @@ def gram_newton_schulz_uvt(
     x = x / (torch.linalg.vector_norm(x, dim=(-2, -1), keepdim=True) + eps)
     x = x.to(_gns_work_dtype(g, work_dtype))
     if max(x.shape[-2:]) > min(x.shape[-2:]):
-        x = _gram_newton_schulz_core(x, steps, eps, bound_safety)
+        x = _gram_newton_schulz_core(
+            x, steps, eps, bound_safety, gns_coeffs, gns_resets, fp32_eps, refine_steps, feas_tol
+        )
     else:
-        x = _standard_newton_schulz_core(x, steps, eps, bound_safety)
+        x = _standard_newton_schulz_core(
+            x, steps, eps, bound_safety, gns_coeffs, fp32_eps, refine_steps, feas_tol
+        )
 
     if transposed:
         x = x.mT
@@ -406,7 +464,18 @@ class SignULMO:
 
 
 class GramNewtonSchulzULMO:
-    __slots__ = ("steps", "eps", "work_dtype", "input_like", "bound_safety")
+    __slots__ = (
+        "steps",
+        "eps",
+        "work_dtype",
+        "input_like",
+        "bound_safety",
+        "gns_coeffs",
+        "gns_resets",
+        "fp32_eps",
+        "refine_steps",
+        "feas_tol",
+    )
 
     def __init__(
         self,
@@ -415,12 +484,22 @@ class GramNewtonSchulzULMO:
         work_dtype: torch.dtype | None = None,
         input_like: bool = False,
         bound_safety: float = 1.05,
+        gns_coeffs: tuple[tuple[float, float, float], ...] = _GNS_COEFFS,
+        gns_resets: frozenset[int] = _GNS_RESETS,
+        fp32_eps: float = _FP32_EPS,
+        refine_steps: int = _MOMENT4_REFINE_STEPS,
+        feas_tol: float = _MOMENT4_FEAS_TOL,
     ):
         self.steps = steps
         self.eps = eps
         self.work_dtype = work_dtype
         self.input_like = input_like
         self.bound_safety = bound_safety
+        self.gns_coeffs = gns_coeffs
+        self.gns_resets = gns_resets
+        self.fp32_eps = fp32_eps
+        self.refine_steps = refine_steps
+        self.feas_tol = feas_tol
 
     def _scale(self, x: torch.Tensor) -> float:
         scale = math.sqrt(x.size(-2) / x.size(-1))
@@ -430,7 +509,16 @@ class GramNewtonSchulzULMO:
         if v.ndim != 2:
             raise ValueError("GramNewtonSchulzULMO expects a 2D tensor")
         return gram_newton_schulz_uvt(
-            v, self.steps, self.eps, self.work_dtype, self.bound_safety
+            v,
+            self.steps,
+            self.eps,
+            self.work_dtype,
+            self.bound_safety,
+            self.gns_coeffs,
+            self.gns_resets,
+            self.fp32_eps,
+            self.refine_steps,
+            self.feas_tol,
         ).mul_(-self._scale(v))
 
     def batch(
@@ -455,6 +543,11 @@ class GramNewtonSchulzULMO:
                 self.eps,
                 self.work_dtype,
                 self.bound_safety,
+                self.gns_coeffs,
+                self.gns_resets,
+                self.fp32_eps,
+                self.refine_steps,
+                self.feas_tol,
             )
             for j, (i, x, _, transposed) in enumerate(items):
                 y = y_batch[j].mT if transposed else y_batch[j]
