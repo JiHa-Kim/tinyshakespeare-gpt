@@ -206,9 +206,9 @@ def current_group_rms(group: dict) -> float:
 @torch.no_grad()
 def init_from_actions_(groups: list[dict]) -> None:
     for group in groups:
-        ulmo = group["ulmo"]
+        geometry = group["ulmo"].geometry
         for p in group["params"]:
-            ulmo.init_(p, float(group["target_rms"]))
+            geometry.init_(p, float(group["target_rms"]))
 
 
 def action_group_fields(

@@ -1,8 +1,6 @@
-import math
-
 import torch
 
-from scionc.ulmos.core import _spectral_atom_sq, _target_radius, init_spectral_
+from scionc.ulmos.core import ULMOGeometry
 
 _SVDGroupKey = tuple[tuple[int, ...], torch.dtype, torch.device]
 _SVDItem = tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, bool, float]
@@ -23,7 +21,6 @@ class StreamingSVDULMO:
     by optimizers when the ULMO exposes that hook.
     """
 
-    is_spectral = True
     __slots__ = (
         "steps",
         "ridge",
@@ -32,7 +29,7 @@ class StreamingSVDULMO:
         "iteration",
         "eps",
         "work_dtype",
-        "input_like",
+        "geometry",
         "states",
         "_param_key",
         "stats",
@@ -67,7 +64,7 @@ class StreamingSVDULMO:
         self.iteration = iteration
         self.eps = eps
         self.work_dtype = work_dtype
-        self.input_like = input_like
+        self.geometry = ULMOGeometry("spectral", input_like=input_like)
         self.states = {}
         self._param_key = None
         self.stats = {"calls": 0, "steps": 0, "refreshes": 0, "quality_checks": 0}
@@ -87,21 +84,6 @@ class StreamingSVDULMO:
         if x.dtype in {torch.float16, torch.bfloat16}:
             return torch.float32
         return x.dtype
-
-    def atom_sq(self, p: torch.Tensor) -> float:
-        return _spectral_atom_sq(p, self.input_like)
-
-    def scale(self, x: torch.Tensor) -> float:
-        scale = math.sqrt(x.size(0) / x.size(1))
-        return max(1.0, scale) if self.input_like else scale
-
-    @torch.no_grad()
-    def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
-        return init_spectral_(
-            p,
-            radius=_target_radius(p, self.atom_sq(p), target_rms),
-            input_like=self.input_like,
-        )
 
     def _ridge_scale(self, gram: torch.Tensor) -> torch.Tensor:
         scale = gram[..., 0, 0].abs()
@@ -231,7 +213,9 @@ class StreamingSVDULMO:
             if transposed:
                 m = m.mT
             key = (tuple(m.shape), m.dtype, m.device)
-            groups.setdefault(key, []).append((i, x, p, m, transposed, self.scale(x)))
+            groups.setdefault(key, []).append(
+                (i, x, p, m, transposed, self.geometry.scale(x))
+            )
 
         for items in groups.values():
             m_batch = torch.stack([item[3] for item in items])
@@ -285,5 +269,5 @@ class StreamingSVDULMO:
         if transposed:
             out = out.mT
         self.stats["calls"] += 1
-        return out.to(dtype=x.dtype).mul_(-self.scale(x))
+        return out.to(dtype=x.dtype).mul_(-self.geometry.scale(x))
 

@@ -108,24 +108,21 @@ def median(values: list[float]) -> float:
 
 
 def spectral_ulmo_scale(x: torch.Tensor, ulmo) -> float:
-    scale = getattr(ulmo, "scale", None)
-    return float(scale(x)) if scale is not None else 1.0
+    return float(ulmo.geometry.scale(x))
 
 
 def is_spectral_ulmo(ulmo) -> bool:
-    return bool(getattr(ulmo, "is_spectral", False))
+    return bool(ulmo.geometry.is_spectral)
 
 
 def dual_norm(
     x: torch.Tensor, ulmo, eps: float = 1e-12, param: torch.Tensor | None = None
 ) -> float:
     x = x.float()
-    if is_spectral_ulmo(ulmo):
+    geometry = ulmo.geometry
+    if geometry.is_spectral:
         return spectral_nuclear_support_estimate(x, eps) * spectral_ulmo_scale(x, ulmo)
-    norm = getattr(ulmo, "dual_norm", None)
-    if norm is not None:
-        return float(norm(x, eps))
-    return float(torch.linalg.vector_norm(x).clamp_min(eps))
+    return float(geometry.dual_norm(x, eps))
 
 
 def spectral_norm_power(x: torch.Tensor, eps: float = 1e-12, steps: int = 4) -> float:
@@ -178,12 +175,10 @@ def spectral_nuclear_support_estimate(
 
 def primal_norm(x: torch.Tensor, ulmo, eps: float = 1e-12) -> float:
     x = x.float()
-    if is_spectral_ulmo(ulmo):
+    geometry = ulmo.geometry
+    if geometry.is_spectral:
         return spectral_norm_power(x, eps) / spectral_ulmo_scale(x, ulmo)
-    norm = getattr(ulmo, "primal_norm", None)
-    if norm is not None:
-        return float(norm(x, eps))
-    return float(torch.linalg.vector_norm(x).clamp_min(eps))
+    return float(geometry.primal_norm(x, eps))
 
 
 def stable_rank_from_input(x: torch.Tensor, eps: float = 1e-12) -> float:

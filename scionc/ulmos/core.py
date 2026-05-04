@@ -184,6 +184,81 @@ def _target_radius(p: torch.Tensor, atom_sq: float, target_rms: float) -> float:
     return target_rms if atom_sq <= 0.0 else target_rms / math.sqrt(atom_sq)
 
 
+class ULMOGeometry:
+    __slots__ = ("kind", "eps", "transpose", "input_like")
+
+    def __init__(
+        self,
+        kind: str,
+        eps: float = 1e-12,
+        transpose: bool = False,
+        input_like: bool = False,
+    ):
+        if kind not in {"colnorm", "rownorm", "sign", "spectral"}:
+            raise ValueError(f"invalid ULMO geometry: {kind}")
+        self.kind = kind
+        self.eps = eps
+        self.transpose = transpose
+        self.input_like = input_like
+
+    @property
+    def is_spectral(self) -> bool:
+        return self.kind == "spectral"
+
+    def scale(self, x: torch.Tensor) -> float:
+        if not self.is_spectral:
+            return 1.0
+        scale = math.sqrt(x.size(-2) / x.size(-1))
+        return max(1.0, scale) if self.input_like else scale
+
+    def atom_sq(self, p: torch.Tensor) -> float:
+        if self.kind == "colnorm":
+            return 1.0
+        if self.kind == "spectral":
+            return _spectral_atom_sq(p, self.input_like)
+        _, cols = _view_shape(p, self.transpose)
+        return 0.0 if cols <= 0 else 1.0 / (cols * cols)
+
+    def dual_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
+        y = _oriented(x.float(), self.transpose)
+        if self.kind == "colnorm":
+            return float(
+                torch.linalg.vector_norm(y, dim=0).sum()
+                * math.sqrt(max(y.size(0), 1))
+            )
+        if self.kind == "rownorm":
+            return float(
+                torch.linalg.vector_norm(y, dim=1).sum()
+                / math.sqrt(max(y.size(1), 1))
+            )
+        return float(y.abs().sum() / max(y.size(1), 1))
+
+    def primal_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
+        y = _oriented(x.float(), self.transpose)
+        if self.kind == "colnorm":
+            return float(
+                torch.linalg.vector_norm(y, dim=0).max()
+                / math.sqrt(max(y.size(0), 1))
+            )
+        if self.kind == "rownorm":
+            return float(
+                torch.linalg.vector_norm(y, dim=1).max()
+                * math.sqrt(max(y.size(1), 1))
+            )
+        return float(y.abs().max() * max(y.size(1), 1))
+
+    @torch.no_grad()
+    def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
+        radius = _target_radius(p, self.atom_sq(p), target_rms)
+        if self.kind == "colnorm":
+            return init_colnorm_(p, radius, self.eps, self.transpose)
+        if self.kind == "rownorm":
+            return init_rownorm_(p, radius, self.eps, self.transpose)
+        if self.kind == "sign":
+            return init_sign_(p, radius, self.transpose)
+        return init_spectral_(p, radius, self.input_like)
+
+
 def _scale_gram_and_first_poly(
     x: torch.Tensor,
     gram: torch.Tensor,
@@ -310,130 +385,63 @@ def gram_newton_schulz_polar(
 
 
 class ColNormULMO:
-    is_spectral = False
-    __slots__ = ("eps", "transpose")
+    __slots__ = ("geometry",)
 
     def __init__(
         self, eps: float = 1e-12, transpose: bool = False
     ):
-        self.eps = eps
-        self.transpose = transpose
+        self.geometry = ULMOGeometry("colnorm", eps=eps, transpose=transpose)
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
-        x = _oriented(w, self.transpose)
-        y = x / torch.linalg.vector_norm(x, dim=0, keepdim=True).clamp_min(self.eps)
-        y = y * -math.sqrt(x.size(0))
-        return _oriented(y, self.transpose)
-
-    def atom_sq(self, p: torch.Tensor) -> float:
-        return 1.0
-
-    def dual_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
-        y = _oriented(x.float(), self.transpose)
-        rows = max(y.size(0), 1)
-        return float(torch.linalg.vector_norm(y, dim=0).sum() * math.sqrt(rows))
-
-    def primal_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
-        y = _oriented(x.float(), self.transpose)
-        rows = max(y.size(0), 1)
-        return float(torch.linalg.vector_norm(y, dim=0).max() / math.sqrt(rows))
-
-    @torch.no_grad()
-    def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
-        return init_colnorm_(
-            p,
-            radius=_target_radius(p, self.atom_sq(p), target_rms),
-            eps=self.eps,
-            transpose=self.transpose,
+        x = _oriented(w, self.geometry.transpose)
+        y = x / torch.linalg.vector_norm(x, dim=0, keepdim=True).clamp_min(
+            self.geometry.eps
         )
+        y = y * -math.sqrt(x.size(0))
+        return _oriented(y, self.geometry.transpose)
 
 
 class RowNormULMO:
-    is_spectral = False
-    __slots__ = ("eps", "transpose")
+    __slots__ = ("geometry",)
 
     def __init__(
         self, eps: float = 1e-12, transpose: bool = False
     ):
-        self.eps = eps
-        self.transpose = transpose
+        self.geometry = ULMOGeometry("rownorm", eps=eps, transpose=transpose)
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
-        x = _oriented(w, self.transpose)
-        y = x / torch.linalg.vector_norm(x, dim=1, keepdim=True).clamp_min(self.eps)
-        y = y * (-1.0 / math.sqrt(x.size(1)))
-        return _oriented(y, self.transpose)
-
-    def atom_sq(self, p: torch.Tensor) -> float:
-        _, cols = _view_shape(p, self.transpose)
-        return 0.0 if cols <= 0 else 1.0 / (cols * cols)
-
-    def dual_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
-        y = _oriented(x.float(), self.transpose)
-        cols = max(y.size(1), 1)
-        return float(torch.linalg.vector_norm(y, dim=1).sum() / math.sqrt(cols))
-
-    def primal_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
-        y = _oriented(x.float(), self.transpose)
-        cols = max(y.size(1), 1)
-        return float(torch.linalg.vector_norm(y, dim=1).max() * math.sqrt(cols))
-
-    @torch.no_grad()
-    def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
-        return init_rownorm_(
-            p,
-            radius=_target_radius(p, self.atom_sq(p), target_rms),
-            eps=self.eps,
-            transpose=self.transpose,
+        x = _oriented(w, self.geometry.transpose)
+        y = x / torch.linalg.vector_norm(x, dim=1, keepdim=True).clamp_min(
+            self.geometry.eps
         )
+        y = y * (-1.0 / math.sqrt(x.size(1)))
+        return _oriented(y, self.geometry.transpose)
 
 
 class SignULMO:
-    is_spectral = False
-    __slots__ = ("transpose",)
+    __slots__ = ("geometry",)
 
     def __init__(self, transpose: bool = False):
-        self.transpose = transpose
+        self.geometry = ULMOGeometry("sign", transpose=transpose)
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
-        x = _oriented(w, self.transpose)
+        x = _oriented(w, self.geometry.transpose)
         y = x.sign() * (-1.0 / x.size(1))
-        return _oriented(y, self.transpose)
-
-    def atom_sq(self, p: torch.Tensor) -> float:
-        _, cols = _view_shape(p, self.transpose)
-        return 0.0 if cols <= 0 else 1.0 / (cols * cols)
-
-    def dual_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
-        y = _oriented(x.float(), self.transpose)
-        return float(y.abs().sum() / max(y.size(1), 1))
-
-    def primal_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
-        y = _oriented(x.float(), self.transpose)
-        return float(y.abs().max() * max(y.size(1), 1))
-
-    @torch.no_grad()
-    def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
-        return init_sign_(
-            p,
-            radius=_target_radius(p, self.atom_sq(p), target_rms),
-            transpose=self.transpose,
-        )
+        return _oriented(y, self.geometry.transpose)
 
 
 class GramNewtonSchulzULMO:
-    is_spectral = True
     __slots__ = (
         "steps",
         "eps",
         "work_dtype",
-        "input_like",
         "bound_safety",
         "gns_coeffs",
         "gns_resets",
         "fp32_eps",
         "refine_steps",
         "feas_tol",
+        "geometry",
     )
 
     def __init__(
@@ -452,28 +460,13 @@ class GramNewtonSchulzULMO:
         self.steps = steps
         self.eps = eps
         self.work_dtype = work_dtype
-        self.input_like = input_like
         self.bound_safety = bound_safety
         self.gns_coeffs = gns_coeffs
         self.gns_resets = gns_resets
         self.fp32_eps = fp32_eps
         self.refine_steps = refine_steps
         self.feas_tol = feas_tol
-
-    def scale(self, x: torch.Tensor) -> float:
-        scale = math.sqrt(x.size(-2) / x.size(-1))
-        return max(1.0, scale) if self.input_like else scale
-
-    def atom_sq(self, p: torch.Tensor) -> float:
-        return _spectral_atom_sq(p, self.input_like)
-
-    @torch.no_grad()
-    def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
-        return init_spectral_(
-            p,
-            radius=_target_radius(p, self.atom_sq(p), target_rms),
-            input_like=self.input_like,
-        )
+        self.geometry = ULMOGeometry("spectral", input_like=input_like)
 
     def __call__(self, v: torch.Tensor) -> torch.Tensor:
         if v.ndim != 2:
@@ -489,7 +482,7 @@ class GramNewtonSchulzULMO:
             self.fp32_eps,
             self.refine_steps,
             self.feas_tol,
-        ).mul_(-self.scale(v))
+        ).mul_(-self.geometry.scale(v))
 
     def batch(
         self, tensors: list[torch.Tensor], params: list[torch.Tensor]
@@ -519,7 +512,9 @@ class GramNewtonSchulzULMO:
                 self.refine_steps,
                 self.feas_tol,
             )
-            scale = y_batch.new_tensor([-self.scale(x) for _, x, _, _ in items])
+            scale = y_batch.new_tensor(
+                [-self.geometry.scale(x) for _, x, _, _ in items]
+            )
             y_batch.mul_(scale.reshape(-1, 1, 1))
             for j, (i, x, _, transposed) in enumerate(items):
                 y = y_batch[j].mT if transposed else y_batch[j]
