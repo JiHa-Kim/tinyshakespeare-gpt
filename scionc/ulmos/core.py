@@ -85,12 +85,7 @@ def _moment4_upper_beta(
     d3 = 2.0 * (n_f * m3 - m2)
     d2 = 3.0 * m2.square() - 2.0 * m3 - n_f * m4
     d1 = 2.0 * (m4 - m2 * m3)
-    d0 = (
-        (n_f - 1.0) * (m2 * m4 - m3.square())
-        - m2 * m2.square()
-        + 2.0 * m2 * m3
-        - m4
-    )
+    d0 = (n_f - 1.0) * (m2 * m4 - m3.square()) - m2 * m2.square() + 2.0 * m2 * m3 - m4
 
     for _ in range(refine_steps):
         t = 0.5 * (lower + upper)
@@ -141,9 +136,7 @@ def _spectral_bounds_from_gram(
         m4 = r4.div(trace_sq.square()).clamp(1.0 / (n * n * n), 1.0)
 
         beta2 = _moment2_upper_beta(m2, n).clamp(eps, 1.0)
-        beta4 = _moment4_upper_beta(
-            m2, m3, m4, n, eps, beta2, refine_steps, feas_tol
-        )
+        beta4 = _moment4_upper_beta(m2, m3, m4, n, eps, beta2, refine_steps, feas_tol)
         upper_beta = torch.minimum(beta2, beta4.to(beta2.dtype)).clamp(eps, 1.0)
         lower_beta = torch.sqrt(torch.sqrt(m4.clamp_min(eps)))
         lower_beta = torch.minimum(lower_beta.to(upper_beta.dtype), upper_beta)
@@ -223,13 +216,11 @@ class ULMOGeometry:
         y = _oriented(x.float(), self.transpose)
         if self.kind == "colnorm":
             return float(
-                torch.linalg.vector_norm(y, dim=0).sum()
-                * math.sqrt(max(y.size(0), 1))
+                torch.linalg.vector_norm(y, dim=0).sum() * math.sqrt(max(y.size(0), 1))
             )
         if self.kind == "rownorm":
             return float(
-                torch.linalg.vector_norm(y, dim=1).sum()
-                / math.sqrt(max(y.size(1), 1))
+                torch.linalg.vector_norm(y, dim=1).sum() / math.sqrt(max(y.size(1), 1))
             )
         return float(y.abs().sum() / max(y.size(1), 1))
 
@@ -237,13 +228,11 @@ class ULMOGeometry:
         y = _oriented(x.float(), self.transpose)
         if self.kind == "colnorm":
             return float(
-                torch.linalg.vector_norm(y, dim=0).max()
-                / math.sqrt(max(y.size(0), 1))
+                torch.linalg.vector_norm(y, dim=0).max() / math.sqrt(max(y.size(0), 1))
             )
         if self.kind == "rownorm":
             return float(
-                torch.linalg.vector_norm(y, dim=1).max()
-                * math.sqrt(max(y.size(1), 1))
+                torch.linalg.vector_norm(y, dim=1).max() * math.sqrt(max(y.size(1), 1))
             )
         return float(y.abs().max() * max(y.size(1), 1))
 
@@ -387,9 +376,7 @@ def gram_newton_schulz_polar(
 class ColNormULMO:
     __slots__ = ("geometry",)
 
-    def __init__(
-        self, eps: float = 1e-12, transpose: bool = False
-    ):
+    def __init__(self, eps: float = 1e-12, transpose: bool = False):
         self.geometry = ULMOGeometry("colnorm", eps=eps, transpose=transpose)
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
@@ -404,9 +391,7 @@ class ColNormULMO:
 class RowNormULMO:
     __slots__ = ("geometry",)
 
-    def __init__(
-        self, eps: float = 1e-12, transpose: bool = False
-    ):
+    def __init__(self, eps: float = 1e-12, transpose: bool = False):
         self.geometry = ULMOGeometry("rownorm", eps=eps, transpose=transpose)
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
@@ -579,4 +564,3 @@ def init_spectral_(
     w_fp.mul_(radius * scale)
     w.data.copy_(w_fp.to(dtype=w.dtype))
     return w
-

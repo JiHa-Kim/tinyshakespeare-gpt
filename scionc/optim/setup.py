@@ -7,7 +7,6 @@ from scionc.optim.parametrization import (
     angular_angle,
     angular_step,
     direction_retention,
-    resolve_schedule,
     schedule_at_step,
     scheduled_retention,
 )
@@ -134,15 +133,17 @@ def build_optimizer(model: GPT, args, device: torch.device):
         half_life = resolve_group_direction_half_life(args, name)
         q = direction_retention(delta_tau, half_life, f"{name}_direction_half_life")
         target_rms = resolve_group_target_rms(args, name)
-        groups.append({
-            "name": name,
-            "params": params,
-            "ulmo": ulmo,
-            "q": q,
-            "q_peak": q,
-            "direction_half_life": half_life,
-            "target_rms": target_rms,
-        })
+        groups.append(
+            {
+                "name": name,
+                "params": params,
+                "ulmo": ulmo,
+                "q": q,
+                "q_peak": q,
+                "direction_half_life": half_life,
+                "target_rms": target_rms,
+            }
+        )
 
     init_and_freeze_radii_(groups)
 
@@ -175,7 +176,9 @@ def optimizer_rms_state(opt) -> dict[str, dict[str, float]]:
         out[group.get("name", f"group{len(out)}")] = {
             "param_rms": current,
             "init_rms": target_rms,
-            "rms_ratio": current / target_rms if target_rms and target_rms > 0.0 else math.nan,
+            "rms_ratio": current / target_rms
+            if target_rms and target_rms > 0.0
+            else math.nan,
         }
     return out
 
@@ -191,7 +194,11 @@ def rms_state_text(state: dict[str, dict[str, float]]) -> str:
 
 
 def apply_scheduled_q(
-    opt, step: int, max_steps: int, warmup_steps: int, decay_steps: int,
+    opt,
+    step: int,
+    max_steps: int,
+    warmup_steps: int,
+    decay_steps: int,
     schedule_floor: float = 0.0,
 ) -> dict[str, float]:
     """Apply WSD schedule to the halving exponent of each group.
@@ -205,7 +212,12 @@ def apply_scheduled_q(
     for group in opt.param_groups:
         q_peak = float(group["q_peak"])
         s_t = schedule_at_step(
-            step, max_steps, 1.0, schedule_floor, warmup_steps, decay_steps,
+            step,
+            max_steps,
+            1.0,
+            schedule_floor,
+            warmup_steps,
+            decay_steps,
         )
         q = scheduled_retention(q_peak, s_t)
         group["q"] = q

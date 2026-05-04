@@ -69,9 +69,7 @@ class RMSSphere(Optimizer):
 
         return loss
 
-    def _collect_entries(
-        self, group
-    ) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
+    def _collect_entries(self, group) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
         q = float(group["q"])  # β = q (tied)
         entries = []
         for param_index, p in enumerate(group["params"]):
@@ -83,9 +81,7 @@ class RMSSphere(Optimizer):
 
             state = self.state[p]
             if "m" not in state:
-                state["m"] = torch.zeros_like(
-                    g, memory_format=torch.preserve_format
-                )
+                state["m"] = torch.zeros_like(g, memory_format=torch.preserve_format)
                 # Freeze radius on first step: R = ‖W₀‖_rms
                 d = p.numel()
                 state["R"] = float((p.data.square().sum() / d).sqrt())

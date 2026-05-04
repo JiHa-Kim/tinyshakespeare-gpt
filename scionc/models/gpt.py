@@ -105,9 +105,7 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.norm1 = Norm()
-        self.attn = CausalSelfAttention(
-            d_model, n_head, block_size, rope_base, dropout
-        )
+        self.attn = CausalSelfAttention(d_model, n_head, block_size, rope_base, dropout)
         self.norm2 = Norm()
         self.mlp = MLP(d_model, hidden_dim, dropout)
 

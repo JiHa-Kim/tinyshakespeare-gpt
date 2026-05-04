@@ -92,9 +92,7 @@ class StreamingSpectralNormEstimator:
         return results
 
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return x / torch.linalg.vector_norm(x, dim=1, keepdim=True).clamp_min(
-            self.eps
-        )
+        return x / torch.linalg.vector_norm(x, dim=1, keepdim=True).clamp_min(self.eps)
 
 
 def median(values: list[float]) -> float:
@@ -329,7 +327,9 @@ class ConvergenceProbe:
         for item, grad, previous in records:
             if not self._can_stream_spectral_norm(item, grad):
                 continue
-            prev_grad = self._previous_tensor(item, previous, 0, grad.shape, grad.device)
+            prev_grad = self._previous_tensor(
+                item, previous, 0, grad.shape, grad.device
+            )
             if prev_grad is None:
                 continue
             requests.append((id(item.param), item, grad.detach().float() - prev_grad))
@@ -416,7 +416,12 @@ class ConvergenceProbe:
             current_param = self._cpu_tensor(item.param, current_param)
             dparam = primal_norm(current_param - prev_param, item.ulmo, self.eps)
 
-        if dgrad is None or dparam is None or dparam <= self.eps or grad_dual <= self.eps:
+        if (
+            dgrad is None
+            or dparam is None
+            or dparam <= self.eps
+            or grad_dual <= self.eps
+        ):
             return current_grad, current_param
 
         l1hat = (dgrad / dparam) / grad_dual
@@ -439,7 +444,9 @@ class ConvergenceProbe:
         scale = max(spectral_ulmo_scale(grad, item.ulmo), self.eps)
         fro_sq = float(grad.detach().float().square().sum().clamp_min(self.eps))
         nuc = grad_dual / scale
-        self._append(stats, "spec_ratio", (nuc * nuc / fro_sq) / max(input_sr, self.eps))
+        self._append(
+            stats, "spec_ratio", (nuc * nuc / fro_sq) / max(input_sr, self.eps)
+        )
 
     def _append_report_stats(
         self,

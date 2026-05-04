@@ -6,10 +6,12 @@ _SVDGroupKey = tuple[tuple[int, ...], torch.dtype, torch.device]
 _SVDItem = tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, bool, float]
 
 
-def _normalize_columns(x: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
-    inv_scale = torch.linalg.vector_norm(x, dim=-2, keepdim=True).clamp_min(
-        eps
-    ).reciprocal()
+def _normalize_columns(
+    x: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    inv_scale = (
+        torch.linalg.vector_norm(x, dim=-2, keepdim=True).clamp_min(eps).reciprocal()
+    )
     return x * inv_scale, inv_scale
 
 
@@ -188,7 +190,9 @@ class StreamingSVDULMO:
             v = torch.eye(m.size(-1), dtype=m.dtype, device=m.device)
         return v
 
-    def _store_basis_for(self, p: torch.Tensor, m: torch.Tensor, v: torch.Tensor) -> None:
+    def _store_basis_for(
+        self, p: torch.Tensor, m: torch.Tensor, v: torch.Tensor
+    ) -> None:
         key = (id(p), tuple(m.shape), m.dtype, m.device)
         self.states[key] = v.detach()
 
@@ -270,4 +274,3 @@ class StreamingSVDULMO:
             out = out.mT
         self.stats["calls"] += 1
         return out.to(dtype=x.dtype).mul_(-self.geometry.scale(x))
-

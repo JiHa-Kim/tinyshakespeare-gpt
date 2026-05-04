@@ -1,7 +1,9 @@
 import math
 
 
-def direction_retention(delta_tau: float, half_life: float, name: str = "direction_half_life") -> float:
+def direction_retention(
+    delta_tau: float, half_life: float, name: str = "direction_half_life"
+) -> float:
     """Compute q = 2^{-Δτ/h}, the per-update direction retention."""
     if delta_tau <= 0.0:
         raise ValueError(f"invalid count increment: {delta_tau}")
@@ -77,4 +79,4 @@ def scheduled_retention(
         return 1.0
     if schedule_ratio >= 1.0:
         return q_peak
-    return q_peak ** schedule_ratio
+    return q_peak**schedule_ratio

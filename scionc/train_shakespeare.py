@@ -161,7 +161,9 @@ def estimate_loss(
     return out
 
 
-def update_logit_stats(acc: dict[str, float], logits: torch.Tensor, targets: torch.Tensor) -> None:
+def update_logit_stats(
+    acc: dict[str, float], logits: torch.Tensor, targets: torch.Tensor
+) -> None:
     values = logits.detach().float()
     token_count = values.numel() // values.size(-1)
     centered = values - values.mean(dim=-1, keepdim=True)
@@ -169,7 +171,9 @@ def update_logit_stats(acc: dict[str, float], logits: torch.Tensor, targets: tor
     probs = log_probs.exp()
     top2 = torch.topk(values, k=min(2, values.size(-1)), dim=-1).values
     top_margin = (
-        top2[..., 0] - top2[..., 1] if top2.size(-1) > 1 else torch.zeros_like(top2[..., 0])
+        top2[..., 0] - top2[..., 1]
+        if top2.size(-1) > 1
+        else torch.zeros_like(top2[..., 0])
     )
     target_probs = probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
@@ -405,9 +409,7 @@ def train(args):
     )
     opt = build_optimizer(raw_model, args, device)
     conv_probe = (
-        ConvergenceProbe(raw_model, opt, args)
-        if args.track_convergence_stats
-        else None
+        ConvergenceProbe(raw_model, opt, args) if args.track_convergence_stats else None
     )
     if conv_probe is not None:
         conv_probe.register_hooks(raw_model)
@@ -480,7 +482,11 @@ def train(args):
 
     for step in range(args.max_iters):
         current_qs = apply_scheduled_q(
-            opt, step, args.max_iters, warmup_steps, decay_steps,
+            opt,
+            step,
+            args.max_iters,
+            warmup_steps,
+            decay_steps,
             args.schedule_floor,
         )
         q = current_qs.get("hidden", next(iter(current_qs.values())))
@@ -623,9 +629,7 @@ def train(args):
             else None
         )
         stat_snapshot = (
-            capture_step_stats(opt)
-            if args.track_step_stats or line_active
-            else None
+            capture_step_stats(opt) if args.track_step_stats or line_active else None
         )
         opt.step()
         line_stats = {}

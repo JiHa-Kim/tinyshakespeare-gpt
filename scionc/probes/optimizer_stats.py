@@ -43,9 +43,7 @@ def accumulate_step_stats(
     accum: dict[str, dict], snapshots: Iterable[StepStatSnapshot]
 ) -> None:
     for snapshot in snapshots:
-        stats = accum.setdefault(
-            snapshot.group, {"steps": 0, "params": 0, "numel": 0}
-        )
+        stats = accum.setdefault(snapshot.group, {"steps": 0, "params": 0, "numel": 0})
         stats["steps"] += 1
         stats["params"] += len(snapshot.items)
 
@@ -107,9 +105,7 @@ def consume_step_stats(
         update_kurt = (
             numel * float(stats.get("update_fourth", 0.0)) / (update_sq**2 + eps)
         )
-        param_kurt = (
-            numel * float(stats.get("param_fourth", 0.0)) / (param_sq**2 + eps)
-        )
+        param_kurt = numel * float(stats.get("param_fourth", 0.0)) / (param_sq**2 + eps)
         out[name] = {
             "steps": int(stats["steps"]),
             "params": int(stats["params"]),
