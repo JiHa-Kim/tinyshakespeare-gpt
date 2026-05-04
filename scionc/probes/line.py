@@ -56,19 +56,16 @@ def line_probe_text(
     stats: dict[str, dict],
     eps: float = 1e-12,
 ) -> str:
-    pred = sum(
-        values.get("lr_raw_descent", values.get("lr_descent", 0.0))
-        for values in stats.values()
-    )
+    pred = sum(values.get("descent", 0.0) for values in stats.values())
     if pred <= eps:
         return ""
     actual = loss_before - loss_after
     ratio = actual / pred
     quadratic = 2.0 * (1.0 - ratio)
-    lr2_update_sq = sum(values.get("lr2_update_sq", 0.0) for values in stats.values())
+    update_sq = sum(values.get("update_sq", 0.0) for values in stats.values())
     curvature = (
-        2.0 * (loss_after - loss_before + pred) / lr2_update_sq
-        if lr2_update_sq > eps
+        2.0 * (loss_after - loss_before + pred) / update_sq
+        if update_sq > eps
         else float("nan")
     )
     obj = line_object_stats_text(stats)
@@ -102,18 +99,11 @@ def line_object_stats_text(stats: dict[str, dict]) -> str:
 def optional_object_text(values: dict) -> str:
     parts = []
     fields = (
-        ("v/g", "atom_grad_rms", ".2e"),
-        ("v/p", "atom_param_rms", ".2e"),
-        ("gv", "grad_atom_cos", ".3f"),
-        ("xv", "param_atom_cos", ".3f"),
-        ("uv", "update_atom_cos", ".3f"),
-        ("vk", "atom_kurtosis", ".2e"),
         ("m/g", "mom_grad_rms", ".2e"),
         ("m/p", "mom_param_rms", ".2e"),
         ("gm", "grad_mom_cos", ".3f"),
         ("xm", "param_mom_cos", ".3f"),
         ("um", "update_mom_cos", ".3f"),
-        ("mv", "mom_atom_cos", ".3f"),
         ("mk", "mom_kurtosis", ".2e"),
     )
     for label, key, fmt in fields:

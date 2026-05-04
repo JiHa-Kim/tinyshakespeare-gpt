@@ -15,8 +15,6 @@ __all__ = [
 @dataclass
 class StepStatSnapshot:
     group: str
-    lr: float
-    shrink_complement: float | None
     items: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]]
 
 
@@ -24,16 +22,6 @@ def capture_step_stats(optimizer: Optimizer) -> list[StepStatSnapshot]:
     snapshots = []
     for group in optimizer.param_groups:
         items = []
-        lr = float(group["lr"])
-        shrink_complement = None
-        if group.get("cwd", False) or group.get("phi", 0.0):
-            shrink_complement = None
-        elif group.get("shrink") is not None:
-            shrink_complement = 1.0 - float(group["shrink"])
-        elif group.get("weight_retention") is not None:
-            shrink_complement = 1.0 - float(group["weight_retention"])
-        elif shrink_complement is None:
-            shrink_complement = lr * float(group.get("weight_decay", 0.0))
         for p in group["params"]:
             g = p.grad
             if g is None:
@@ -47,11 +35,7 @@ def capture_step_stats(optimizer: Optimizer) -> list[StepStatSnapshot]:
                 )
             )
         if items:
-            snapshots.append(
-                StepStatSnapshot(
-                    group.get("name", "group"), lr, shrink_complement, items
-                )
-            )
+            snapshots.append(StepStatSnapshot(group.get("name", "group"), items))
     return snapshots
 
 
@@ -78,12 +62,6 @@ def accumulate_step_stats(
             p32 = p_before.float()
             momentum = state.get("m")
             mom = momentum.detach().float() if momentum is not None else None
-            atom = None
-            if snapshot.shrink_complement is not None and snapshot.lr > 0.0:
-                atom = (
-                    delta.add(p32, alpha=float(snapshot.shrink_complement))
-                    / snapshot.lr
-                )
 
             update_sq = delta.square().sum()
             grad_sq = grad.square().sum()
@@ -104,14 +82,6 @@ def accumulate_step_stats(
             _stat_add(stats, "grad_fourth", grad.square().square().sum())
             _stat_add(stats, "update_fourth", delta.square().square().sum())
             _stat_add(stats, "param_fourth", p32.square().square().sum())
-            if atom is not None:
-                atom_sq = atom.square().sum()
-                _stat_add(stats, "atom_sq", atom_sq)
-                _stat_add(stats, "atom_abs", atom.abs().sum())
-                _stat_add(stats, "atom_fourth", atom.square().square().sum())
-                _stat_add(stats, "grad_atom", -(grad * atom).sum())
-                _stat_add(stats, "param_atom", (p32 * atom).sum())
-                _stat_add(stats, "update_atom", (delta * atom).sum())
             if mom is not None:
                 mom_sq = mom.square().sum()
                 _stat_add(stats, "mom_sq", mom_sq)
@@ -120,12 +90,6 @@ def accumulate_step_stats(
                 _stat_add(stats, "grad_mom", (grad * mom).sum())
                 _stat_add(stats, "param_mom", (p32 * mom).sum())
                 _stat_add(stats, "update_mom", (delta * mom).sum())
-                if atom is not None:
-                    _stat_add(stats, "mom_atom", -(mom * atom).sum())
-            _stat_add(stats, "lr_descent", descent)
-            _stat_add(stats, "raw_descent", descent)
-            _stat_add(stats, "lr_raw_descent", descent)
-            _stat_add(stats, "lr2_update_sq", update_sq)
 
 
 def consume_step_stats(
@@ -139,10 +103,6 @@ def consume_step_stats(
         descent = float(stats.get("descent", 0.0))
         param_grad = float(stats.get("param_grad", 0.0))
         param_update = float(stats.get("param_update", 0.0))
-        lr_descent = float(stats.get("lr_descent", descent))
-        raw_descent = float(stats.get("raw_descent", descent))
-        lr_raw_descent = float(stats.get("lr_raw_descent", descent))
-        lr2_update_sq = float(stats.get("lr2_update_sq", update_sq))
         numel = max(int(stats["numel"]), 1)
         grad_rms = (grad_sq / numel) ** 0.5
         update_rms = (update_sq / numel) ** 0.5
@@ -161,7 +121,6 @@ def consume_step_stats(
             "steps": int(stats["steps"]),
             "params": int(stats["params"]),
             "grad_rms": grad_rms,
-            "raw_grad_rms": grad_rms,
             "update_rms": update_rms,
             "param_rms": param_rms,
             "grad_abs_mean": grad_abs,
@@ -171,12 +130,8 @@ def consume_step_stats(
             "update_kurtosis": update_kurt,
             "param_kurtosis": param_kurt,
             "descent": descent,
-            "lr_descent": lr_descent,
-            "raw_descent": raw_descent,
-            "lr_raw_descent": lr_raw_descent,
-            "lr2_update_sq": lr2_update_sq,
+            "update_sq": update_sq,
             "cos": descent / ((grad_sq * update_sq) ** 0.5 + eps),
-            "raw_cos": raw_descent / ((grad_sq * update_sq) ** 0.5 + eps),
             "param_grad_cos": param_grad / ((param_sq * grad_sq) ** 0.5 + eps),
             "param_update_cos": param_update / ((param_sq * update_sq) ** 0.5 + eps),
             "update_grad_rms": update_rms / (grad_rms + eps),
@@ -201,29 +156,6 @@ def add_optional_object_stats(
     update_rms = (update_sq / numel) ** 0.5
     param_rms = (param_sq / numel) ** 0.5
 
-    atom_sq = float(stats.get("atom_sq", 0.0))
-    if atom_sq > 0.0:
-        atom_rms = (atom_sq / numel) ** 0.5
-        atom_abs = float(stats.get("atom_abs", 0.0)) / numel
-        out.update(
-            {
-                "atom_rms": atom_rms,
-                "atom_grad_rms": atom_rms / (grad_rms + eps),
-                "atom_param_rms": atom_rms / (param_rms + eps),
-                "atom_update_rms": atom_rms / (update_rms + eps),
-                "atom_abs_rms": atom_abs / (atom_rms + eps),
-                "atom_kurtosis": numel
-                * float(stats.get("atom_fourth", 0.0))
-                / (atom_sq**2 + eps),
-                "grad_atom_cos": float(stats.get("grad_atom", 0.0))
-                / ((grad_sq * atom_sq) ** 0.5 + eps),
-                "param_atom_cos": float(stats.get("param_atom", 0.0))
-                / ((param_sq * atom_sq) ** 0.5 + eps),
-                "update_atom_cos": float(stats.get("update_atom", 0.0))
-                / ((update_sq * atom_sq) ** 0.5 + eps),
-            }
-        )
-
     mom_sq = float(stats.get("mom_sq", 0.0))
     if mom_sq > 0.0:
         mom_rms = (mom_sq / numel) ** 0.5
@@ -246,8 +178,3 @@ def add_optional_object_stats(
                 / ((update_sq * mom_sq) ** 0.5 + eps),
             }
         )
-        atom_sq = float(stats.get("atom_sq", 0.0))
-        if atom_sq > 0.0:
-            out["mom_atom_cos"] = float(stats.get("mom_atom", 0.0)) / (
-                (mom_sq * atom_sq) ** 0.5 + eps
-            )
