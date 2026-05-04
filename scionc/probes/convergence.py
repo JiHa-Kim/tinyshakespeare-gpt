@@ -3,14 +3,7 @@ from dataclasses import dataclass
 
 import torch
 
-from scionc.ulmos.core import (
-    ColNormULMO,
-    GramNewtonSchulzULMO,
-    RowNormULMO,
-    SignULMO,
-    gram_newton_schulz_uvt,
-)
-from scionc.ulmos.streaming_svd import StreamingSVDULMO
+from scionc.ulmos.core import gram_newton_schulz_uvt
 from scionc.models.gpt import GPT
 
 
@@ -114,17 +107,13 @@ def median(values: list[float]) -> float:
     return 0.5 * (values[mid - 1] + values[mid])
 
 
-def oriented_matrix(x: torch.Tensor, ulmo) -> torch.Tensor:
-    return x.mT if getattr(ulmo, "transpose", False) else x
-
-
 def spectral_ulmo_scale(x: torch.Tensor, ulmo) -> float:
-    scale = math.sqrt(x.size(0) / x.size(1))
-    return max(1.0, scale) if getattr(ulmo, "input_like", False) else scale
+    scale = getattr(ulmo, "scale", None)
+    return float(scale(x)) if scale is not None else 1.0
 
 
 def is_spectral_ulmo(ulmo) -> bool:
-    return isinstance(ulmo, GramNewtonSchulzULMO | StreamingSVDULMO)
+    return bool(getattr(ulmo, "is_spectral", False))
 
 
 def dual_norm(
@@ -133,18 +122,9 @@ def dual_norm(
     x = x.float()
     if is_spectral_ulmo(ulmo):
         return spectral_nuclear_support_estimate(x, eps) * spectral_ulmo_scale(x, ulmo)
-
-    y = oriented_matrix(x, ulmo)
-    if isinstance(ulmo, SignULMO):
-        return float(y.abs().sum() / max(y.size(1), 1))
-    if isinstance(ulmo, ColNormULMO):
-        return float(
-            torch.linalg.vector_norm(y, dim=0).sum() * math.sqrt(y.size(0))
-        )
-    if isinstance(ulmo, RowNormULMO):
-        return float(
-            torch.linalg.vector_norm(y, dim=1).sum() / math.sqrt(max(y.size(1), 1))
-        )
+    norm = getattr(ulmo, "dual_norm", None)
+    if norm is not None:
+        return float(norm(x, eps))
     return float(torch.linalg.vector_norm(x).clamp_min(eps))
 
 
@@ -200,18 +180,9 @@ def primal_norm(x: torch.Tensor, ulmo, eps: float = 1e-12) -> float:
     x = x.float()
     if is_spectral_ulmo(ulmo):
         return spectral_norm_power(x, eps) / spectral_ulmo_scale(x, ulmo)
-
-    y = oriented_matrix(x, ulmo)
-    if isinstance(ulmo, SignULMO):
-        return float(y.abs().max() * max(y.size(1), 1))
-    if isinstance(ulmo, ColNormULMO):
-        return float(
-            torch.linalg.vector_norm(y, dim=0).max() / math.sqrt(y.size(0))
-        )
-    if isinstance(ulmo, RowNormULMO):
-        return float(
-            torch.linalg.vector_norm(y, dim=1).max() * math.sqrt(max(y.size(1), 1))
-        )
+    norm = getattr(ulmo, "primal_norm", None)
+    if norm is not None:
+        return float(norm(x, eps))
     return float(torch.linalg.vector_norm(x).clamp_min(eps))
 
 

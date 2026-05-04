@@ -166,6 +166,10 @@ def _view_shape(p: torch.Tensor, transpose: bool = False) -> tuple[int, int]:
     return (cols, rows) if transpose else (rows, cols)
 
 
+def _oriented(x: torch.Tensor, transpose: bool) -> torch.Tensor:
+    return x.mT if transpose else x
+
+
 def _spectral_atom_sq(p: torch.Tensor, input_like: bool = False) -> float:
     rows, cols = _view_shape(p)
     if rows <= 0 or cols <= 0:
@@ -364,6 +368,7 @@ def gram_newton_schulz_uvt(
 
 
 class ColNormULMO:
+    is_spectral = False
     __slots__ = ("eps", "transpose")
 
     def __init__(
@@ -373,13 +378,23 @@ class ColNormULMO:
         self.transpose = transpose
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
-        x = w.mT if self.transpose else w
+        x = _oriented(w, self.transpose)
         y = x / torch.linalg.vector_norm(x, dim=0, keepdim=True).clamp_min(self.eps)
         y = y * -math.sqrt(x.size(0))
-        return y.mT if self.transpose else y
+        return _oriented(y, self.transpose)
 
     def atom_sq(self, p: torch.Tensor) -> float:
         return 1.0
+
+    def dual_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
+        y = _oriented(x.float(), self.transpose)
+        rows = max(y.size(0), 1)
+        return float(torch.linalg.vector_norm(y, dim=0).sum() * math.sqrt(rows))
+
+    def primal_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
+        y = _oriented(x.float(), self.transpose)
+        rows = max(y.size(0), 1)
+        return float(torch.linalg.vector_norm(y, dim=0).max() / math.sqrt(rows))
 
     @torch.no_grad()
     def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
@@ -392,6 +407,7 @@ class ColNormULMO:
 
 
 class RowNormULMO:
+    is_spectral = False
     __slots__ = ("eps", "transpose")
 
     def __init__(
@@ -401,14 +417,24 @@ class RowNormULMO:
         self.transpose = transpose
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
-        x = w.mT if self.transpose else w
+        x = _oriented(w, self.transpose)
         y = x / torch.linalg.vector_norm(x, dim=1, keepdim=True).clamp_min(self.eps)
         y = y * (-1.0 / math.sqrt(x.size(1)))
-        return y.mT if self.transpose else y
+        return _oriented(y, self.transpose)
 
     def atom_sq(self, p: torch.Tensor) -> float:
         _, cols = _view_shape(p, self.transpose)
         return 0.0 if cols <= 0 else 1.0 / (cols * cols)
+
+    def dual_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
+        y = _oriented(x.float(), self.transpose)
+        cols = max(y.size(1), 1)
+        return float(torch.linalg.vector_norm(y, dim=1).sum() / math.sqrt(cols))
+
+    def primal_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
+        y = _oriented(x.float(), self.transpose)
+        cols = max(y.size(1), 1)
+        return float(torch.linalg.vector_norm(y, dim=1).max() * math.sqrt(cols))
 
     @torch.no_grad()
     def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
@@ -421,19 +447,28 @@ class RowNormULMO:
 
 
 class SignULMO:
+    is_spectral = False
     __slots__ = ("transpose",)
 
     def __init__(self, transpose: bool = False):
         self.transpose = transpose
 
     def __call__(self, w: torch.Tensor) -> torch.Tensor:
-        x = w.mT if self.transpose else w
+        x = _oriented(w, self.transpose)
         y = x.sign() * (-1.0 / x.size(1))
-        return y.mT if self.transpose else y
+        return _oriented(y, self.transpose)
 
     def atom_sq(self, p: torch.Tensor) -> float:
         _, cols = _view_shape(p, self.transpose)
         return 0.0 if cols <= 0 else 1.0 / (cols * cols)
+
+    def dual_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
+        y = _oriented(x.float(), self.transpose)
+        return float(y.abs().sum() / max(y.size(1), 1))
+
+    def primal_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
+        y = _oriented(x.float(), self.transpose)
+        return float(y.abs().max() * max(y.size(1), 1))
 
     @torch.no_grad()
     def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
@@ -445,6 +480,7 @@ class SignULMO:
 
 
 class GramNewtonSchulzULMO:
+    is_spectral = True
     __slots__ = (
         "steps",
         "eps",
@@ -482,7 +518,7 @@ class GramNewtonSchulzULMO:
         self.refine_steps = refine_steps
         self.feas_tol = feas_tol
 
-    def _scale(self, x: torch.Tensor) -> float:
+    def scale(self, x: torch.Tensor) -> float:
         scale = math.sqrt(x.size(-2) / x.size(-1))
         return max(1.0, scale) if self.input_like else scale
 
@@ -511,7 +547,7 @@ class GramNewtonSchulzULMO:
             self.fp32_eps,
             self.refine_steps,
             self.feas_tol,
-        ).mul_(-self._scale(v))
+        ).mul_(-self.scale(v))
 
     def batch(
         self, tensors: list[torch.Tensor], params: list[torch.Tensor]
@@ -541,7 +577,7 @@ class GramNewtonSchulzULMO:
                 self.refine_steps,
                 self.feas_tol,
             )
-            scale = y_batch.new_tensor([-self._scale(x) for _, x, _, _ in items])
+            scale = y_batch.new_tensor([-self.scale(x) for _, x, _, _ in items])
             y_batch.mul_(scale.reshape(-1, 1, 1))
             for j, (i, x, _, transposed) in enumerate(items):
                 y = y_batch[j].mT if transposed else y_batch[j]

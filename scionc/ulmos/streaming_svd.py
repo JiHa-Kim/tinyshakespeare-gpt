@@ -23,6 +23,7 @@ class StreamingSVDULMO:
     by optimizers when the ULMO exposes that hook.
     """
 
+    is_spectral = True
     __slots__ = (
         "steps",
         "ridge",
@@ -89,6 +90,10 @@ class StreamingSVDULMO:
 
     def atom_sq(self, p: torch.Tensor) -> float:
         return _spectral_atom_sq(p, self.input_like)
+
+    def scale(self, x: torch.Tensor) -> float:
+        scale = math.sqrt(x.size(0) / x.size(1))
+        return max(1.0, scale) if self.input_like else scale
 
     @torch.no_grad()
     def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
@@ -225,11 +230,8 @@ class StreamingSVDULMO:
             transposed = m.size(0) < m.size(1)
             if transposed:
                 m = m.mT
-            scale = math.sqrt(x.size(0) / x.size(1))
-            if self.input_like:
-                scale = max(1.0, scale)
             key = (tuple(m.shape), m.dtype, m.device)
-            groups.setdefault(key, []).append((i, x, p, m, transposed, scale))
+            groups.setdefault(key, []).append((i, x, p, m, transposed, self.scale(x)))
 
         for items in groups.values():
             m_batch = torch.stack([item[3] for item in items])
@@ -257,10 +259,6 @@ class StreamingSVDULMO:
         if x.ndim != 2:
             raise ValueError("StreamingSVDULMO expects a 2D tensor")
 
-        scale = math.sqrt(x.size(0) / x.size(1))
-        if self.input_like:
-            scale = max(1.0, scale)
-
         work_dtype = self._resolve_work_dtype(x)
         m = x.to(work_dtype)
         transposed = m.size(0) < m.size(1)
@@ -287,5 +285,5 @@ class StreamingSVDULMO:
         if transposed:
             out = out.mT
         self.stats["calls"] += 1
-        return out.to(dtype=x.dtype).mul_(-scale)
+        return out.to(dtype=x.dtype).mul_(-self.scale(x))
 
