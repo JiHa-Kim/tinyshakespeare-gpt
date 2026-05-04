@@ -1525,60 +1525,17 @@ def make_parser():
         default=None,
         help="base-2 log of the peak eta multiplier",
     )
-    p.add_argument(
-        "--step-scale-embed", dest="step_scale_embed", type=float, default=None
-    )
-    p.add_argument(
-        "--log2-step-scale-embed",
-        dest="log2_step_scale_embed",
-        type=float,
-        default=None,
-    )
-    p.add_argument(
-        "--step-scale-hidden", dest="step_scale_hidden", type=float, default=None
-    )
-    p.add_argument(
-        "--log2-step-scale-hidden",
-        dest="log2_step_scale_hidden",
-        type=float,
-        default=None,
-    )
-    p.add_argument(
-        "--step-scale-out",
-        dest="step_scale_out",
-        type=float,
-        default=None,
-    )
-    p.add_argument(
-        "--log2-step-scale-out",
-        dest="log2_step_scale_out",
-        type=float,
-        default=None,
-    )
+    for group in GROUP_NAMES:
+        p.add_argument(f"--step-scale-{group}", type=float, default=None)
+        p.add_argument(f"--log2-step-scale-{group}", type=float, default=None)
     p.add_argument(
         "--min-step-scale",
         type=float,
         default=0.0,
         help="decay floor for the eta multiplier; must be <= peak",
     )
-    p.add_argument(
-        "--min-step-scale-embed",
-        dest="min_step_scale_embed",
-        type=float,
-        default=None,
-    )
-    p.add_argument(
-        "--min-step-scale-hidden",
-        dest="min_step_scale_hidden",
-        type=float,
-        default=None,
-    )
-    p.add_argument(
-        "--min-step-scale-out",
-        dest="min_step_scale_out",
-        type=float,
-        default=None,
-    )
+    for group in GROUP_NAMES:
+        p.add_argument(f"--min-step-scale-{group}", type=float, default=None)
     p.add_argument(
         "--rms-radius",
         dest="rms_radius",
@@ -1589,24 +1546,8 @@ def make_parser():
             "defaults are embed=0.70, hidden=0.051, out=0.022"
         ),
     )
-    p.add_argument(
-        "--rms-radius-embed",
-        dest="rms_radius_embed",
-        type=float,
-        default=None,
-    )
-    p.add_argument(
-        "--rms-radius-hidden",
-        dest="rms_radius_hidden",
-        type=float,
-        default=None,
-    )
-    p.add_argument(
-        "--rms-radius-out",
-        dest="rms_radius_out",
-        type=float,
-        default=None,
-    )
+    for group in GROUP_NAMES:
+        p.add_argument(f"--rms-radius-{group}", type=float, default=None)
     p.add_argument(
         "--beta-half-life",
         type=float,
@@ -1655,24 +1596,8 @@ def make_parser():
         default=None,
         help="weight shrink half-life in processed tokens for all groups",
     )
-    p.add_argument(
-        "--shrink-half-life-embed",
-        dest="shrink_half_life_embed",
-        type=float,
-        default=None,
-    )
-    p.add_argument(
-        "--shrink-half-life-hidden",
-        dest="shrink_half_life_hidden",
-        type=float,
-        default=None,
-    )
-    p.add_argument(
-        "--shrink-half-life-out",
-        dest="shrink_half_life_out",
-        type=float,
-        default=None,
-    )
+    for group in GROUP_NAMES:
+        p.add_argument(f"--shrink-half-life-{group}", type=float, default=None)
     p.add_argument(
         "--shrink-schedule",
         choices=["scheduled", "constant"],
