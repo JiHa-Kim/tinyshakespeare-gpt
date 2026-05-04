@@ -484,7 +484,6 @@ def action_group_fields(
         "target_rms": target_rms,
         "memory_beta": memory_beta,
         "base_eta": DEFAULT_BASE_ETA,
-        "peak_eta": DEFAULT_BASE_ETA * peak_step_scale,
         "peak_step_scale": peak_step_scale,
         "max_step_scale": peak_step_scale,
         "min_step_scale": min_step_scale,
@@ -492,7 +491,6 @@ def action_group_fields(
         "shrink_half_life": shrink_half_life,
         "rms_solve": args.rms_solve,
         "beta_half_life": args.beta_half_life,
-        "count_increment": delta_tau,
     }
     shrink, eta = group_action(fields, peak_step_scale)
     fields.update(
@@ -501,24 +499,6 @@ def action_group_fields(
         lr=eta,
     )
     return fields
-
-
-def optimizer_group(
-    name: str,
-    params: list[torch.Tensor],
-    ulmo,
-    args,
-    delta_tau: int,
-    memory_beta: float,
-) -> dict | None:
-    if not params:
-        return None
-    return {
-        "name": name,
-        "params": params,
-        "ulmo": ulmo,
-        **action_group_fields(name, args, delta_tau, memory_beta),
-    }
 
 
 def optimizer_group_specs(model: GPT, args, work_dtype: torch.dtype):
@@ -547,9 +527,15 @@ def build_optimizer(model: GPT, args, device: torch.device):
     work_dtype = torch.float16 if device.type == "cuda" else torch.float32
     groups = []
     for name, params, ulmo in optimizer_group_specs(model, args, work_dtype):
-        group = optimizer_group(name, params, ulmo, args, delta_tau, memory_beta)
-        if group is not None:
-            groups.append(group)
+        if params:
+            groups.append(
+                {
+                    "name": name,
+                    "params": params,
+                    "ulmo": ulmo,
+                    **action_group_fields(name, args, delta_tau, memory_beta),
+                }
+            )
     init_from_actions_(groups)
 
     hidden_group = next(group for group in groups if group["name"] == "hidden")
