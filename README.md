@@ -3,7 +3,7 @@
 A compact ScionC sandbox organized by category:
 
 - `scionc/optim/`: ScionC plus lower-level Lion-K experiments.
-- `scionc/ulmos/`: basic ULMOs, Gram-NS, streaming SVD, and SVD-filter helpers.
+- `scionc/ulmos/`: ULMOs, Gram-NS, streaming SVD, and SVD-filter helpers.
 - `scionc/models/`: compact GPT model and tiny Shakespeare data utilities.
 - `scionc/probes/`: convergence, line, and optimizer-step stats probes.
 - `scionc/train_shakespeare.py`: training entrypoint.
@@ -19,56 +19,39 @@ m'=\beta m+(1-\beta)g,
 \qquad
 v=\operatorname{ulmo}(m'),
 \qquad
-w'=\zeta_t w+\eta_t v.
+w'=\sigma_t w+\eta_t v.
 ```
 
-The tuned coordinates are the additive step-scale schedule `eta_t`, the
-momentum-state retention half-life, the weight-retention half-life, and an
-optional target RMS weight radius `R_W`:
+The active coordinates are:
+
+- additive step scale `eta_t`,
+- primal weight shrink `sigma_t`,
+- momentum-state retention `beta`,
+- target actual entrywise weight RMS `R_W`.
+
+Half-lives are specified in processed-token units:
 
 ```math
 \beta=2^{-\Delta\tau/h_\beta},
 \qquad
-\zeta_{\mathrm{peak}}=2^{-\Delta\tau/h_\zeta}.
+\sigma_{\mathrm{peak}}=2^{-\Delta\tau/h_{\mathrm{shrink}}}.
 ```
 
-The default WSD scalar `q_t=s_t/s_peak` schedules the two independent
-coordinates with one simple visible schedule:
+The default WSD scalar `q_t=s_t/s_peak` keeps one simple visible schedule while
+leaving movement and shrink independent:
 
 ```math
 \eta_t=q_t\eta_{\mathrm{peak}},
 \qquad
-\zeta_t=\zeta_{\mathrm{peak}}^{q_t}.
+\sigma_t=\sigma_{\mathrm{peak}}^{q_t}.
 ```
 
-The implied steady-state RMS radius is diagnostic and includes the actual
-entrywise RMS scale of the ULMO atom:
-
-```math
-A_\zeta=\frac{1+\zeta_t\beta}{1-\zeta_t\beta},
-\qquad
-R_{\mathrm{ss},t}
-=
-\eta_t
-\sqrt{
-\frac{A_\zeta\,\|v_t\|_{\mathrm{rms}}^2}{1-\zeta_t^2}
-}.
-```
-
-The script stores `eta_t` as the optimizer-group `lr` and stores `zeta_t` as
-`weight_retention`. By default, the optimizer applies the one-step RMS-targeting
-root capped by this baseline schedule; use `--no-rms-solve` to run the plain
-step-scale schedule. Eval lines print `weight_rms current/target` for each
-optimizer group.
+By default, ScionC solves the nonnegative one-step `eta` that targets `R_W` at
+the end of the update, capped by the baseline `eta_t` schedule. Eval lines print
+`weight_rms current/target` for each optimizer group.
 
 See [docs/scionc_rms_radius_parametrization.md](docs/scionc_rms_radius_parametrization.md)
 for the derivation.
-
-The lower-level Lion-K/CCWD optimizer uses the same retention/radius language:
-`lr` is the additive direction scale, `weight_retention` is the active
-coordinate retention, and `rms_radius` derives the retention from the stationary
-RMS balance. See
-[docs/lionk_ccwd_rms_parametrization.md](docs/lionk_ccwd_rms_parametrization.md).
 
 ## Defaults
 
@@ -80,12 +63,11 @@ RMS balance. See
 - block size: 256
 - target actual RMS radii: embedding 0.70, hidden 0.051, output 0.022
 - peak eta: 0.035 at step scale 1 (`log2=0`)
-- legacy support diagnostics: embedding 1, hidden 3, output 10
 - RMS solve: enabled, capped by the eta schedule
 - schedule floor: 0
 - readout mu: 1
-- momentum-state retention half-life: about 2.21e5 processed tokens
-- weight-retention half-lives:
+- momentum-state half-life: about 2.21e5 processed tokens
+- shrink half-lives:
   - embedding: about 3.19e5 processed tokens
   - hidden: about 9.68e5 processed tokens
   - output: about 3.24e6 processed tokens
@@ -118,9 +100,9 @@ uv run python -m scionc.train_shakespeare \
   --beta-half-life 2.214e5 --readout-mu 1 \
   --hidden-ulmo gram-ns \
   --embed-ulmo colnorm --out-ulmo sign \
-  --weight-retention-half-life-embed 3.188e5 \
-  --weight-retention-half-life-hidden 9.677e5 \
-  --weight-retention-half-life-out 3.239e6 \
+  --shrink-half-life-embed 3.188e5 \
+  --shrink-half-life-hidden 9.677e5 \
+  --shrink-half-life-out 3.239e6 \
   --temperature 0.8 --top-k 40 --sample-count 2
 ```
 

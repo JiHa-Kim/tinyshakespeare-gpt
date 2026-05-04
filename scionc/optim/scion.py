@@ -13,7 +13,7 @@ class ScionC(Optimizer):
     Each group supplies a ULMO. The default constrained SCG update is:
 
         m <- beta * m + (1 - beta) * grad
-        p <- zeta * p + eta * ulmo(m)
+        p <- shrink * p + eta * ulmo(m)
 
     The additive scale `eta` is taken from `lr` (step-scale form). If
     `rms_solve` and `rms_radius` are set on a group, `eta` is dynamically
@@ -27,7 +27,7 @@ class ScionC(Optimizer):
         memory_beta: float = 0.95,
         readout_mu: float = 1.0,
         ulmo=None,
-        weight_retention: float = 1.0,
+        shrink: float = 1.0,
         rms_radius: float | None = None,
         rms_solve: bool = False,
     ):
@@ -37,8 +37,8 @@ class ScionC(Optimizer):
             raise ValueError(f"invalid memory_beta: {memory_beta}")
         if not (0.0 <= readout_mu <= 1.0):
             raise ValueError(f"invalid readout_mu: {readout_mu}")
-        if not (0.0 < weight_retention <= 1.0):
-            raise ValueError(f"invalid weight_retention: {weight_retention}")
+        if not (0.0 < shrink <= 1.0):
+            raise ValueError(f"invalid shrink: {shrink}")
 
         super().__init__(
             params,
@@ -47,7 +47,7 @@ class ScionC(Optimizer):
                 memory_beta=memory_beta,
                 readout_mu=readout_mu,
                 ulmo=ulmo,
-                weight_retention=weight_retention,
+                shrink=shrink,
                 rms_radius=rms_radius,
                 rms_solve=rms_solve,
             ),
@@ -68,11 +68,11 @@ class ScionC(Optimizer):
             rms_radius = group.get("rms_radius") if group.get("rms_solve") else None
             rms_targets = group.get("rms_targets") if group.get("rms_solve") else None
             lr = float(group["lr"])
-            zeta = float(group["weight_retention"])
+            shrink = float(group["shrink"])
             if lr == 0.0:
-                if zeta != 1.0:
+                if shrink != 1.0:
                     for _, p, _ in entries:
-                        p.mul_(zeta)
+                        p.mul_(shrink)
                 continue
 
             updates = self._updates(group["ulmo"], entries)
@@ -88,26 +88,29 @@ class ScionC(Optimizer):
                     w_sq = p.square().mean().item()
                     v_sq = max(u.square().mean().item(), 1e-15)
                     r_sq = target_radius * target_radius
-                    d = zeta * zeta * s * s - v_sq * (zeta * zeta * w_sq - r_sq)
+                    d = (
+                        shrink * shrink * s * s
+                        - v_sq * (shrink * shrink * w_sq - r_sq)
+                    )
                     if d >= 0.0:
                         root = math.sqrt(d)
                         roots = [
                             value
                             for value in (
-                                (-zeta * s - root) / v_sq,
-                                (-zeta * s + root) / v_sq,
+                                (-shrink * s - root) / v_sq,
+                                (-shrink * s + root) / v_sq,
                             )
                             if value >= 0.0
                         ]
                         eta = min(roots) if roots else 0.0
                     else:
-                        eta = max(0.0, -zeta * s / v_sq)
+                        eta = max(0.0, -shrink * s / v_sq)
                     eta = min(eta, lr)
                 else:
                     eta = lr
 
-                if zeta != 1.0:
-                    p.mul_(zeta)
+                if shrink != 1.0:
+                    p.mul_(shrink)
                 if eta != 0.0:
                     p.add_(u, alpha=eta)
 

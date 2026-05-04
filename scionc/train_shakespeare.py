@@ -22,8 +22,7 @@ from scionc.ulmos import (
 )
 from scionc.optim import ScionC
 from scionc.optim.parametrization import (
-    RMSMatchedAction,
-    ema_atom_correlation_factor,
+    ScheduledAction,
     halving_factor,
     resolve_schedule,
     schedule_at_step,
@@ -55,30 +54,25 @@ from scionc.probes.optimizer_stats import (
     consume_step_stats,
 )
 
-DEFAULT_SUPPORT_RADII = {
-    "embed": 1.0,
-    "hidden": 3.0,
-    "out": 10.0,
-}
 DEFAULT_RMS_RADII = {
     "embed": 0.70,
     "hidden": 0.051,
     "out": 0.022,
 }
-GROUP_NAMES = tuple(DEFAULT_SUPPORT_RADII)
+GROUP_NAMES = tuple(DEFAULT_RMS_RADII)
 DEFAULT_COUNT_INCREMENT = 64 * 256
 DEFAULT_MOMENTUM_RETENTION = 0.95
 DEFAULT_BETA_HALF_LIFE = -DEFAULT_COUNT_INCREMENT / math.log2(
     DEFAULT_MOMENTUM_RETENTION
 )
-DEFAULT_WEIGHT_RETENTIONS = {
+DEFAULT_SHRINKS = {
     "embed": 0.965,
     "hidden": 0.9883333333333333,
     "out": 0.9965,
 }
-DEFAULT_WEIGHT_RETENTION_HALF_LIVES = {
-    name: -DEFAULT_COUNT_INCREMENT / math.log2(retention)
-    for name, retention in DEFAULT_WEIGHT_RETENTIONS.items()
+DEFAULT_SHRINK_HALF_LIVES = {
+    name: -DEFAULT_COUNT_INCREMENT / math.log2(shrink)
+    for name, shrink in DEFAULT_SHRINKS.items()
 }
 DEFAULT_STEP_SCALE = 1.0
 DEFAULT_BASE_ETA = 3.5e-2
@@ -308,35 +302,29 @@ def resolve_group_step_scale(args, group: str) -> tuple[float, float]:
     return peak, floor
 
 
-def resolve_group_rms_radius(args, group: str) -> tuple[float, bool]:
+def resolve_group_rms_radius(args, group: str) -> float:
     radius = getattr(args, f"rms_radius_{group}", None)
-    explicit = radius is not None
     if radius is None:
         radius = getattr(args, "rms_radius", None)
-        explicit = radius is not None
     if radius is None:
         radius = DEFAULT_RMS_RADII[group]
     if radius <= 0.0:
         raise ValueError(f"invalid {group} target RMS radius: {radius}")
-    return float(radius), explicit
-
-
-def resolve_group_support_radius(group: str) -> float:
-    return DEFAULT_SUPPORT_RADII[group]
+    return float(radius)
 
 
 def count_increment(args) -> int:
     return args.batch_size * args.block_size * args.grad_accum
 
 
-def resolve_group_weight_retention_half_life(args, group: str) -> float:
-    half_life = getattr(args, f"weight_retention_half_life_{group}", None)
+def resolve_group_shrink_half_life(args, group: str) -> float:
+    half_life = getattr(args, f"shrink_half_life_{group}", None)
     if half_life is None:
-        half_life = args.weight_retention_half_life
+        half_life = args.shrink_half_life
     if half_life is None:
-        half_life = DEFAULT_WEIGHT_RETENTION_HALF_LIVES[group]
+        half_life = DEFAULT_SHRINK_HALF_LIVES[group]
     if half_life <= 0.0:
-        raise ValueError(f"invalid {group} weight-retention half-life: {half_life}")
+        raise ValueError(f"invalid {group} shrink half-life: {half_life}")
     return half_life
 
 
@@ -435,19 +423,7 @@ def group_schedule_ratio(group: dict, scheduled_step_scale: float) -> float:
     return ratio
 
 
-def implied_steady_rms(
-    eta: float, zeta: float, atom_correlation: float, atom_sq: float = 1.0
-) -> float:
-    if eta <= 0.0 or zeta >= 1.0:
-        return 0.0
-    if atom_sq <= 0.0:
-        return 0.0
-    return eta * math.sqrt(
-        atom_correlation * atom_sq / ((1.0 - zeta) * (1.0 + zeta))
-    )
-
-
-def group_action(group: dict, scheduled_step_scale: float):
+def group_action(group: dict, scheduled_step_scale: float) -> ScheduledAction:
     peak_scale = float(group["peak_step_scale"])
     validate_step_scale(scheduled_step_scale, f"{group.get('name', 'group')} schedule")
     if peak_scale > 0.0 and scheduled_step_scale > peak_scale * (1.0 + 1e-12):
@@ -457,28 +433,17 @@ def group_action(group: dict, scheduled_step_scale: float):
         )
 
     ratio = group_schedule_ratio(group, scheduled_step_scale)
-    mode = group.get("weight_retention_schedule", "scheduled")
-    peak_weight_retention = float(group["peak_weight_retention"])
-    if mode in {"constant", "decoupled"}:
-        weight_retention = peak_weight_retention
-    elif mode == "coupled":
-        weight_retention = peak_weight_retention**scheduled_step_scale
-    else:
-        weight_retention = peak_weight_retention**ratio
-
-    eta = float(group["base_eta"]) * scheduled_step_scale
-    decay = 1.0 - weight_retention
-    rho = eta / decay if decay > 0.0 and eta > 0.0 else math.inf
-    atom_correlation = ema_atom_correlation_factor(
-        float(group["memory_beta"]), weight_retention
+    peak_shrink = float(group["peak_shrink"])
+    shrink = (
+        peak_shrink
+        if group.get("shrink_schedule") == "constant"
+        else peak_shrink**ratio
     )
-    return RMSMatchedAction(
-        rms_radius=float(group.get("rms_radius", math.nan)),
-        rho=rho,
-        weight_retention=weight_retention,
+    eta = float(group["base_eta"]) * scheduled_step_scale
+    return ScheduledAction(
+        shrink=shrink,
         eta=eta,
         step_scale=scheduled_step_scale,
-        atom_correlation=atom_correlation,
     )
 
 
@@ -510,18 +475,6 @@ def ulmo_atom_sq(p: torch.Tensor, ulmo) -> float:
     return 1.0 / max(p.numel(), 1)
 
 
-def group_weighted_value(group: dict, values: list[float]) -> float:
-    params = group["params"]
-    total = sum(p.numel() for p in params)
-    if total <= 0:
-        return 0.0
-    return sum(value * p.numel() for value, p in zip(values, params, strict=True)) / total
-
-
-def group_rms_from_targets(group: dict, targets: list[float]) -> float:
-    return math.sqrt(group_weighted_value(group, [target * target for target in targets]))
-
-
 @torch.no_grad()
 def current_group_rms(group: dict) -> float:
     total = sum(p.numel() for p in group["params"])
@@ -531,40 +484,9 @@ def current_group_rms(group: dict) -> float:
     return math.sqrt(sq / total)
 
 
-def default_peak_rms_targets(group: dict) -> list[float]:
-    action = group_action(group, float(group["peak_step_scale"]))
-    return [
-        implied_steady_rms(
-            action.eta,
-            action.weight_retention,
-            action.atom_correlation,
-            atom_sq,
-        )
-        for atom_sq in group["atom_sq"]
-    ]
-
-
-def configure_group_rms_targets(group: dict, preserve_existing: bool = False) -> None:
-    if "atom_sq" not in group or len(group["atom_sq"]) != len(group["params"]):
-        group["atom_sq"] = [ulmo_atom_sq(p, group["ulmo"]) for p in group["params"]]
-
-    requested = group.get("requested_rms_radius")
-    existing = group.get("rms_targets")
-    if (
-        requested is None
-        and preserve_existing
-        and isinstance(existing, list)
-        and len(existing) == len(group["params"])
-        and all(float(target) > 0.0 for target in existing)
-    ):
-        targets = [float(target) for target in existing]
-    elif requested is None:
-        targets = default_peak_rms_targets(group)
-    else:
-        targets = [float(requested)] * len(group["params"])
-
-    group["rms_targets"] = targets
-    group["rms_radius"] = group_rms_from_targets(group, targets)
+def configure_group_rms_targets(group: dict) -> None:
+    rms_radius = float(group["rms_radius"])
+    group["rms_targets"] = [rms_radius] * len(group["params"])
 
 
 @torch.no_grad()
@@ -581,7 +503,7 @@ def init_like_ulmo_(p: torch.Tensor, ulmo, radius: float) -> None:
         raise TypeError(f"unsupported ULMO init: {type(ulmo).__name__}")
 
 
-def support_radius_for_weight_rms(p: torch.Tensor, ulmo, rms_radius: float) -> float:
+def init_radius_for_weight_rms(p: torch.Tensor, ulmo, rms_radius: float) -> float:
     atom_sq = ulmo_atom_sq(p, ulmo)
     if atom_sq <= 0.0:
         return rms_radius
@@ -591,18 +513,10 @@ def support_radius_for_weight_rms(p: torch.Tensor, ulmo, rms_radius: float) -> f
 @torch.no_grad()
 def init_from_actions_(groups: list[dict]) -> None:
     for group in groups:
-        support_radius = float(group["support_radius"])
-        use_target_init = bool(group.get("rms_radius_explicit")) or bool(
-            group.get("rms_solve")
-        )
         targets = group.get("rms_targets", [])
         ulmo = group["ulmo"]
         for index, p in enumerate(group["params"]):
-            radius = (
-                support_radius
-                if not use_target_init
-                else support_radius_for_weight_rms(p, ulmo, float(targets[index]))
-            )
+            radius = init_radius_for_weight_rms(p, ulmo, float(targets[index]))
             init_like_ulmo_(p, ulmo, radius)
 
 
@@ -610,37 +524,32 @@ def action_group_fields(
     name: str, args, delta_tau: int, memory_beta: float
 ) -> dict:
     peak_step_scale, min_step_scale = resolve_group_step_scale(args, name)
-    weight_retention_half_life = resolve_group_weight_retention_half_life(args, name)
-    peak_weight_retention = halving_factor(
+    shrink_half_life = resolve_group_shrink_half_life(args, name)
+    peak_shrink = halving_factor(
         delta_tau,
-        weight_retention_half_life,
-        f"{name}_weight_retention_half_life",
+        shrink_half_life,
+        f"{name}_shrink_half_life",
     )
-    requested_rms_radius, rms_radius_explicit = resolve_group_rms_radius(args, name)
+    rms_radius = resolve_group_rms_radius(args, name)
     fields = {
-        "requested_rms_radius": requested_rms_radius,
-        "rms_radius": requested_rms_radius,
-        "rms_radius_explicit": rms_radius_explicit,
-        "support_radius": resolve_group_support_radius(name),
+        "rms_radius": rms_radius,
         "memory_beta": memory_beta,
         "base_eta": DEFAULT_BASE_ETA,
         "peak_eta": DEFAULT_BASE_ETA * peak_step_scale,
         "peak_step_scale": peak_step_scale,
         "max_step_scale": peak_step_scale,
         "min_step_scale": min_step_scale,
-        "peak_weight_retention": peak_weight_retention,
-        "weight_retention_half_life": weight_retention_half_life,
-        "weight_retention_schedule": args.weight_retention_schedule,
+        "peak_shrink": peak_shrink,
+        "shrink_half_life": shrink_half_life,
+        "shrink_schedule": args.shrink_schedule,
         "rms_solve": args.rms_solve,
         "beta_half_life": args.beta_half_life,
         "count_increment": delta_tau,
     }
     action = group_action(fields, peak_step_scale)
     fields.update(
-        rho=action.rho,
-        atom_correlation=action.atom_correlation,
         step_scale=peak_step_scale,
-        weight_retention=action.weight_retention,
+        shrink=action.shrink,
         lr=action.eta,
     )
     return fields
@@ -662,7 +571,6 @@ def optimizer_group(
         "ulmo": ulmo,
         **action_group_fields(name, args, delta_tau, memory_beta),
     }
-    group["atom_sq"] = [ulmo_atom_sq(p, ulmo) for p in params]
     configure_group_rms_targets(group)
     return group
 
@@ -719,7 +627,7 @@ def configure_optimizer_actions(opt, args) -> None:
             memory_beta=memory_beta,
             readout_mu=args.readout_mu,
         )
-        configure_group_rms_targets(group, preserve_existing=True)
+        configure_group_rms_targets(group)
 
 
 def group_ulmo(opt, name: str, cls):
@@ -990,34 +898,14 @@ def format_optimizer_schedule(opt) -> str:
         peak_action = group_action(group, peak_step_scale)
         min_action = group_action(group, min_step_scale)
         rms_radius = group.get("rms_radius", math.nan)
-        support_radius = group.get("support_radius", math.nan)
-        weight_half_life = group.get("weight_retention_half_life", math.inf)
-        atom_sq = group_weighted_value(group, group.get("atom_sq", [1.0]))
-        peak_rss = implied_steady_rms(
-            peak_action.eta,
-            peak_action.weight_retention,
-            peak_action.atom_correlation,
-            atom_sq,
-        )
-        min_rss = implied_steady_rms(
-            min_action.eta,
-            min_action.weight_retention,
-            min_action.atom_correlation,
-            atom_sq,
-        )
+        shrink_half_life = group.get("shrink_half_life", math.inf)
         parts.append(
             f"{name}=(rw={rms_radius:g},"
-            f"rss={peak_rss:.3g}->{min_rss:.3g},"
-            f"support={support_radius:g},"
-            f"rho={peak_action.rho:.3g}->{min_action.rho:.3g},"
             f"s={peak_step_scale:.3g}->{min_step_scale:.3g},"
-            f"wr_sched={group.get('weight_retention_schedule', 'scheduled')},"
             f"eta={peak_action.eta:.3e}->{min_action.eta:.3e},"
-            f"h_weight={weight_half_life:.3g},"
-            f"zeta={peak_action.weight_retention:.6f}->"
-            f"{min_action.weight_retention:.6f},"
-            f"A={peak_action.atom_correlation:.3g}->"
-            f"{min_action.atom_correlation:.3g})"
+            f"h_shrink={shrink_half_life:.3g},"
+            f"shrink_sched={group.get('shrink_schedule', 'scheduled')},"
+            f"shrink={peak_action.shrink:.6f}->{min_action.shrink:.6f})"
         )
     return ", ".join(parts)
 
@@ -1026,12 +914,7 @@ def format_optimizer_schedule(opt) -> str:
 def optimizer_rms_state(opt) -> dict[str, dict[str, float]]:
     out = {}
     for group in opt.param_groups:
-        targets = group.get("rms_targets")
-        target = (
-            group_rms_from_targets(group, [float(value) for value in targets])
-            if isinstance(targets, list) and len(targets) == len(group["params"])
-            else float(group.get("rms_radius", math.nan))
-        )
+        target = float(group.get("rms_radius", math.nan))
         current = current_group_rms(group)
         out[group.get("name", f"group{len(out)}")] = {
             "param_rms": current,
@@ -1069,10 +952,8 @@ def apply_scheduled_etas(
         )
         action = group_action(group, step_scale)
         group["step_scale"] = step_scale
-        group["weight_retention"] = action.weight_retention
+        group["shrink"] = action.shrink
         group["lr"] = action.eta
-        group["rho"] = action.rho
-        group["atom_correlation"] = action.atom_correlation
         current_etas[group.get("name", f"group{len(current_etas)}")] = action.eta
     return current_etas
 
@@ -1805,38 +1686,36 @@ def make_parser():
     p.add_argument("--spi-refresh-interval", type=int, default=100)
     p.add_argument("--spi-refresh-threshold", type=float, default=0.10)
     p.add_argument(
-        "--weight-retention-half-life",
+        "--shrink-half-life",
         type=float,
         default=None,
-        help="weight-retention half-life in processed tokens for all groups",
+        help="weight shrink half-life in processed tokens for all groups",
     )
     p.add_argument(
-        "--weight-retention-half-life-embed",
-        dest="weight_retention_half_life_embed",
-        type=float,
-        default=None,
-    )
-    p.add_argument(
-        "--weight-retention-half-life-hidden",
-        dest="weight_retention_half_life_hidden",
+        "--shrink-half-life-embed",
+        dest="shrink_half_life_embed",
         type=float,
         default=None,
     )
     p.add_argument(
-        "--weight-retention-half-life-out",
-        "--weight-retention-half-life-unembed",
-        dest="weight_retention_half_life_out",
+        "--shrink-half-life-hidden",
+        dest="shrink_half_life_hidden",
         type=float,
         default=None,
     )
     p.add_argument(
-        "--weight-retention-schedule",
-        choices=["scheduled", "constant", "coupled", "decoupled"],
+        "--shrink-half-life-out",
+        dest="shrink_half_life_out",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--shrink-schedule",
+        choices=["scheduled", "constant"],
         default="scheduled",
         help=(
-            "scheduled applies the WSD ratio to the retention halving exponent; "
-            "constant/decoupled keeps weight retention at its peak half-life; "
-            "coupled applies the absolute eta multiplier to retention"
+            "scheduled applies the WSD ratio to the shrink halving exponent; "
+            "constant keeps shrink at its peak half-life"
         ),
     )
     p.add_argument(
