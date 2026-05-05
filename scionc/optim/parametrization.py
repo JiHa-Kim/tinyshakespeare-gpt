@@ -62,21 +62,19 @@ def schedule_at_step(
     return peak + (floor - peak) * progress
 
 
-def scheduled_retention(
+def scheduled_angular_step_retention(
     q_peak: float,
     schedule_ratio: float,
 ) -> float:
-    """Apply a WSD schedule ratio to the peak retention.
+    """Apply a WSD schedule ratio to the spherical movement size.
 
-    The halving exponent H = -log2(q_peak) is scaled by schedule_ratio:
-
-        q(t) = 2^{-schedule_ratio * H} = q_peak^{schedule_ratio}
-
-    At schedule_ratio=1, q = q_peak (peak movement).
-    At schedule_ratio=0, q = 1 (no movement).
+    The optimizer moves by eps = sqrt(1 - q^2) on the RMS sphere.  This
+    schedules eps directly, matching the old optimizer's eta schedule.
     """
     if schedule_ratio <= 0.0:
         return 1.0
     if schedule_ratio >= 1.0:
         return q_peak
-    return q_peak**schedule_ratio
+    eps_peak = angular_step(q_peak)
+    eps = schedule_ratio * eps_peak
+    return math.sqrt(max(0.0, 1.0 - eps * eps))

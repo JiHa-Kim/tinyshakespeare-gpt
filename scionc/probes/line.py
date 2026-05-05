@@ -56,9 +56,28 @@ def line_probe_text(
     stats: dict[str, dict],
     eps: float = 1e-12,
 ) -> str:
+    values = line_probe_stats(loss_before, loss_after, stats, eps)
+    if not values:
+        return ""
+    obj = line_object_stats_text(stats)
+    return (
+        f"line_probe step {step:5d} | "
+        f"pred {values['predicted']:.3e} | actual {values['actual']:.3e} | "
+        f"ratio {values['ratio']:.3f} | quad {values['quadratic']:.3f} | "
+        f"curv {values['curvature']:.3e}"
+        f"{obj}"
+    )
+
+
+def line_probe_stats(
+    loss_before: float,
+    loss_after: float,
+    stats: dict[str, dict],
+    eps: float = 1e-12,
+) -> dict[str, float]:
     pred = sum(values.get("descent", 0.0) for values in stats.values())
     if pred <= eps:
-        return ""
+        return {}
     actual = loss_before - loss_after
     ratio = actual / pred
     quadratic = 2.0 * (1.0 - ratio)
@@ -68,13 +87,16 @@ def line_probe_text(
         if update_sq > eps
         else float("nan")
     )
-    obj = line_object_stats_text(stats)
-    return (
-        f"line_probe step {step:5d} | "
-        f"pred {pred:.3e} | actual {actual:.3e} | "
-        f"ratio {ratio:.3f} | quad {quadratic:.3f} | curv {curvature:.3e}"
-        f"{obj}"
-    )
+    return {
+        "loss_before": loss_before,
+        "loss_after": loss_after,
+        "predicted": pred,
+        "actual": actual,
+        "ratio": ratio,
+        "quadratic": quadratic,
+        "curvature": curvature,
+        "update_sq": update_sq,
+    }
 
 
 def line_object_stats_text(stats: dict[str, dict]) -> str:
@@ -114,8 +136,22 @@ def optional_object_text(values: dict) -> str:
 
 
 def line_curve_text(step: int, losses: list[tuple[float, float]]) -> str:
-    if len(losses) < 3:
+    values = line_curve_stats(losses)
+    if not values:
         return ""
+    points = ",".join(f"{scale:g}:{loss:.4f}" for scale, loss in losses)
+    return (
+        f"line_curve step {step:5d} | "
+        f"Pfit {values['predicted']:.3e} | Cfit {values['curvature']:.3e} | "
+        f"a* {values['a_star']:.3f} | "
+        f"best {values['best_scale']:g}:{values['best_loss']:.4f} | "
+        f"losses {points}"
+    )
+
+
+def line_curve_stats(losses: list[tuple[float, float]]) -> dict[str, float]:
+    if len(losses) < 3:
+        return {}
 
     xs = torch.tensor([scale for scale, _ in losses], dtype=torch.float64)
     ys = torch.tensor([loss for _, loss in losses], dtype=torch.float64)
@@ -125,17 +161,18 @@ def line_curve_text(step: int, losses: list[tuple[float, float]]) -> str:
     design = torch.stack([xs[mask], xs[mask].square()], dim=1)
     target = ys[mask] - y0
     if design.size(0) < design.size(1):
-        return ""
+        return {}
 
     coeff = torch.linalg.lstsq(design, target).solution
     predicted = -float(coeff[0])
     curvature = float(2.0 * coeff[1])
     a_star = predicted / curvature if curvature > 1e-12 else float("nan")
     best_scale, best_loss = min(losses, key=lambda item: item[1])
-    points = ",".join(f"{scale:g}:{loss:.4f}" for scale, loss in losses)
-    return (
-        f"line_curve step {step:5d} | "
-        f"Pfit {predicted:.3e} | Cfit {curvature:.3e} | "
-        f"a* {a_star:.3f} | best {best_scale:g}:{best_loss:.4f} | "
-        f"losses {points}"
-    )
+    return {
+        "predicted": predicted,
+        "curvature": curvature,
+        "a_star": a_star,
+        "best_scale": best_scale,
+        "best_loss": best_loss,
+        "loss_zero": float(y0),
+    }

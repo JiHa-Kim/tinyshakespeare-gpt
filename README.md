@@ -2,51 +2,65 @@
 
 A compact ScionC sandbox organized by category:
 
-- `scionc/optim/`: RMS-Sphere optimizer and schedule parametrization helpers.
+- `scionc/optim/`: Hyperball optimizer and schedule parametrization helpers.
 - `scionc/ulmos/`: ULMOs, Gram-NS, and streaming SVD helpers.
 - `scionc/models/`: compact GPT model and tiny Shakespeare data utilities.
 - `scionc/probes/`: convergence, line, and optimizer-step stats probes.
 - `scionc/train_shakespeare.py`: training entrypoint.
 
-## Active Recipe: RMS-Sphere
+## Active Recipe: Hyperball
 
 Each controlled weight block lives on a fixed-radius RMS sphere.
-Initialization sets each block radius. A single direction-retention
-half-life sets the angular movement. Weight decay is the exact radial
-Lagrange correction, not a manually scheduled penalty.
+Initialization sets each block radius. Group-specific weight-direction
+half-lives set angular movement on the sphere. A separate state half-life
+sets momentum retention.
 
 One optimizer update advances the count by
 `batch_size * block_size * grad_accum` processed tokens. For one controlled
 block:
 
 ```math
-M \leftarrow q\,M + (1-q)\,G,
+M \leftarrow \beta\,M + (1-\beta)\,G,
 \qquad
 V = \operatorname{ulmo}(M),
 \qquad
-\hat W' = q\,\hat W + \sqrt{1-q^2}\,U,
+\hat W' = \operatorname{rmsnorm}\!\left(
+  \hat W + \varepsilon\,\operatorname{rmsnorm}(V)
+\right),
+\qquad
+\varepsilon = \sqrt{1-q^2}.
 ```
 
-where $U$ is the unit tangent direction obtained by projecting the ULMO
-atom $V$ onto the tangent space and normalizing.
+The sign is positive because local ULMOs return descent directions. This is
+the usual Hyperball `W <- RMSNorm(W - eta RMSNorm(V))` update when `V`
+denotes a gradient-like atom.
 
 The active coordinates are:
 
-- direction half-life $h$ (processed tokens),
-- per-update retention $q = 2^{-\Delta\tau/h}$,
+- state half-life $h_\beta$ (processed tokens),
+- weight-direction half-life $h_w$ (processed tokens),
+- per-update state retention $\beta = 2^{-\Delta\tau/h_\beta}$,
+- per-update weight retention $q = 2^{-\Delta\tau/h_w}$,
 - frozen block radius $R = \|W_0\|_{\mathrm{rms}}$.
 
 ## Defaults
 
-- optimizer: RMS-Sphere
+- optimizer: Hyperball
 - hidden ULMO: Gram Newton-Schulz
 - input/output ULMOs: untied ColNorm + Sign; tied Sign + Sign
 - batch size: 64
 - gradient accumulation: 1
 - block size: 256
 - initialization RMS: embedding 0.70, hidden 0.051, output 0.022
-- direction half-life: about 2.21e5 processed tokens
-- WSD schedule: 100 warmup steps, stable phase, 15% decay (floor=0)
+- state half-life: about 2.21e5 processed tokens
+- peak relative RMS movement: embedding about 3.68%, hidden about 2.56%,
+  output about 0.35%
+- weight-direction half-lives: embedding about 1.68e7, hidden about 3.47e7,
+  output about 1.85e9 processed tokens
+- WSD schedule: 100 warmup steps, stable phase, 15% decay (floor=0);
+  the schedule scales the spherical movement `sqrt(1 - q^2)` directly
+- update rule: `retract` by default; `--hyperball-update slerp` runs the
+  tangent-projected spherical-lerp comparison
 
 ## Hidden ULMOs
 
@@ -62,13 +76,14 @@ and applies one or more streaming subspace steps per optimizer update.
 ```bash
 uv run python -m scionc.train_shakespeare \
   --mode train \
-  --out-path out/rms_sphere_2k.pt \
-  --sample-out out/rms_sphere_2k_samples.md \
+  --out-path out/hyperball_2k.pt \
+  --sample-out out/hyperball_2k_samples.md \
   --batch-size 64 --grad-accum 1 --block-size 256 \
   --n-layer 6 --n-head 6 --d-model 384 \
-  --direction-half-life 2.214e5 \
   --schedule-floor 0 \
+  --hyperball-update retract \
   --warmup-iters 100 --decay-frac 0.15 \
+  --state-half-life 2.214e5 \
   --hidden-ulmo gram-ns \
   --embed-ulmo colnorm --out-ulmo sign \
   --temperature 0.8 --top-k 40 --sample-count 2
@@ -80,6 +95,6 @@ Evaluate the saved checkpoint with more batches:
 uv run python -m scionc.train_shakespeare \
   --mode eval \
   --device cuda \
-  --out-path out/rms_sphere_2k.pt \
+  --out-path out/hyperball_2k.pt \
   --eval-iters 200
 ```

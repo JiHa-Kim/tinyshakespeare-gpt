@@ -8,9 +8,9 @@ from scionc.optim.parametrization import (
     angular_step,
     direction_retention,
     schedule_at_step,
-    scheduled_retention,
+    scheduled_angular_step_retention,
 )
-from scionc.optim.scion import RMSSphere
+from scionc.optim.scion import Hyperball
 from scionc.ulmos.core import ColNormULMO, GramNewtonSchulzULMO, RowNormULMO, SignULMO
 from scionc.ulmos.streaming_svd import StreamingSVDULMO
 
@@ -21,7 +21,29 @@ DEFAULT_TARGET_RMS = {
 }
 GROUP_NAMES = tuple(DEFAULT_TARGET_RMS)
 DEFAULT_COUNT_INCREMENT = 64 * 256
-DEFAULT_DIRECTION_HALF_LIFE = 2.214e5  # processed tokens
+OPTIMIZER_NAME = "hyperball"
+DEFAULT_HYPERBALL_UPDATE = "retract"
+DEFAULT_STATE_RETENTION = 0.95
+DEFAULT_STATE_HALF_LIFE = -DEFAULT_COUNT_INCREMENT / math.log2(
+    DEFAULT_STATE_RETENTION
+)
+DEFAULT_DIRECTION_RETENTIONS = {
+    "embed": 0.99932288,
+    "hidden": 0.99967232,
+    "out": 0.999993875,
+}
+DEFAULT_DIRECTION_HALF_LIVES = {
+    name: -DEFAULT_COUNT_INCREMENT / math.log2(retention)
+    for name, retention in DEFAULT_DIRECTION_RETENTIONS.items()
+}
+DEFAULT_DIRECTION_HALF_LIFE = None  # global override; None uses group defaults
+
+
+def resolve_hyperball_update(args) -> str:
+    update = args.hyperball_update
+    if update not in {"retract", "slerp"}:
+        raise ValueError(f"invalid Hyperball update rule: {update}")
+    return update
 
 
 def count_increment(args) -> int:
@@ -42,11 +64,22 @@ def resolve_group_target_rms(args, group: str) -> float:
 def resolve_group_direction_half_life(args, group: str) -> float:
     half_life = getattr(args, f"direction_half_life_{group}", None)
     if half_life is None:
-        half_life = args.direction_half_life
+        half_life = getattr(args, "direction_half_life", None)
     if half_life is None:
-        half_life = DEFAULT_DIRECTION_HALF_LIFE
+        half_life = DEFAULT_DIRECTION_HALF_LIVES[group]
     if half_life <= 0.0:
         raise ValueError(f"invalid {group} direction half-life: {half_life}")
+    return float(half_life)
+
+
+def resolve_group_state_half_life(args, group: str) -> float:
+    half_life = getattr(args, f"state_half_life_{group}", None)
+    if half_life is None:
+        half_life = getattr(args, "state_half_life", None)
+    if half_life is None:
+        half_life = DEFAULT_STATE_HALF_LIFE
+    if half_life <= 0.0:
+        raise ValueError(f"invalid {group} state half-life: {half_life}")
     return float(half_life)
 
 
@@ -125,6 +158,7 @@ def current_group_rms(group: dict) -> float:
 def build_optimizer(model: GPT, args, device: torch.device):
     delta_tau = count_increment(args)
     work_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    update_rule = resolve_hyperball_update(args)
 
     groups = []
     for name, params, ulmo in optimizer_group_specs(model, args, work_dtype):
@@ -132,6 +166,10 @@ def build_optimizer(model: GPT, args, device: torch.device):
             continue
         half_life = resolve_group_direction_half_life(args, name)
         q = direction_retention(delta_tau, half_life, f"{name}_direction_half_life")
+        state_half_life = resolve_group_state_half_life(args, name)
+        beta = direction_retention(
+            delta_tau, state_half_life, f"{name}_state_half_life"
+        )
         target_rms = resolve_group_target_rms(args, name)
         groups.append(
             {
@@ -140,7 +178,10 @@ def build_optimizer(model: GPT, args, device: torch.device):
                 "ulmo": ulmo,
                 "q": q,
                 "q_peak": q,
+                "beta": beta,
+                "update_rule": update_rule,
                 "direction_half_life": half_life,
+                "state_half_life": state_half_life,
                 "target_rms": target_rms,
             }
         )
@@ -148,7 +189,13 @@ def build_optimizer(model: GPT, args, device: torch.device):
     init_and_freeze_radii_(groups)
 
     default_q = groups[0]["q"] if groups else 0.99
-    return RMSSphere(groups, q=default_q)
+    default_beta = groups[0]["beta"] if groups else DEFAULT_STATE_RETENTION
+    return Hyperball(
+        groups,
+        q=default_q,
+        beta=default_beta,
+        update_rule=update_rule,
+    )
 
 
 def format_optimizer_schedule(opt) -> str:
@@ -159,10 +206,14 @@ def format_optimizer_schedule(opt) -> str:
         eps = angular_step(q)
         theta = angular_angle(q)
         h = group.get("direction_half_life", float("nan"))
+        beta = float(group.get("beta", float("nan")))
+        h_state = group.get("state_half_life", float("nan"))
         target_rms = group.get("target_rms", float("nan"))
+        update_rule = group.get("update_rule", DEFAULT_HYPERBALL_UPDATE)
         parts.append(
-            f"{name}=(h={h:.3g},q={q:.6f},eps={eps:.6f},theta={theta:.6f},"
-            f"init_rms={target_rms:g})"
+            f"{name}=(h_weight={h:.3g},q={q:.6f},eps={eps:.6f},"
+            f"theta={theta:.6f},h_state={h_state:.3g},beta={beta:.6f},"
+            f"init_rms={target_rms:g},update={update_rule})"
         )
     return ", ".join(parts)
 
@@ -201,10 +252,10 @@ def apply_scheduled_q(
     decay_steps: int,
     schedule_floor: float = 0.0,
 ) -> dict[str, float]:
-    """Apply WSD schedule to the halving exponent of each group.
+    """Apply WSD schedule to the spherical movement of each group.
 
-    The schedule ratio s_t ∈ [floor, 1] scales the halving exponent:
-        q_t = q_peak^{s_t}
+    The schedule ratio s_t in [floor, 1] scales eps = sqrt(1 - q^2):
+        eps_t = s_t eps_peak
 
     Returns the current q per group.
     """
@@ -219,7 +270,7 @@ def apply_scheduled_q(
             warmup_steps,
             decay_steps,
         )
-        q = scheduled_retention(q_peak, s_t)
+        q = scheduled_angular_step_retention(q_peak, s_t)
         group["q"] = q
         group["schedule_ratio"] = s_t
         current_qs[group.get("name", f"group{len(current_qs)}")] = q

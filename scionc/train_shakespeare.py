@@ -11,14 +11,18 @@ import torch
 from scionc.compile_env import ensure_compile_env
 from scionc.optim.parametrization import angular_step, resolve_schedule
 from scionc.optim.setup import (
+    DEFAULT_HYPERBALL_UPDATE,
     DEFAULT_DIRECTION_HALF_LIFE,
+    DEFAULT_STATE_HALF_LIFE,
     GROUP_NAMES,
+    OPTIMIZER_NAME,
     apply_scheduled_q,
     build_optimizer,
     count_increment,
     format_optimizer_schedule,
     optimizer_io_label,
     optimizer_rms_state,
+    resolve_hyperball_update,
     rms_state_text,
 )
 from scionc.models.gpt import (
@@ -34,7 +38,9 @@ from scionc.probes.line import (
     capture_params,
     capture_rng,
     finish_line_snapshot,
+    line_curve_stats,
     line_curve_text,
+    line_probe_stats,
     line_probe_text,
     parse_line_scales,
     restore_rng,
@@ -363,11 +369,13 @@ def run_line_probe(
     line_stats: dict[str, dict],
     amp_dtype: torch.dtype | None,
     device: torch.device,
-) -> None:
+) -> dict:
     if batch is None or rng_before is None or loss_before is None:
-        return
+        return {}
 
     rng_after = capture_rng(device)
+    curve_losses = []
+    curve_values = {}
     if params_before is None:
         restore_rng(rng_before, device)
         with torch.no_grad(), amp_ctx(amp_dtype):
@@ -376,7 +384,6 @@ def run_line_probe(
         loss_after_value = float(loss_after.detach())
     else:
         snapshot = finish_line_snapshot(params_before)
-        curve_losses = []
         for scale in curve_scales:
             apply_line_scale(snapshot, scale)
             restore_rng(rng_before, device)
@@ -386,16 +393,29 @@ def run_line_probe(
         apply_line_scale(snapshot, 1.0)
         restore_rng(rng_after, device)
         loss_after_value = min(curve_losses, key=lambda item: abs(item[0] - 1.0))[1]
+        curve_values = line_curve_stats(curve_losses)
         curve_text = line_curve_text(step, curve_losses)
         if curve_text:
             print(curve_text)
 
+    probe_values = line_probe_stats(loss_before, loss_after_value, line_stats)
     line_text = line_probe_text(step, loss_before, loss_after_value, line_stats)
     if line_text:
         print(line_text)
+    return {
+        "loss_before": loss_before,
+        "loss_after": loss_after_value,
+        "probe": probe_values,
+        "curve": curve_values,
+        "curve_losses": [
+            {"scale": scale, "loss": loss} for scale, loss in curve_losses
+        ],
+        "step_stats": line_stats,
+    }
 
 
 def train(args):
+    args.hyperball_update = resolve_hyperball_update(args)
     device, amp_dtype = configure_runtime(args)
     metrics = MetricsLogger(args.metrics_jsonl, args.run_name)
     line_curve_scales = parse_line_scales(args.line_curve_scales)
@@ -424,7 +444,9 @@ def train(args):
     effective_tokens = count_increment(args)
     first_group = opt.param_groups[0]
     q_peak = float(first_group.get("q_peak", first_group["q"]))
+    beta = float(first_group.get("beta", math.nan))
     direction_half_life = first_group.get("direction_half_life", math.nan)
+    state_half_life = first_group.get("state_half_life", math.nan)
     io_weights = optimizer_io_label(raw_model)
 
     group_text = format_optimizer_schedule(opt)
@@ -433,7 +455,8 @@ def train(args):
         f"warmup_steps={warmup_steps} stable_steps={stable_steps} decay_steps={decay_steps} "
         f"count_increment={effective_tokens} "
         f"direction_half_life={direction_half_life:.3g} q_peak={q_peak:.6f} "
-        f"optimizer=rms_sphere dropout={args.dropout:.3f} "
+        f"state_half_life={state_half_life:.3g} beta={beta:.6f} "
+        f"optimizer={OPTIMIZER_NAME} update={args.hyperball_update} dropout={args.dropout:.3f} "
         f"hidden_ulmo={args.hidden_ulmo} "
         f"io_weights={io_weights} embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
         f"qkv=split spi_iteration={args.spi_iteration} "
@@ -449,9 +472,12 @@ def train(args):
             "count_increment": effective_tokens,
         },
         optimizer={
-            "name": "rms_sphere",
+            "name": OPTIMIZER_NAME,
             "direction_half_life": direction_half_life,
             "q_peak": q_peak,
+            "state_half_life": state_half_life,
+            "beta": beta,
+            "update_rule": args.hyperball_update,
             "groups": group_text,
         },
         model={
@@ -547,7 +573,8 @@ def train(args):
                 else ""
             )
             print(
-                f"step {step:5d} | q {q:.6f} eps {eps_move:.6f} | train {train_loss:.4f} | val {val_loss:.4f} | "
+                f"step {step:5d} | q {q:.6f} eps {eps_move:.6f} beta {beta:.6f} | "
+                f"train {train_loss:.4f} | val {val_loss:.4f} | "
                 f"best_val {best_val:.4f} | train_seconds {elapsed:.3f} | "
                 f"tok/s {(total_opt_steps * effective_tokens) / elapsed:.0f}"
                 f"{mem_text}{logit_text}{rms_text}{opt_text}"
@@ -558,6 +585,7 @@ def train(args):
                 step=step,
                 total_opt_steps=total_opt_steps,
                 q=q,
+                beta=beta,
                 qs=current_qs,
                 train_loss=train_loss,
                 val_loss=val_loss,
@@ -642,7 +670,7 @@ def train(args):
                 line_stats = consume_step_stats(line_stat_accum)
         total_opt_steps = step + 1
         if line_active:
-            run_line_probe(
+            line_record = run_line_probe(
                 model,
                 step,
                 line_batch,
@@ -654,6 +682,13 @@ def train(args):
                 amp_dtype,
                 device,
             )
+            if line_record:
+                metrics.write(
+                    "line_probe",
+                    step=step,
+                    total_opt_steps=total_opt_steps,
+                    **line_record,
+                )
 
     if not (args.skip_sample or diverged):
         prompt = args.prompt or "\n"
@@ -803,7 +838,7 @@ def make_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["train", "sample", "eval"], default="train")
     p.add_argument("--data-path", default="data/tiny_shakespeare.txt")
-    p.add_argument("--out-path", default="out/scion_shakespeare.pt")
+    p.add_argument("--out-path", default="out/hyperball_shakespeare.pt")
     p.add_argument("--device", default="")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
@@ -841,15 +876,32 @@ def make_parser():
         "--direction-half-life",
         type=float,
         default=DEFAULT_DIRECTION_HALF_LIFE,
-        help="direction-retention half-life in processed tokens",
+        help=(
+            "weight-direction retention half-life in processed tokens; "
+            "default uses group-specific clocks"
+        ),
     )
     for group in GROUP_NAMES:
         p.add_argument(f"--direction-half-life-{group}", type=float, default=None)
     p.add_argument(
+        "--state-half-life",
+        type=float,
+        default=DEFAULT_STATE_HALF_LIFE,
+        help="momentum-state retention half-life in processed tokens",
+    )
+    for group in GROUP_NAMES:
+        p.add_argument(f"--state-half-life-{group}", type=float, default=None)
+    p.add_argument(
         "--schedule-floor",
         type=float,
         default=0.0,
-        help="WSD schedule floor for the halving exponent ratio (0 = no movement at decay end)",
+        help="WSD schedule floor for the spherical movement ratio (0 = no movement at decay end)",
+    )
+    p.add_argument(
+        "--hyperball-update",
+        choices=["slerp", "retract"],
+        default=DEFAULT_HYPERBALL_UPDATE,
+        help="fixed-radius update rule; retract is the Hyperball RMSNorm baseline",
     )
     p.add_argument(
         "--target-rms",

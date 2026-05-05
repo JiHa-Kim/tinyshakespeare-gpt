@@ -4,15 +4,22 @@ import torch
 from torch.optim import Optimizer
 
 
-class RMSSphere(Optimizer):
+class Hyperball(Optimizer):
     """
-    RMS-Sphere optimizer.
+    Hyperball optimizer.
 
     Each controlled block lives on a fixed-radius RMS sphere.  The radius
-    R = ‖W₀‖_rms is frozen on the first optimizer step.  A single direction
-    retention q sets the angular movement; momentum retention β = q.
+    R = ‖W₀‖_rms is frozen on the first optimizer step.  Direction retention
+    q sets the angular movement; state retention β sets momentum memory.
+    The default update is the fixed-radius RMSNorm retraction:
 
-    The spherical update is:
+        Ŵ_{t+1} = rmsnorm(Ŵ_t + η rmsnorm(V_t))
+
+    under this codebase's convention that ULMOs return descent directions.
+    The `slerp` update instead projects the atom to the tangent space and
+    applies a normalized spherical lerp.
+
+    The legacy `slerp` ablation uses:
 
         Ŵ_{t+1} = q Ŵ_t + √(1 − q²) U_t
 
@@ -20,11 +27,24 @@ class RMSSphere(Optimizer):
     the ULMO atom of the momentum state onto the tangent space of the sphere.
     """
 
-    def __init__(self, params, q: float = 0.99, ulmo=None):
+    def __init__(
+        self,
+        params,
+        q: float = 0.99,
+        beta: float = 0.95,
+        ulmo=None,
+        update_rule: str = "retract",
+    ):
         if not (0.0 < q <= 1.0):
             raise ValueError(f"invalid q: {q}")
+        if not (0.0 <= beta <= 1.0):
+            raise ValueError(f"invalid beta: {beta}")
+        if update_rule not in {"slerp", "retract"}:
+            raise ValueError(f"invalid update_rule: {update_rule}")
 
-        super().__init__(params, dict(q=q, ulmo=ulmo))
+        super().__init__(
+            params, dict(q=q, beta=beta, ulmo=ulmo, update_rule=update_rule)
+        )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -43,6 +63,7 @@ class RMSSphere(Optimizer):
             if eps_move == 0.0:
                 continue
 
+            update_rule = group.get("update_rule", "retract")
             updates = self._updates(group["ulmo"], entries)
 
             for (_, p, _), u in zip(entries, updates, strict=True):
@@ -53,6 +74,16 @@ class RMSSphere(Optimizer):
 
                 d = p.numel()
                 w_hat = p.data / R
+
+                if update_rule == "retract":
+                    u_rms = (u.square().sum() / d).sqrt()
+                    if float(u_rms) <= 0.0:
+                        continue
+                    w_hat = w_hat + eps_move * (u / u_rms)
+                    w_hat_rms = (w_hat.square().sum() / d).sqrt()
+                    w_hat = w_hat / w_hat_rms
+                    p.data.copy_(R * w_hat)
+                    continue
 
                 # Tangent projection: D = u − ⟨u, ŵ⟩_rms ŵ
                 inner_rms = (u * w_hat).sum() / d
@@ -70,14 +101,14 @@ class RMSSphere(Optimizer):
         return loss
 
     def _collect_entries(self, group) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
-        q = float(group["q"])  # β = q (tied)
+        beta = float(group["beta"])
         entries = []
         for param_index, p in enumerate(group["params"]):
             g = p.grad
             if g is None:
                 continue
             if g.is_sparse:
-                raise RuntimeError("RMSSphere does not support sparse gradients")
+                raise RuntimeError("Hyperball does not support sparse gradients")
 
             state = self.state[p]
             if "m" not in state:
@@ -87,7 +118,7 @@ class RMSSphere(Optimizer):
                 state["R"] = float((p.data.square().sum() / d).sqrt())
 
             m = state["m"]
-            m.lerp_(g, 1.0 - q)
+            m.lerp_(g, 1.0 - beta)
             entries.append((param_index, p, m))
         return entries
 
