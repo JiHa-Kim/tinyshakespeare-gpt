@@ -9,7 +9,11 @@ from pathlib import Path
 import torch
 
 from scionc.compile_env import ensure_compile_env
-from scionc.optim.parametrization import resolve_schedule
+from scionc.optim.parametrization import (
+    resolve_schedule,
+    retention_from_half_life,
+    schedule_at_step,
+)
 from scionc.optim.setup import (
     DEFAULT_HYPERBALL_UPDATE,
     DEFAULT_LEARNING_RATE,
@@ -26,6 +30,7 @@ from scionc.optim.setup import (
     rms_state_text,
 )
 from scionc.models.gpt import (
+    Derf,
     GPT,
     BatchSource,
     CharDataset,
@@ -115,6 +120,56 @@ class MetricsLogger:
         if self.file is not None:
             self.file.close()
             self.file = None
+
+
+class NormalizedSGD:
+    """Scion-style normalized descent for small unconstrained parameter groups."""
+
+    def __init__(self, params, lr: float, beta: float, eps: float = 1e-12):
+        self.params = [p for p in params if p.requires_grad]
+        self.lr_peak = float(lr)
+        self.lr = float(lr)
+        self.beta = float(beta)
+        self.eps = eps
+        self.state: dict[torch.Tensor, torch.Tensor] = {}
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for p in self.params:
+            if p.grad is None:
+                continue
+            if set_to_none:
+                p.grad = None
+            else:
+                p.grad.zero_()
+
+    @torch.no_grad()
+    def step(self) -> None:
+        total = 0
+        sq = None
+        updates = []
+        for p in self.params:
+            if p.grad is None:
+                continue
+            if p.grad.is_sparse:
+                raise RuntimeError("NormalizedSGD does not support sparse gradients")
+            m = self.state.get(p)
+            if m is None:
+                m = torch.zeros_like(p, memory_format=torch.preserve_format)
+                self.state[p] = m
+            m.lerp_(p.grad, 1.0 - self.beta)
+            m32 = m.float()
+            value = m32.square().sum()
+            sq = value if sq is None else sq + value
+            total += p.numel()
+            updates.append((p, m))
+
+        if not updates or sq is None or total <= 0:
+            return
+        rms = (sq / total).sqrt()
+        if float(rms) <= self.eps:
+            return
+        for p, m in updates:
+            p.add_(m / rms.to(dtype=m.dtype), alpha=-self.lr)
 
 
 def step_stats_text(stats: dict[str, dict]) -> str:
@@ -331,8 +386,93 @@ def build_model(args, dataset: CharDataset, device: torch.device) -> GPT:
         rope_base=args.rope_base,
         dropout=args.dropout,
         tie_weights=args.tie_weights,
+        norm_type=args.norm_type,
+        derf_alpha=args.derf_alpha,
+        derf_shift=args.derf_shift,
     )
     return GPT(cfg).to(device)
+
+
+def derf_parameter_groups(model: GPT) -> dict[str, list[torch.Tensor]]:
+    groups = {"shape": [], "affine": []}
+    for module in model.modules():
+        if isinstance(module, Derf):
+            groups["shape"].extend([module.alpha, module.shift])
+            groups["affine"].extend([module.gamma, module.beta])
+    return groups
+
+
+def build_derf_optimizers(model: GPT, args) -> dict[str, NormalizedSGD]:
+    groups = {
+        name: params for name, params in derf_parameter_groups(model).items() if params
+    }
+    if not groups:
+        return {}
+    beta = retention_from_half_life(
+        count_increment(args), args.derf_state_half_life, "derf_state_half_life"
+    )
+    return {
+        name: NormalizedSGD(params, args.derf_lr, beta)
+        for name, params in groups.items()
+    }
+
+
+def zero_derf_optimizers(
+    opts: dict[str, NormalizedSGD], set_to_none: bool = True
+) -> None:
+    for opt in opts.values():
+        opt.zero_grad(set_to_none=set_to_none)
+
+
+def step_derf_optimizers(opts: dict[str, NormalizedSGD]) -> None:
+    for opt in opts.values():
+        opt.step()
+
+
+@torch.no_grad()
+def derf_state(model: GPT) -> dict[str, float]:
+    alphas = []
+    shifts = []
+    gammas = []
+    betas = []
+    for module in model.modules():
+        if isinstance(module, Derf):
+            alphas.append(float(module.alpha))
+            shifts.append(float(module.shift))
+            gammas.extend(float(x) for x in module.gamma.detach().flatten())
+            betas.extend(float(x) for x in module.beta.detach().flatten())
+    if not alphas:
+        return {}
+    return {
+        "alpha_mean": sum(alphas) / len(alphas),
+        "alpha_min": min(alphas),
+        "alpha_max": max(alphas),
+        "shift_mean": sum(shifts) / len(shifts),
+        "shift_min": min(shifts),
+        "shift_max": max(shifts),
+        "gamma_mean": sum(gammas) / len(gammas),
+        "gamma_min": min(gammas),
+        "gamma_max": max(gammas),
+        "beta_mean": sum(betas) / len(betas),
+        "beta_min": min(betas),
+        "beta_max": max(betas),
+    }
+
+
+def derf_state_text(state: dict[str, float]) -> str:
+    if not state:
+        return ""
+    return (
+        " | derf "
+        f"a={state['alpha_mean']:.3g}"
+        f"[{state['alpha_min']:.3g},{state['alpha_max']:.3g}],"
+        f"s={state['shift_mean']:.3g}"
+        f"[{state['shift_min']:.3g},{state['shift_max']:.3g}],"
+        f"g={state['gamma_mean']:.3g}"
+        f"[{state['gamma_min']:.3g},{state['gamma_max']:.3g}],"
+        f"b={state['beta_mean']:.3g}"
+        f"[{state['beta_min']:.3g},{state['beta_max']:.3g}]"
+    )
 
 
 def resolve_training_schedule(args) -> tuple[int, int, int]:
@@ -428,6 +568,7 @@ def train(args):
         dataset.train, dataset.val, args.block_size, args.batch_size, device
     )
     opt = build_optimizer(raw_model, args, device)
+    derf_opts = build_derf_optimizers(raw_model, args)
     conv_probe = (
         ConvergenceProbe(raw_model, opt, args) if args.track_convergence_stats else None
     )
@@ -445,6 +586,7 @@ def train(args):
     first_group = opt.param_groups[0]
     lr_peak = float(first_group.get("lr_peak", first_group["lr"]))
     beta = float(first_group.get("beta", math.nan))
+    derf_beta = next(iter(derf_opts.values())).beta if derf_opts else math.nan
     state_half_life = first_group.get("state_half_life", math.nan)
     io_weights = optimizer_io_label(raw_model)
 
@@ -455,7 +597,9 @@ def train(args):
         f"count_increment={effective_tokens} "
         f"lr_peak={lr_peak:.6f} "
         f"state_half_life={state_half_life:.3g} beta={beta:.6f} "
-        f"optimizer={OPTIMIZER_NAME} update={args.hyperball_update} dropout={args.dropout:.3f} "
+        f"optimizer={OPTIMIZER_NAME} update={args.hyperball_update} "
+        f"norm={args.norm_type} derf_lr={args.derf_lr:.6f} "
+        f"derf_beta={derf_beta:.6f} dropout={args.dropout:.3f} "
         f"hidden_ulmo={args.hidden_ulmo} "
         f"io_weights={io_weights} embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
         f"qkv=split spi_iteration={args.spi_iteration} "
@@ -475,11 +619,18 @@ def train(args):
             "lr_peak": lr_peak,
             "state_half_life": state_half_life,
             "beta": beta,
+            "derf_lr_peak": args.derf_lr,
+            "derf_state_half_life": args.derf_state_half_life,
+            "derf_beta": derf_beta,
+            "derf_groups": list(derf_opts),
             "update_rule": args.hyperball_update,
             "groups": group_text,
         },
         model={
             "dropout": args.dropout,
+            "norm_type": args.norm_type,
+            "derf_alpha": args.derf_alpha,
+            "derf_shift": args.derf_shift,
             "hidden_ulmo": args.hidden_ulmo,
             "io_weights": io_weights,
             "embed_ulmo": args.embed_ulmo,
@@ -514,6 +665,18 @@ def train(args):
             args.schedule_floor,
         )
         lr = current_lrs.get("hidden", next(iter(current_lrs.values())))
+        derf_lr = 0.0
+        if derf_opts:
+            derf_lr = schedule_at_step(
+                step,
+                args.max_iters,
+                args.derf_lr,
+                args.schedule_floor * args.derf_lr,
+                warmup_steps,
+                decay_steps,
+            )
+            for derf_group_opt in derf_opts.values():
+                derf_group_opt.lr = derf_lr
 
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
             train_loss = float(last_train_loss)
@@ -529,6 +692,7 @@ def train(args):
                 consume_step_stats(step_stat_accum) if args.track_step_stats else {}
             )
             weight_rms = optimizer_rms_state(opt)
+            derf_stats = derf_state(raw_model)
 
             if not math.isfinite(val_loss):
                 diverged, diverge_reason = True, "nonfinite_eval_loss"
@@ -561,6 +725,7 @@ def train(args):
             mem_text = cuda_memory_text(device)
             opt_text = step_stats_text(opt_stats)
             rms_text = rms_state_text(weight_rms)
+            derf_text = derf_state_text(derf_stats)
             logit_text = (
                 " | logits "
                 f"std={logit_stats['logit_std']:.3f},"
@@ -570,11 +735,12 @@ def train(args):
                 else ""
             )
             print(
-                f"step {step:5d} | lr {lr:.6f} beta {beta:.6f} | "
+                f"step {step:5d} | lr {lr:.6f} beta {beta:.6f} "
+                f"derf_lr {derf_lr:.6f} | "
                 f"train {train_loss:.4f} | val {val_loss:.4f} | "
                 f"best_val {best_val:.4f} | train_seconds {elapsed:.3f} | "
                 f"tok/s {(total_opt_steps * effective_tokens) / elapsed:.0f}"
-                f"{mem_text}{logit_text}{rms_text}{opt_text}"
+                f"{mem_text}{logit_text}{rms_text}{derf_text}{opt_text}"
             )
             memory = cuda_memory_stats(device)
             metrics.write(
@@ -582,6 +748,7 @@ def train(args):
                 step=step,
                 total_opt_steps=total_opt_steps,
                 lr=lr,
+                derf_lr=derf_lr,
                 beta=beta,
                 lrs=current_lrs,
                 train_loss=train_loss,
@@ -593,6 +760,7 @@ def train(args):
                 cuda_memory=memory,
                 logit_stats=logit_stats,
                 weight_rms=weight_rms,
+                derf=derf_stats,
                 step_stats=opt_stats,
             )
             if (
@@ -614,6 +782,8 @@ def train(args):
         line_rng_before = None
         line_loss_before = None
         opt.zero_grad(set_to_none=True)
+        if derf_opts:
+            zero_derf_optimizers(derf_opts, set_to_none=True)
         if conv_probe is not None:
             conv_probe.start_step(step)
         train_loss = None
@@ -657,6 +827,8 @@ def train(args):
             capture_step_stats(opt) if args.track_step_stats or line_active else None
         )
         opt.step()
+        if derf_opts:
+            step_derf_optimizers(derf_opts)
         line_stats = {}
         if stat_snapshot is not None:
             if args.track_step_stats:
@@ -848,6 +1020,36 @@ def make_parser():
     p.add_argument("--d-model", type=int, default=384)
     p.add_argument("--rope-base", type=float, default=10000.0)
     p.add_argument("--dropout", type=float, default=0.15)
+    p.add_argument(
+        "--norm-type",
+        choices=["rmsnorm", "derf"],
+        default="rmsnorm",
+        help="activation transform used at pre-attn, pre-MLP, and final norm sites",
+    )
+    p.add_argument(
+        "--derf-alpha",
+        type=float,
+        default=0.5,
+        help="Derf input scale alpha initialization",
+    )
+    p.add_argument(
+        "--derf-shift",
+        type=float,
+        default=0.0,
+        help="Derf horizontal shift initialization",
+    )
+    p.add_argument(
+        "--derf-lr",
+        type=float,
+        default=0.001,
+        help="peak normalized-SGD learning rate for Derf shape and affine groups",
+    )
+    p.add_argument(
+        "--derf-state-half-life",
+        type=float,
+        default=DEFAULT_STATE_HALF_LIFE,
+        help="momentum half-life for Derf normalized-SGD updates",
+    )
     p.add_argument(
         "--tie-weights",
         action="store_true",

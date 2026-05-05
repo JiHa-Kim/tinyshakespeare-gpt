@@ -15,13 +15,35 @@ def rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
 
 
-class Norm(nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return rms_norm(x, self.eps)
+
+
+class Derf(nn.Module):
+    def __init__(self, d_model: int, alpha: float = 0.5, shift: float = 0.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(alpha)))
+        self.shift = nn.Parameter(torch.tensor(float(shift)))
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.gamma * torch.erf(self.alpha * x + self.shift) + self.beta
+
+
+def make_norm(
+    kind: str, d_model: int, derf_alpha: float = 0.5, derf_shift: float = 0.0
+) -> nn.Module:
+    if kind == "rmsnorm":
+        return RMSNorm()
+    if kind == "derf":
+        return Derf(d_model, derf_alpha, derf_shift)
+    raise ValueError(f"unsupported norm type: {kind}")
 
 
 def rotary_cache(seq_len: int, head_dim: int, base: float = 10000.0):
@@ -102,11 +124,14 @@ class Block(nn.Module):
         block_size: int,
         rope_base: float = 10000.0,
         dropout: float = 0.0,
+        norm_type: str = "rmsnorm",
+        derf_alpha: float = 0.5,
+        derf_shift: float = 0.0,
     ):
         super().__init__()
-        self.norm1 = Norm()
+        self.norm1 = make_norm(norm_type, d_model, derf_alpha, derf_shift)
         self.attn = CausalSelfAttention(d_model, n_head, block_size, rope_base, dropout)
-        self.norm2 = Norm()
+        self.norm2 = make_norm(norm_type, d_model, derf_alpha, derf_shift)
         self.mlp = MLP(d_model, hidden_dim, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -124,6 +149,9 @@ class GPTConfig:
     rope_base: float = 10000.0
     dropout: float = 0.0
     tie_weights: bool = False
+    norm_type: str = "rmsnorm"
+    derf_alpha: float = 0.5
+    derf_shift: float = 0.0
 
     @property
     def hidden_dim(self) -> int:
@@ -144,11 +172,16 @@ class GPT(nn.Module):
                     cfg.block_size,
                     cfg.rope_base,
                     cfg.dropout,
+                    cfg.norm_type,
+                    cfg.derf_alpha,
+                    cfg.derf_shift,
                 )
                 for _ in range(cfg.n_layer)
             ]
         )
-        self.norm_f = Norm()
+        self.norm_f = make_norm(
+            cfg.norm_type, cfg.d_model, cfg.derf_alpha, cfg.derf_shift
+        )
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if cfg.tie_weights:
             self.lm_head.weight = self.tok_emb.weight

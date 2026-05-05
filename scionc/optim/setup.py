@@ -109,7 +109,11 @@ def make_edge_ulmo(kind: str):
 
 def hidden_params(model: GPT) -> list[torch.Tensor]:
     skip = {id(model.tok_emb.weight), id(model.lm_head.weight)}
-    return [p for p in model.parameters() if p.requires_grad and id(p) not in skip]
+    return [
+        p
+        for p in model.parameters()
+        if p.requires_grad and p.ndim >= 2 and id(p) not in skip
+    ]
 
 
 def optimizer_group_specs(model: GPT, args, work_dtype: torch.dtype):
