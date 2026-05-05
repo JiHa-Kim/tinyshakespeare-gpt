@@ -1,10 +1,10 @@
 import math
 
 
-def direction_retention(
-    delta_tau: float, half_life: float, name: str = "direction_half_life"
+def retention_from_half_life(
+    delta_tau: float, half_life: float, name: str = "half_life"
 ) -> float:
-    """Compute q = 2^{-Δτ/h}, the per-update direction retention."""
+    """Compute a per-update EMA retention from a processed-token half-life."""
     if delta_tau <= 0.0:
         raise ValueError(f"invalid count increment: {delta_tau}")
     if half_life <= 0.0:
@@ -12,16 +12,6 @@ def direction_retention(
     if math.isinf(half_life):
         return 1.0
     return 2.0 ** (-delta_tau / half_life)
-
-
-def angular_step(q: float) -> float:
-    """Compute ε = √(1 − q²), the relative movement per update."""
-    return math.sqrt(max(0.0, 1.0 - q * q))
-
-
-def angular_angle(q: float) -> float:
-    """Compute θ = arccos(q), the angular step per update."""
-    return math.acos(min(q, 1.0))
 
 
 def resolve_schedule(
@@ -62,19 +52,15 @@ def schedule_at_step(
     return peak + (floor - peak) * progress
 
 
-def scheduled_angular_step_retention(
-    q_peak: float,
+def scheduled_learning_rate(
+    lr_peak: float,
     schedule_ratio: float,
 ) -> float:
-    """Apply a WSD schedule ratio to the spherical movement size.
-
-    The optimizer moves by eps = sqrt(1 - q^2) on the RMS sphere.  This
-    schedules eps directly, matching the old optimizer's eta schedule.
-    """
+    """Apply a WSD schedule ratio to the Euclidean pre-retraction step size."""
+    if lr_peak < 0.0:
+        raise ValueError(f"invalid peak learning rate: {lr_peak}")
     if schedule_ratio <= 0.0:
-        return 1.0
+        return 0.0
     if schedule_ratio >= 1.0:
-        return q_peak
-    eps_peak = angular_step(q_peak)
-    eps = schedule_ratio * eps_peak
-    return math.sqrt(max(0.0, 1.0 - eps * eps))
+        return lr_peak
+    return schedule_ratio * lr_peak

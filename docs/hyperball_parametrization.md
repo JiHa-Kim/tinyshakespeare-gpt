@@ -14,29 +14,19 @@ $$
 
 The radius is inherited from initialization and never changes.
 
-## Clocks
+## State Clock And Step Size
 
-A state half-life $h_\beta$ sets the momentum EMA retention. A separate
-weight-direction half-life $h_w$ sets the per-update spherical movement:
-
-$$
-\beta = 2^{-\Delta\tau / h_\beta},
-\qquad
-q = 2^{-\Delta\tau / h_w}.
-$$
-
-The induced angular step and relative movement of the weight are:
+A state half-life $h_\beta$ sets the momentum EMA retention:
 
 $$
-\theta = \arccos q,
-\qquad
-\varepsilon = \sqrt{1 - q^2}.
+\beta = 2^{-\Delta\tau / h_\beta}.
 $$
 
-The default weight-direction clocks are calibrated from the old optimizer's
-observed stable `update/param` RMS, not from its radial shrink retentions.
-For the default batch geometry, this gives peak relative RMS movements of
-about `embed=0.0368`, `hidden=0.0256`, and `out=0.0035`.
+The default `retract` update uses a group-specific learning rate $\eta$ as the
+Euclidean pre-retraction step size. The defaults are calibrated from the old
+optimizer's observed stable `update/param` RMS, not from radial shrink
+retentions. For the default batch geometry, this gives peak learning rates of about
+`embed=0.0368`, `hidden=0.0256`, and `out=0.0035`.
 
 ## Hyperball Update
 
@@ -44,7 +34,7 @@ Let $\hat W = W / R$ with $\|\hat W\|_{\mathrm{rms}} = 1$. The default update
 is the fixed-radius Hyperball RMSNorm retraction:
 
 $$
-\hat W' = \operatorname{rmsnorm}(\hat W + \varepsilon\,
+\hat W' = \operatorname{rmsnorm}(\hat W + \eta_t\,
     \operatorname{rmsnorm}(V)).
 $$
 
@@ -60,12 +50,12 @@ V_\perp = V - \langle V, \hat W \rangle_{\mathrm{rms}} \hat W.
 $$
 
 Large radial alignment between $V$ and $\hat W$ therefore reduces effective
-tangent movement even though the raw step is $\varepsilon$.
+tangent movement even though the raw step is $\eta_t$.
 
-## Slerp Ablation
+## Geodesic Slerp Ablation
 
-`--hyperball-update slerp` runs the older tangent-projected comparison. It
-normalizes:
+`--hyperball-update slerp` runs the tangent-projected geodesic comparison. It
+normalizes the tangent component of the atom:
 
 $$
 D = V - \langle V, \hat W \rangle_{\mathrm{rms}} \hat W,
@@ -73,42 +63,43 @@ D = V - \langle V, \hat W \rangle_{\mathrm{rms}} \hat W,
 U = D / \|D\|_{\mathrm{rms}},
 $$
 
-then updates:
+then applies the exponential map on the fixed-RMS sphere:
 
 $$
-\hat W' = q \hat W + \varepsilon U.
+\hat W' = \cos(\eta_t)\hat W + \sin(\eta_t)U.
 $$
 
-Radius preservation is automatic because $\| \hat W' \|_{\mathrm{rms}}^2 =
-q^2 + (1-q^2) = 1$ up to floating-point roundoff.
+Radius preservation is automatic because $\| \hat W' \|_{\mathrm{rms}} = 1$
+up to floating-point roundoff. In this ablation, $\eta_t$ is the angular step
+in radians.
 
 ## WSD Schedule
 
 The WSD warmup/stable/decay schedule produces a scalar $s_t \in [0, 1]$.
-This scales the spherical movement directly:
+This scales the learning rate directly:
 
 $$
-\varepsilon_t = s_t \varepsilon_{\mathrm{peak}}, \qquad
-q_t = \sqrt{1 - \varepsilon_t^2}.
+\eta_t = s_t \eta_{\mathrm{peak}}.
 $$
 
-At $s_t = 1$ (stable phase), $\varepsilon_t = \varepsilon_{\mathrm{peak}}$
-(full angular movement). At $s_t = 0$ (floor), $q_t = 1$ (no movement).
-State retention $\beta$ is not scheduled.
+At $s_t = 1$ (stable phase), $\eta_t = \eta_{\mathrm{peak}}$. At $s_t = 0$
+(floor), $\eta_t = 0$ (no movement). State retention $\beta$ is not scheduled.
 
 ## Transfer
 
-When batch size, block size, or gradient accumulation changes, keep both
-half-lives fixed in processed-token units and recompute $\beta$ and $q$ from
-the new count increment:
+When batch size, block size, or gradient accumulation changes, keep the state
+half-life fixed in processed-token units and recompute $\beta$ from the new
+count increment:
 
 $$
 \Delta\tau = \text{batch size} \cdot \text{block size} \cdot \text{grad accum},
 \qquad
-\beta = 2^{-\Delta\tau / h_\beta},
-\qquad
-q = 2^{-\Delta\tau / h_w}.
+\beta = 2^{-\Delta\tau / h_\beta}.
 $$
+
+The learning rate is an explicit optimizer-step coordinate. Change it directly
+when changing the batch geometry. Under `--hyperball-update slerp`, the same
+scheduled coordinate is interpreted as a geodesic angle in radians.
 
 ## CLI
 
@@ -116,11 +107,11 @@ Primary coordinates:
 
 - `--state-half-life`: global momentum-state half-life in processed tokens.
 - `--state-half-life-{embed,hidden,out}`: per-group state half-life overrides.
-- `--direction-half-life`: global weight-direction half-life in processed tokens.
-- `--direction-half-life-{embed,hidden,out}`: per-group overrides.
-- `--schedule-floor`: WSD schedule floor for the movement ratio (default 0).
+- `--lr`: global pre-retraction learning rate.
+- `--lr-{embed,hidden,out}`: per-group learning-rate overrides.
+- `--schedule-floor`: WSD schedule floor for the learning-rate ratio (default 0).
 - `--hyperball-update {retract,slerp}`: Hyperball RMSNorm retraction update or
-  normalized spherical-lerp comparison.
+  tangent-projected geodesic comparison.
 - `--target-rms-{embed,hidden,out}`: initialization RMS targets. Defaults are
   `embed=0.70`, `hidden=0.051`, `out=0.022`. After init, R is frozen.
 - `--warmup-iters`, `--decay-frac`, etc.: WSD schedule shape.

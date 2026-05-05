@@ -9,42 +9,45 @@ class Hyperball(Optimizer):
     Hyperball optimizer.
 
     Each controlled block lives on a fixed-radius RMS sphere.  The radius
-    R = ‖W₀‖_rms is frozen on the first optimizer step.  Direction retention
-    q sets the angular movement; state retention β sets momentum memory.
+    R = ‖W₀‖_rms is frozen on the first optimizer step.  The learning rate
+    sets the Euclidean pre-retraction movement; state retention β sets momentum
+    memory.
     The default update is the fixed-radius RMSNorm retraction:
 
-        Ŵ_{t+1} = rmsnorm(Ŵ_t + η rmsnorm(V_t))
+        Ŵ_{t+1} = rmsnorm(Ŵ_t + lr rmsnorm(V_t))
 
     under this codebase's convention that ULMOs return descent directions.
-    The `slerp` update instead projects the atom to the tangent space and
-    applies a normalized spherical lerp.
+    The `slerp` update projects the atom to the tangent space and applies the
+    sphere exponential map:
 
-    The legacy `slerp` ablation uses:
+        Ŵ_{t+1} = cos(lr) Ŵ_t + sin(lr) U_t
 
-        Ŵ_{t+1} = q Ŵ_t + √(1 − q²) U_t
-
-    where U_t is the unit RMS tangent descent direction obtained by projecting
-    the ULMO atom of the momentum state onto the tangent space of the sphere.
+    where lr is the angular step in radians and U_t is the unit RMS tangent
+    descent direction.
     """
 
     def __init__(
         self,
         params,
-        q: float = 0.99,
+        lr: float = 0.01,
         beta: float = 0.95,
         ulmo=None,
         update_rule: str = "retract",
     ):
-        if not (0.0 < q <= 1.0):
-            raise ValueError(f"invalid q: {q}")
+        if lr < 0.0:
+            raise ValueError(f"invalid lr: {lr}")
         if not (0.0 <= beta <= 1.0):
             raise ValueError(f"invalid beta: {beta}")
-        if update_rule not in {"slerp", "retract"}:
+        if update_rule not in {"retract", "slerp"}:
             raise ValueError(f"invalid update_rule: {update_rule}")
 
         super().__init__(
-            params, dict(q=q, beta=beta, ulmo=ulmo, update_rule=update_rule)
+            params, dict(lr=lr, beta=beta, ulmo=ulmo, update_rule=update_rule)
         )
+        for group in self.param_groups:
+            update = group.get("update_rule", update_rule)
+            if update not in {"retract", "slerp"}:
+                raise ValueError(f"invalid update_rule: {update}")
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -58,9 +61,8 @@ class Hyperball(Optimizer):
             if not entries:
                 continue
 
-            q = float(group["q"])
-            eps_move = math.sqrt(max(0.0, 1.0 - q * q))
-            if eps_move == 0.0:
+            lr = float(group["lr"])
+            if lr == 0.0:
                 continue
 
             update_rule = group.get("update_rule", "retract")
@@ -79,24 +81,23 @@ class Hyperball(Optimizer):
                     u_rms = (u.square().sum() / d).sqrt()
                     if float(u_rms) <= 0.0:
                         continue
-                    w_hat = w_hat + eps_move * (u / u_rms)
+                    w_hat = w_hat + lr * (u / u_rms)
                     w_hat_rms = (w_hat.square().sum() / d).sqrt()
                     w_hat = w_hat / w_hat_rms
                     p.data.copy_(R * w_hat)
                     continue
 
-                # Tangent projection: D = u − ⟨u, ŵ⟩_rms ŵ
                 inner_rms = (u * w_hat).sum() / d
-                D = u - inner_rms * w_hat
-                D_rms = (D.square().sum() / d).sqrt()
+                tangent = u - inner_rms * w_hat
+                tangent_rms = (tangent.square().sum() / d).sqrt()
+                if float(tangent_rms) <= 0.0:
+                    continue
 
-                if float(D_rms) > 0.0:
-                    U = D / D_rms
-                    w_hat = q * w_hat + eps_move * U
-                    # Numerical re-projection to the constraint manifold
-                    w_hat_rms = (w_hat.square().sum() / d).sqrt()
-                    w_hat = w_hat / w_hat_rms
-                    p.data.copy_(R * w_hat)
+                tangent_unit = tangent / tangent_rms
+                w_hat = math.cos(lr) * w_hat + math.sin(lr) * tangent_unit
+                w_hat_rms = (w_hat.square().sum() / d).sqrt()
+                w_hat = w_hat / w_hat_rms
+                p.data.copy_(R * w_hat)
 
         return loss
 

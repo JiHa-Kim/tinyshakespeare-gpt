@@ -389,7 +389,7 @@ class ConvergenceProbe:
         grad: torch.Tensor,
         previous: _PrevState,
         grad_dual: float,
-        q: float,
+        lr: float,
         spectral_dgrad: dict[int, float],
         streaming_dparam: dict[int, float],
         current_grad: torch.Tensor | None,
@@ -426,8 +426,8 @@ class ConvergenceProbe:
 
         l1hat = (dgrad / dparam) / grad_dual
         self._append(stats, "l1", l1hat)
-        self._append(stats, "eta_pred", self.action_scale / l1hat)
-        self._append(stats, "action_eff", q * l1hat)
+        self._append(stats, "lr_pred", self.action_scale / l1hat)
+        self._append(stats, "action_eff", lr * l1hat)
         return current_grad, current_param
 
     def _append_spec_ratio(
@@ -454,7 +454,7 @@ class ConvergenceProbe:
         item: ConvergenceItem,
         grad: torch.Tensor,
         previous: _PrevState,
-        current_qs: dict[str, float],
+        current_lrs: dict[str, float],
         streaming_dparam: dict[int, float],
         spectral_gdual: dict[int, float],
         spectral_dgrad: dict[int, float],
@@ -468,16 +468,16 @@ class ConvergenceProbe:
             current_grad = self._cpu_tensor(grad, current_grad)
             grad_dual = dual_norm(current_grad, item.ulmo, self.eps, item.param)
 
-        q = current_qs.get(item.group, float("nan"))
+        lr = current_lrs.get(item.group, float("nan"))
         self._append(stats, "gdual", grad_dual)
-        self._append(stats, "q", q)
+        self._append(stats, "lr", lr)
         current_grad, current_param = self._append_change_stats(
             stats,
             item,
             grad,
             previous,
             grad_dual,
-            q,
+            lr,
             spectral_dgrad,
             streaming_dparam,
             current_grad,
@@ -512,7 +512,7 @@ class ConvergenceProbe:
         current_param = self._cpu_tensor(item.param, current_param)
         self.prev[key] = (current_grad.clone(), current_param.clone())
 
-    def capture(self, step: int, current_qs: dict[str, float]) -> str:
+    def capture(self, step: int, current_lrs: dict[str, float]) -> str:
         report = self.active
         if not report and not self.keep_prev:
             self.summary = {}
@@ -544,7 +544,7 @@ class ConvergenceProbe:
                     item,
                     grad,
                     previous,
-                    current_qs,
+                    current_lrs,
                     streaming_dparam,
                     spectral_gdual,
                     spectral_dgrad,
@@ -563,23 +563,23 @@ class ConvergenceProbe:
         self.summary = {}
         for name, stats in grouped.items():
             group_summary: dict[str, float] = {}
-            q = median(stats.get("q", []))
-            group_summary["q"] = q
-            fields = [f"q={q:.6f}"]
+            lr = median(stats.get("lr", []))
+            group_summary["lr"] = lr
+            fields = [f"lr={lr:.6f}"]
             if stats.get("l1"):
                 l1 = median(stats["l1"])
                 action_eff = median(stats["action_eff"])
-                eta_pred = median(stats["eta_pred"])
+                lr_pred = median(stats["lr_pred"])
                 group_summary.update(
                     {
                         "l1": l1,
                         "action_eff": action_eff,
-                        "eta_pred": eta_pred,
+                        "lr_pred": lr_pred,
                     }
                 )
                 fields.append(f"L1={l1:.2e}")
                 fields.append(f"act={action_eff:.2f}")
-                fields.append(f"eta*={eta_pred:.2e}")
+                fields.append(f"lr*={lr_pred:.2e}")
             gdual = median(stats.get("gdual", []))
             group_summary["gdual"] = gdual
             fields.append(f"g*={gdual:.2e}")

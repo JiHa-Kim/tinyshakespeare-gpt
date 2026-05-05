@@ -9,14 +9,14 @@ from pathlib import Path
 import torch
 
 from scionc.compile_env import ensure_compile_env
-from scionc.optim.parametrization import angular_step, resolve_schedule
+from scionc.optim.parametrization import resolve_schedule
 from scionc.optim.setup import (
     DEFAULT_HYPERBALL_UPDATE,
-    DEFAULT_DIRECTION_HALF_LIFE,
+    DEFAULT_LEARNING_RATE,
     DEFAULT_STATE_HALF_LIFE,
     GROUP_NAMES,
     OPTIMIZER_NAME,
-    apply_scheduled_q,
+    apply_scheduled_lr,
     build_optimizer,
     count_increment,
     format_optimizer_schedule,
@@ -443,9 +443,8 @@ def train(args):
     warmup_steps, stable_steps, decay_steps = resolve_training_schedule(args)
     effective_tokens = count_increment(args)
     first_group = opt.param_groups[0]
-    q_peak = float(first_group.get("q_peak", first_group["q"]))
+    lr_peak = float(first_group.get("lr_peak", first_group["lr"]))
     beta = float(first_group.get("beta", math.nan))
-    direction_half_life = first_group.get("direction_half_life", math.nan)
     state_half_life = first_group.get("state_half_life", math.nan)
     io_weights = optimizer_io_label(raw_model)
 
@@ -454,7 +453,7 @@ def train(args):
         "schedule "
         f"warmup_steps={warmup_steps} stable_steps={stable_steps} decay_steps={decay_steps} "
         f"count_increment={effective_tokens} "
-        f"direction_half_life={direction_half_life:.3g} q_peak={q_peak:.6f} "
+        f"lr_peak={lr_peak:.6f} "
         f"state_half_life={state_half_life:.3g} beta={beta:.6f} "
         f"optimizer={OPTIMIZER_NAME} update={args.hyperball_update} dropout={args.dropout:.3f} "
         f"hidden_ulmo={args.hidden_ulmo} "
@@ -473,8 +472,7 @@ def train(args):
         },
         optimizer={
             "name": OPTIMIZER_NAME,
-            "direction_half_life": direction_half_life,
-            "q_peak": q_peak,
+            "lr_peak": lr_peak,
             "state_half_life": state_half_life,
             "beta": beta,
             "update_rule": args.hyperball_update,
@@ -507,7 +505,7 @@ def train(args):
     step_stat_accum = {}
 
     for step in range(args.max_iters):
-        current_qs = apply_scheduled_q(
+        current_lrs = apply_scheduled_lr(
             opt,
             step,
             args.max_iters,
@@ -515,8 +513,7 @@ def train(args):
             decay_steps,
             args.schedule_floor,
         )
-        q = current_qs.get("hidden", next(iter(current_qs.values())))
-        eps_move = angular_step(q)
+        lr = current_lrs.get("hidden", next(iter(current_lrs.values())))
 
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
             train_loss = float(last_train_loss)
@@ -573,7 +570,7 @@ def train(args):
                 else ""
             )
             print(
-                f"step {step:5d} | q {q:.6f} eps {eps_move:.6f} beta {beta:.6f} | "
+                f"step {step:5d} | lr {lr:.6f} beta {beta:.6f} | "
                 f"train {train_loss:.4f} | val {val_loss:.4f} | "
                 f"best_val {best_val:.4f} | train_seconds {elapsed:.3f} | "
                 f"tok/s {(total_opt_steps * effective_tokens) / elapsed:.0f}"
@@ -584,9 +581,9 @@ def train(args):
                 "eval",
                 step=step,
                 total_opt_steps=total_opt_steps,
-                q=q,
+                lr=lr,
                 beta=beta,
-                qs=current_qs,
+                lrs=current_lrs,
                 train_loss=train_loss,
                 val_loss=val_loss,
                 best_val=best_val,
@@ -641,14 +638,14 @@ def train(args):
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
         if conv_probe is not None:
-            conv_text = conv_probe.capture(step, current_qs)
+            conv_text = conv_probe.capture(step, current_lrs)
             if conv_text:
                 print(conv_text)
                 metrics.write(
                     "convergence",
                     step=step,
                     total_opt_steps=total_opt_steps,
-                    qs=current_qs,
+                    lrs=current_lrs,
                     groups=conv_probe.summary,
                 )
         line_params_before = (
@@ -873,16 +870,16 @@ def make_parser():
     p.add_argument("--decay-frac", type=float, default=0.15)
 
     p.add_argument(
-        "--direction-half-life",
+        "--lr",
         type=float,
-        default=DEFAULT_DIRECTION_HALF_LIFE,
+        default=DEFAULT_LEARNING_RATE,
         help=(
-            "weight-direction retention half-life in processed tokens; "
-            "default uses group-specific clocks"
+            "optimizer step size for all groups; retract uses it before "
+            "retraction, slerp uses it as an angular step"
         ),
     )
     for group in GROUP_NAMES:
-        p.add_argument(f"--direction-half-life-{group}", type=float, default=None)
+        p.add_argument(f"--lr-{group}", type=float, default=None)
     p.add_argument(
         "--state-half-life",
         type=float,
@@ -895,13 +892,13 @@ def make_parser():
         "--schedule-floor",
         type=float,
         default=0.0,
-        help="WSD schedule floor for the spherical movement ratio (0 = no movement at decay end)",
+        help="WSD schedule floor for the learning-rate ratio (0 = no movement at decay end)",
     )
     p.add_argument(
         "--hyperball-update",
         choices=["slerp", "retract"],
         default=DEFAULT_HYPERBALL_UPDATE,
-        help="fixed-radius update rule; retract is the Hyperball RMSNorm baseline",
+        help="fixed-radius update rule; slerp is the tangent geodesic variant",
     )
     p.add_argument(
         "--target-rms",
@@ -993,7 +990,7 @@ def make_parser():
     p.add_argument(
         "--track-line-probe",
         action="store_true",
-        help="estimate same-batch eta aggressiveness with one extra forward",
+        help="estimate same-batch learning-rate aggressiveness with one extra forward",
     )
     p.add_argument(
         "--line-probe-interval",
@@ -1017,7 +1014,7 @@ def make_parser():
         dest="convergence_action_scale",
         type=float,
         default=0.5,
-        help="target normalized action scale for L1-derived eta reports",
+        help="target normalized action scale for L1-derived learning-rate reports",
     )
     p.add_argument(
         "--convergence-probe",

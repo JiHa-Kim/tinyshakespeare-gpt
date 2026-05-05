@@ -4,11 +4,9 @@ import torch
 
 from scionc.models.gpt import GPT
 from scionc.optim.parametrization import (
-    angular_angle,
-    angular_step,
-    direction_retention,
+    retention_from_half_life,
     schedule_at_step,
-    scheduled_angular_step_retention,
+    scheduled_learning_rate,
 )
 from scionc.optim.scion import Hyperball
 from scionc.ulmos.core import ColNormULMO, GramNewtonSchulzULMO, RowNormULMO, SignULMO
@@ -27,16 +25,12 @@ DEFAULT_STATE_RETENTION = 0.95
 DEFAULT_STATE_HALF_LIFE = -DEFAULT_COUNT_INCREMENT / math.log2(
     DEFAULT_STATE_RETENTION
 )
-DEFAULT_DIRECTION_RETENTIONS = {
-    "embed": 0.99932288,
-    "hidden": 0.99967232,
-    "out": 0.999993875,
+DEFAULT_LEARNING_RATES = {
+    "embed": 0.036793769968644335,
+    "hidden": 0.025597902762094994,
+    "out": 0.003499994640607136,
 }
-DEFAULT_DIRECTION_HALF_LIVES = {
-    name: -DEFAULT_COUNT_INCREMENT / math.log2(retention)
-    for name, retention in DEFAULT_DIRECTION_RETENTIONS.items()
-}
-DEFAULT_DIRECTION_HALF_LIFE = None  # global override; None uses group defaults
+DEFAULT_LEARNING_RATE = None  # global override; None uses group defaults
 
 
 def resolve_hyperball_update(args) -> str:
@@ -61,15 +55,15 @@ def resolve_group_target_rms(args, group: str) -> float:
     return float(target)
 
 
-def resolve_group_direction_half_life(args, group: str) -> float:
-    half_life = getattr(args, f"direction_half_life_{group}", None)
-    if half_life is None:
-        half_life = getattr(args, "direction_half_life", None)
-    if half_life is None:
-        half_life = DEFAULT_DIRECTION_HALF_LIVES[group]
-    if half_life <= 0.0:
-        raise ValueError(f"invalid {group} direction half-life: {half_life}")
-    return float(half_life)
+def resolve_group_lr(args, group: str) -> float:
+    lr = getattr(args, f"lr_{group}", None)
+    if lr is None:
+        lr = getattr(args, "lr", None)
+    if lr is None:
+        lr = DEFAULT_LEARNING_RATES[group]
+    if lr < 0.0:
+        raise ValueError(f"invalid {group} learning rate: {lr}")
+    return float(lr)
 
 
 def resolve_group_state_half_life(args, group: str) -> float:
@@ -164,10 +158,9 @@ def build_optimizer(model: GPT, args, device: torch.device):
     for name, params, ulmo in optimizer_group_specs(model, args, work_dtype):
         if not params:
             continue
-        half_life = resolve_group_direction_half_life(args, name)
-        q = direction_retention(delta_tau, half_life, f"{name}_direction_half_life")
+        lr = resolve_group_lr(args, name)
         state_half_life = resolve_group_state_half_life(args, name)
-        beta = direction_retention(
+        beta = retention_from_half_life(
             delta_tau, state_half_life, f"{name}_state_half_life"
         )
         target_rms = resolve_group_target_rms(args, name)
@@ -176,11 +169,10 @@ def build_optimizer(model: GPT, args, device: torch.device):
                 "name": name,
                 "params": params,
                 "ulmo": ulmo,
-                "q": q,
-                "q_peak": q,
+                "lr": lr,
+                "lr_peak": lr,
                 "beta": beta,
                 "update_rule": update_rule,
-                "direction_half_life": half_life,
                 "state_half_life": state_half_life,
                 "target_rms": target_rms,
             }
@@ -188,11 +180,11 @@ def build_optimizer(model: GPT, args, device: torch.device):
 
     init_and_freeze_radii_(groups)
 
-    default_q = groups[0]["q"] if groups else 0.99
+    default_lr = groups[0]["lr"] if groups else 0.01
     default_beta = groups[0]["beta"] if groups else DEFAULT_STATE_RETENTION
     return Hyperball(
         groups,
-        q=default_q,
+        lr=default_lr,
         beta=default_beta,
         update_rule=update_rule,
     )
@@ -202,17 +194,13 @@ def format_optimizer_schedule(opt) -> str:
     parts = []
     for group in opt.param_groups:
         name = group.get("name", "group")
-        q = float(group["q_peak"])
-        eps = angular_step(q)
-        theta = angular_angle(q)
-        h = group.get("direction_half_life", float("nan"))
+        lr = float(group["lr_peak"])
         beta = float(group.get("beta", float("nan")))
         h_state = group.get("state_half_life", float("nan"))
         target_rms = group.get("target_rms", float("nan"))
         update_rule = group.get("update_rule", DEFAULT_HYPERBALL_UPDATE)
         parts.append(
-            f"{name}=(h_weight={h:.3g},q={q:.6f},eps={eps:.6f},"
-            f"theta={theta:.6f},h_state={h_state:.3g},beta={beta:.6f},"
+            f"{name}=(lr={lr:.6f},h_state={h_state:.3g},beta={beta:.6f},"
             f"init_rms={target_rms:g},update={update_rule})"
         )
     return ", ".join(parts)
@@ -244,7 +232,7 @@ def rms_state_text(state: dict[str, dict[str, float]]) -> str:
     return " | weight_rms " + "; ".join(parts)
 
 
-def apply_scheduled_q(
+def apply_scheduled_lr(
     opt,
     step: int,
     max_steps: int,
@@ -252,16 +240,10 @@ def apply_scheduled_q(
     decay_steps: int,
     schedule_floor: float = 0.0,
 ) -> dict[str, float]:
-    """Apply WSD schedule to the spherical movement of each group.
-
-    The schedule ratio s_t in [floor, 1] scales eps = sqrt(1 - q^2):
-        eps_t = s_t eps_peak
-
-    Returns the current q per group.
-    """
-    current_qs = {}
+    """Apply WSD schedule to each group's pre-retraction learning rate."""
+    current_lrs = {}
     for group in opt.param_groups:
-        q_peak = float(group["q_peak"])
+        lr_peak = float(group["lr_peak"])
         s_t = schedule_at_step(
             step,
             max_steps,
@@ -270,8 +252,8 @@ def apply_scheduled_q(
             warmup_steps,
             decay_steps,
         )
-        q = scheduled_angular_step_retention(q_peak, s_t)
-        group["q"] = q
+        lr = scheduled_learning_rate(lr_peak, s_t)
+        group["lr"] = lr
         group["schedule_ratio"] = s_t
-        current_qs[group.get("name", f"group{len(current_qs)}")] = q
-    return current_qs
+        current_lrs[group.get("name", f"group{len(current_lrs)}")] = lr
+    return current_lrs

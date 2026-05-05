@@ -11,9 +11,9 @@ A compact ScionC sandbox organized by category:
 ## Active Recipe: Hyperball
 
 Each controlled weight block lives on a fixed-radius RMS sphere.
-Initialization sets each block radius. Group-specific weight-direction
-half-lives set angular movement on the sphere. A separate state half-life
-sets momentum retention.
+Initialization sets each block radius. Group-specific learning rates set the
+Euclidean step taken before retraction. A separate state half-life sets
+momentum retention.
 
 One optimizer update advances the count by
 `batch_size * block_size * grad_accum` processed tokens. For one controlled
@@ -25,22 +25,19 @@ M \leftarrow \beta\,M + (1-\beta)\,G,
 V = \operatorname{ulmo}(M),
 \qquad
 \hat W' = \operatorname{rmsnorm}\!\left(
-  \hat W + \varepsilon\,\operatorname{rmsnorm}(V)
-\right),
-\qquad
-\varepsilon = \sqrt{1-q^2}.
+  \hat W + \eta_t\,\operatorname{rmsnorm}(V)
+\right).
 ```
 
 The sign is positive because local ULMOs return descent directions. This is
-the usual Hyperball `W <- RMSNorm(W - eta RMSNorm(V))` update when `V`
+the usual Hyperball `W <- RMSNorm(W - lr RMSNorm(V))` update when `V`
 denotes a gradient-like atom.
 
 The active coordinates are:
 
 - state half-life $h_\beta$ (processed tokens),
-- weight-direction half-life $h_w$ (processed tokens),
 - per-update state retention $\beta = 2^{-\Delta\tau/h_\beta}$,
-- per-update weight retention $q = 2^{-\Delta\tau/h_w}$,
+- scheduled pre-retraction learning rate $\eta_t$,
 - frozen block radius $R = \|W_0\|_{\mathrm{rms}}$.
 
 ## Defaults
@@ -53,14 +50,12 @@ The active coordinates are:
 - block size: 256
 - initialization RMS: embedding 0.70, hidden 0.051, output 0.022
 - state half-life: about 2.21e5 processed tokens
-- peak relative RMS movement: embedding about 3.68%, hidden about 2.56%,
+- peak pre-retraction learning rate: embedding about 3.68%, hidden about 2.56%,
   output about 0.35%
-- weight-direction half-lives: embedding about 1.68e7, hidden about 3.47e7,
-  output about 1.85e9 processed tokens
 - WSD schedule: 100 warmup steps, stable phase, 15% decay (floor=0);
-  the schedule scales the spherical movement `sqrt(1 - q^2)` directly
+  the schedule scales the learning rate directly
 - update rule: `retract` by default; `--hyperball-update slerp` runs the
-  tangent-projected spherical-lerp comparison
+  tangent-projected geodesic comparison
 
 ## Hidden ULMOs
 
