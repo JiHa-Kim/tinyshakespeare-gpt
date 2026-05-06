@@ -9,7 +9,7 @@ from scionh.models.deepnorm import calibrate_deepnorm_branches
 from scionh.models.gpt import BatchSource, GPT, apply_rope
 from scionh.optim.auxiliary import configure_derf_training
 from scionh.optim.setup import build_optimizer, resolve_hyperball_update
-from scionh.train_shakespeare import make_parser
+from scionh.training.cli import make_parser
 from scionh.training.runtime import (
     build_model,
     configure_runtime,
