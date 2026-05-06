@@ -16,12 +16,29 @@ def rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, eps: float = 1e-6):
+    def __init__(
+        self,
+        d_model: int | None = None,
+        eps: float = 1e-6,
+        affine: bool = False,
+    ):
         super().__init__()
         self.eps = eps
+        self.normalized_shape = (d_model,) if d_model is not None else None
+        if affine:
+            if d_model is None:
+                raise ValueError("affine RMSNorm requires d_model")
+            self.gamma = nn.Parameter(torch.ones(d_model))
+        else:
+            self.register_parameter("gamma", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return rms_norm(x, self.eps)
+        if self.normalized_shape is not None:
+            return F.rms_norm(x, self.normalized_shape, self.gamma, self.eps)
+        y = rms_norm(x, self.eps)
+        if self.gamma is None:
+            return y
+        return self.gamma * y
 
 
 class Derf(nn.Module):
@@ -37,10 +54,15 @@ class Derf(nn.Module):
 
 
 def make_norm(
-    kind: str, d_model: int, derf_alpha: float = 0.5, derf_shift: float = 0.0
+    kind: str,
+    d_model: int,
+    derf_alpha: float = 0.5,
+    derf_shift: float = 0.0,
 ) -> nn.Module:
     if kind == "rmsnorm":
-        return RMSNorm()
+        return RMSNorm(d_model)
+    if kind == "rmsnorm-affine":
+        return RMSNorm(d_model, affine=True)
     if kind == "derf":
         return Derf(d_model, derf_alpha, derf_shift)
     raise ValueError(f"unsupported norm type: {kind}")
@@ -184,11 +206,13 @@ class CausalSelfAttention(nn.Module):
         self.kv_cache = kv_cache
         self.kernel_attn_eps = 1e-6
         if kv_cache == "full":
-            self.q = nn.Linear(d_model, d_model, bias=False)
-            self.k = nn.Linear(d_model, d_model, bias=False)
-            self.v = nn.Linear(d_model, d_model, bias=False)
+            self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+            self.q = None
+            self.k = None
+            self.v = None
             self.lowrank_kv = None
         else:
+            self.qkv = None
             self.q = nn.Linear(d_model, d_model, bias=False)
             self.k = None
             self.v = None
@@ -250,13 +274,16 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seqlen, d_model = x.shape
-        q = self.q(x)
+        if self.qkv is not None:
+            q, k, v = self.qkv(x).split(d_model, dim=-1)
+        else:
+            if self.q is None:
+                raise RuntimeError("low-rank KV path called without q projection")
+            q = self.q(x)
         if self.lowrank_kv is not None:
             return self.dropout(self._forward_lowrank_kv(x, q))
-        if self.q is None or self.k is None or self.v is None:
-            raise RuntimeError("full KV path called without full k/v projections")
-        k = self.k(x)
-        v = self.v(x)
+        if self.qkv is None:
+            raise RuntimeError("full KV path called without fused qkv projection")
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_head, self.head_dim)
         v = v.view(bsz, seqlen, self.n_head, self.head_dim)
@@ -281,13 +308,13 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
-        self.gate = nn.Linear(d_model, hidden_dim, bias=False)
-        self.up = nn.Linear(d_model, hidden_dim, bias=False)
+        self.up_gate = nn.Linear(d_model, 2 * hidden_dim, bias=False)
         self.down = nn.Linear(hidden_dim, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden = F.silu(self.gate(x)) * self.up(x)
+        gate, up = self.up_gate(x).chunk(2, dim=-1)
+        hidden = F.silu(gate) * up
         return self.dropout(self.down(hidden))
 
 
@@ -307,9 +334,40 @@ class Block(nn.Module):
         kv_cache: str = "full",
         kv_key_rank: int = 3,
         kv_value_rank: int = 192,
+        resid_scale: float = 1.0,
+        block_type: str = "preln",
+        deepnorm_alpha: float = 1.0,
+        deepnorm_branch_scale: float = 1.0,
+        lns_scale: float = 1.0,
     ):
         super().__init__()
-        self.norm1 = make_norm(norm_type, d_model, derf_alpha, derf_shift)
+        if resid_scale < 0:
+            raise ValueError("resid_scale must be non-negative")
+        if block_type not in {"preln", "deepnorm"}:
+            raise ValueError(f"unsupported block type: {block_type}")
+        if block_type == "deepnorm" and deepnorm_alpha <= 0:
+            raise ValueError("deepnorm_alpha must be positive")
+        if deepnorm_branch_scale <= 0:
+            raise ValueError("deepnorm_branch_scale must be positive")
+        if lns_scale <= 0:
+            raise ValueError("lns_scale must be positive")
+        self.resid_scale = resid_scale
+        self.block_type = block_type
+        self.deepnorm_alpha = deepnorm_alpha
+        self.lns_scale = lns_scale
+        self.register_buffer(
+            "deepnorm_attn_scale",
+            torch.tensor(float(deepnorm_branch_scale)),
+        )
+        self.register_buffer(
+            "deepnorm_mlp_scale",
+            torch.tensor(float(deepnorm_branch_scale)),
+        )
+        self.norm1 = (
+            None
+            if block_type == "deepnorm"
+            else make_norm(norm_type, d_model, derf_alpha, derf_shift)
+        )
         self.attn = CausalSelfAttention(
             d_model,
             n_head,
@@ -321,12 +379,48 @@ class Block(nn.Module):
             kv_key_rank,
             kv_value_rank,
         )
-        self.norm2 = make_norm(norm_type, d_model, derf_alpha, derf_shift)
+        self.norm2 = (
+            None
+            if block_type == "deepnorm"
+            else make_norm(norm_type, d_model, derf_alpha, derf_shift)
+        )
         self.mlp = MLP(d_model, hidden_dim, dropout)
+        self.post_attn_norm = (
+            make_norm(norm_type, d_model, derf_alpha, derf_shift)
+            if block_type == "deepnorm"
+            else None
+        )
+        self.post_mlp_norm = (
+            make_norm(norm_type, d_model, derf_alpha, derf_shift)
+            if block_type == "deepnorm"
+            else None
+        )
+
+    @torch.no_grad()
+    def set_deepnorm_branch_scales(
+        self, attn_scale: float, mlp_scale: float
+    ) -> None:
+        if attn_scale <= 0.0 or mlp_scale <= 0.0:
+            raise ValueError("DeepNorm branch scales must be positive")
+        self.deepnorm_attn_scale.fill_(float(attn_scale))
+        self.deepnorm_mlp_scale.fill_(float(mlp_scale))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
-        return x + self.mlp(self.norm2(x))
+        if self.block_type == "preln":
+            if self.norm1 is None or self.norm2 is None:
+                raise RuntimeError("Pre-LN norms are missing")
+            x = x + self.resid_scale * self.attn(self.lns_scale * self.norm1(x))
+            return x + self.resid_scale * self.mlp(self.lns_scale * self.norm2(x))
+
+        if self.block_type == "deepnorm":
+            if self.post_attn_norm is None or self.post_mlp_norm is None:
+                raise RuntimeError("DeepNorm post-norms are missing")
+            x = self.post_attn_norm(
+                self.deepnorm_alpha * x + self.deepnorm_attn_scale * self.attn(x)
+            )
+            return self.post_mlp_norm(
+                self.deepnorm_alpha * x + self.deepnorm_mlp_scale * self.mlp(x)
+            )
 
 
 @dataclass
@@ -346,10 +440,21 @@ class GPTConfig:
     kv_cache: str = "full"
     kv_key_rank: int = 3
     kv_value_rank: int = 192
+    resid_scale: float = 1.0
+    block_type: str = "preln"
+    deepnorm_alpha: float = 0.0
+    deepnorm_branch_scale: float = 1.0
+    lns: bool = False
 
     @property
     def hidden_dim(self) -> int:
         return 64 * math.ceil(((8 * self.d_model) // 3) / 64)
+
+    @property
+    def resolved_deepnorm_alpha(self) -> float:
+        if self.deepnorm_alpha > 0.0:
+            return self.deepnorm_alpha
+        return (2.0 * self.n_layer) ** 0.25
 
 
 class GPT(nn.Module):
@@ -357,6 +462,7 @@ class GPT(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        deepnorm_alpha = cfg.resolved_deepnorm_alpha
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -373,8 +479,13 @@ class GPT(nn.Module):
                     cfg.kv_cache,
                     cfg.kv_key_rank,
                     cfg.kv_value_rank,
+                    cfg.resid_scale,
+                    cfg.block_type,
+                    deepnorm_alpha,
+                    cfg.deepnorm_branch_scale,
+                    1.0 / math.sqrt(i + 1) if cfg.lns else 1.0,
                 )
-                for _ in range(cfg.n_layer)
+                for i in range(cfg.n_layer)
             ]
         )
         self.norm_f = make_norm(

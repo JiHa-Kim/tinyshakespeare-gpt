@@ -63,9 +63,14 @@ def load_or_init_model(args, dataset: CharDataset, device: torch.device) -> GPT:
 
 
 def qkv_from_attention(attn, x: torch.Tensor):
-    q = attn.q(x)
-    k = attn.k(x)
-    v = attn.v(x)
+    if attn.qkv is not None:
+        q, k, v = attn.qkv(x).split(x.size(-1), dim=-1)
+    elif attn.q is not None and attn.k is not None and attn.v is not None:
+        q = attn.q(x)
+        k = attn.k(x)
+        v = attn.v(x)
+    else:
+        raise RuntimeError("KV cache probe requires full QKV projections")
     bsz, seqlen, _ = q.shape
     q = q.view(bsz, seqlen, attn.n_head, attn.head_dim)
     k = k.view(bsz, seqlen, attn.n_head, attn.head_dim)

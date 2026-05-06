@@ -48,6 +48,8 @@ def resolve_group_target_rms(args, group: str) -> float:
     target = getattr(args, f"target_rms_{group}", None)
     if target is None:
         target = getattr(args, "target_rms", None)
+    if target is None and group == "out" and args.out_rms_rule == "fan-in":
+        target = 1.0 / math.sqrt(args.d_model)
     if target is None:
         target = DEFAULT_TARGET_RMS[group]
     if target <= 0.0:

@@ -58,9 +58,14 @@ def qkv_for_layer(model: GPT, idx: torch.Tensor, layer: int):
     attn = block.attn
     x = layer_input(model, idx, layer)
     x = block.norm1(x)
-    q = attn.q(x)
-    k = attn.k(x)
-    v = attn.v(x)
+    if attn.qkv is not None:
+        q, k, v = attn.qkv(x).split(x.size(-1), dim=-1)
+    elif attn.q is not None and attn.k is not None and attn.v is not None:
+        q = attn.q(x)
+        k = attn.k(x)
+        v = attn.v(x)
+    else:
+        raise RuntimeError("KV spectrum probe requires full QKV projections")
     bsz, seqlen, d_model = q.shape
     q = q.view(bsz, seqlen, attn.n_head, attn.head_dim)
     k = k.view(bsz, seqlen, attn.n_head, attn.head_dim)

@@ -36,6 +36,7 @@ from scionc.models.gpt import (
     BatchSource,
     CharDataset,
     GPTConfig,
+    RMSNorm,
     maybe_download_tiny_shakespeare,
 )
 from scionc.probes.convergence import ConvergenceProbe
@@ -434,8 +435,103 @@ def build_model(args, dataset: CharDataset, device: torch.device) -> GPT:
         kv_cache=args.kv_cache,
         kv_key_rank=args.kv_key_rank,
         kv_value_rank=args.kv_value_rank,
+        resid_scale=args.resid_scale,
+        block_type=args.block_type,
+        deepnorm_alpha=args.deepnorm_alpha,
+        deepnorm_branch_scale=args.deepnorm_branch_scale,
+        lns=args.lns,
     )
     return GPT(cfg).to(device)
+
+
+def _rms_float(x: torch.Tensor) -> float:
+    return float(x.detach().float().square().mean().sqrt())
+
+
+@torch.no_grad()
+def calibrate_deepnorm_branches(
+    model: GPT, idx: torch.Tensor, eps: float = 1e-12
+) -> dict[str, float]:
+    if model.cfg.block_type != "deepnorm":
+        return {}
+
+    target_delta = 1.0 / math.sqrt(2.0 * model.cfg.n_layer)
+    was_training = model.training
+    model.eval()
+    attn_scales = []
+    mlp_scales = []
+    attn_ratios_before = []
+    mlp_ratios_before = []
+    attn_ratios_after = []
+    mlp_ratios_after = []
+    try:
+        x = model.tok_emb(idx)
+        for block in model.blocks:
+            if block.block_type != "deepnorm":
+                x = block(x)
+                continue
+            if block.post_attn_norm is None or block.post_mlp_norm is None:
+                raise RuntimeError("DeepNorm post-norms are missing")
+
+            alpha = float(block.deepnorm_alpha)
+            attn_out = block.attn(x)
+            attn_den = max(alpha * _rms_float(x), eps)
+            attn_raw = _rms_float(attn_out)
+            attn_ratio = attn_raw / attn_den
+            attn_scale = target_delta / max(attn_ratio, eps)
+            block.deepnorm_attn_scale.fill_(attn_scale)
+            x = block.post_attn_norm(alpha * x + attn_scale * attn_out)
+
+            mlp_out = block.mlp(x)
+            mlp_den = max(alpha * _rms_float(x), eps)
+            mlp_raw = _rms_float(mlp_out)
+            mlp_ratio = mlp_raw / mlp_den
+            mlp_scale = target_delta / max(mlp_ratio, eps)
+            block.deepnorm_mlp_scale.fill_(mlp_scale)
+            x = block.post_mlp_norm(alpha * x + mlp_scale * mlp_out)
+
+            attn_scales.append(attn_scale)
+            mlp_scales.append(mlp_scale)
+            attn_ratios_before.append(attn_ratio)
+            mlp_ratios_before.append(mlp_ratio)
+            attn_ratios_after.append(attn_ratio * attn_scale)
+            mlp_ratios_after.append(mlp_ratio * mlp_scale)
+    finally:
+        model.train(was_training)
+
+    def stats(values: list[float], prefix: str) -> dict[str, float]:
+        if not values:
+            return {}
+        return {
+            f"{prefix}_mean": sum(values) / len(values),
+            f"{prefix}_min": min(values),
+            f"{prefix}_max": max(values),
+        }
+
+    return {
+        "target_delta": target_delta,
+        **stats(attn_scales, "attn_scale"),
+        **stats(mlp_scales, "mlp_scale"),
+        **stats(attn_ratios_before, "attn_ratio_before"),
+        **stats(mlp_ratios_before, "mlp_ratio_before"),
+        **stats(attn_ratios_after, "attn_ratio_after"),
+        **stats(mlp_ratios_after, "mlp_ratio_after"),
+    }
+
+
+def deepnorm_calibration_text(stats: dict[str, float]) -> str:
+    if not stats:
+        return ""
+    return (
+        "deepnorm_calibration "
+        f"target_delta={stats['target_delta']:.6g} "
+        f"attn_scale={stats['attn_scale_mean']:.4g}"
+        f"[{stats['attn_scale_min']:.4g},{stats['attn_scale_max']:.4g}] "
+        f"mlp_scale={stats['mlp_scale_mean']:.4g}"
+        f"[{stats['mlp_scale_min']:.4g},{stats['mlp_scale_max']:.4g}] "
+        f"attn_ratio_before={stats['attn_ratio_before_mean']:.4g} "
+        f"mlp_ratio_before={stats['mlp_ratio_before_mean']:.4g}"
+    )
 
 
 def configure_derf_training(model: GPT, args) -> None:
@@ -457,6 +553,8 @@ def derf_parameter_groups(model: GPT) -> dict[str, list[torch.Tensor]]:
             groups["affine"].extend(
                 p for p in (module.gamma, module.beta) if p.requires_grad
             )
+        elif isinstance(module, RMSNorm) and module.gamma is not None:
+            groups["affine"].append(module.gamma)
     return groups
 
 
@@ -616,6 +714,55 @@ def derf_state_text(state: dict[str, float]) -> str:
     )
 
 
+@torch.no_grad()
+def rmsnorm_affine_state(model: GPT) -> dict[str, float]:
+    values = []
+    final_values = []
+    block_values = []
+    for name, module in model.named_modules():
+        if not isinstance(module, RMSNorm) or module.gamma is None:
+            continue
+        gamma = module.gamma.detach().float().flatten()
+        values.append(gamma)
+        if name == "norm_f":
+            final_values.append(gamma)
+        else:
+            block_values.append(gamma)
+    if not values:
+        return {}
+
+    def tensor_stats(prefix: str, parts: list[torch.Tensor]) -> dict[str, float]:
+        if not parts:
+            return {}
+        x = torch.cat(parts)
+        return {
+            f"{prefix}_mean": float(x.mean()),
+            f"{prefix}_rms": float(x.square().mean().sqrt()),
+            f"{prefix}_min": float(x.min()),
+            f"{prefix}_max": float(x.max()),
+        }
+
+    return {
+        **tensor_stats("gamma", values),
+        **tensor_stats("block_gamma", block_values),
+        **tensor_stats("final_gamma", final_values),
+    }
+
+
+def rmsnorm_affine_state_text(state: dict[str, float]) -> str:
+    if not state:
+        return ""
+    final = ""
+    if "final_gamma_rms" in state:
+        final = f",final_rms={state['final_gamma_rms']:.3g}"
+    return (
+        " | norm_affine "
+        f"g_mean={state['gamma_mean']:.3g},g_rms={state['gamma_rms']:.3g},"
+        f"g=[{state['gamma_min']:.3g},{state['gamma_max']:.3g}]"
+        f"{final}"
+    )
+
+
 def resolve_training_schedule(args) -> tuple[int, int, int]:
     warmup_steps = (
         args.warmup_iters
@@ -717,6 +864,13 @@ def train(args):
     )
     eval_batches = fixed_eval_batches(args, source)
     opt = build_optimizer(raw_model, args, device)
+    deepnorm_calibration = {}
+    if args.deepnorm_calibrate_branches:
+        idx, _targets = source.seeded_batch("train", resolve_data_seed(args))
+        deepnorm_calibration = calibrate_deepnorm_branches(raw_model, idx)
+        text = deepnorm_calibration_text(deepnorm_calibration)
+        if text:
+            print(text)
     derf_opts = build_derf_optimizers(raw_model, args)
     kv_decoder_opt = build_kv_decoder_optimizer(raw_model, args)
     conv_probe = (
@@ -742,6 +896,7 @@ def train(args):
     io_weights = optimizer_io_label(raw_model)
     params_info = parameter_summary(raw_model)
     kv_info = kv_cache_summary(raw_model)
+    deepnorm_alpha = raw_model.cfg.resolved_deepnorm_alpha
 
     group_text = format_optimizer_schedule(opt)
     print(
@@ -760,12 +915,18 @@ def train(args):
         f"kv_decoder_beta={kv_decoder_beta:.6f} "
         f"params={params_info['total']} trainable_params={params_info['trainable']} "
         f"dropout={args.dropout:.3f} "
+        f"resid_scale={args.resid_scale:.6f} "
+        f"block_type={args.block_type} "
+        f"deepnorm_alpha={deepnorm_alpha:.6g} "
+        f"deepnorm_branch_scale={args.deepnorm_branch_scale:.6g} "
+        f"deepnorm_calibrate={args.deepnorm_calibrate_branches} "
+        f"lns={args.lns} "
         f"attn={args.attn_type} "
         f"seed={args.seed} data_seed={resolve_data_seed(args)} "
         f"eval_seed={resolve_eval_seed(args)} fixed_eval={args.fixed_eval_batches} "
         f"hidden_ulmo={args.hidden_ulmo} "
         f"io_weights={io_weights} embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
-        f"qkv=split spi_iteration={args.spi_iteration} "
+        f"qkv=fused spi_iteration={args.spi_iteration} "
         f"groups={group_text}"
     )
     metrics.write(
@@ -799,6 +960,13 @@ def train(args):
         model={
             "params": params_info,
             "dropout": args.dropout,
+            "resid_scale": args.resid_scale,
+            "block_type": args.block_type,
+            "deepnorm_alpha": deepnorm_alpha,
+            "deepnorm_branch_scale": args.deepnorm_branch_scale,
+            "deepnorm_calibrate_branches": args.deepnorm_calibrate_branches,
+            "deepnorm_calibration": deepnorm_calibration,
+            "lns": args.lns,
             "norm_type": args.norm_type,
             "derf_alpha": args.derf_alpha,
             "derf_shift": args.derf_shift,
@@ -809,7 +977,7 @@ def train(args):
             "io_weights": io_weights,
             "embed_ulmo": args.embed_ulmo,
             "out_ulmo": args.out_ulmo,
-            "qkv": "split",
+            "qkv": "fused",
             "spi_iteration": args.spi_iteration,
         },
     )
@@ -827,6 +995,7 @@ def train(args):
     diverged = False
     diverge_reason = ""
     train_start = sync_now(device)
+    eval_seconds = 0.0
     step_stat_accum = {}
 
     for step in range(args.max_iters):
@@ -864,6 +1033,7 @@ def train(args):
             kv_decoder_opt.lr = kv_decoder_lr
 
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
+            eval_start = sync_now(device)
             train_loss = float(last_train_loss)
             val_loss, logit_stats = estimate_val_metrics(
                 model,
@@ -879,6 +1049,7 @@ def train(args):
             )
             weight_rms = optimizer_rms_state(opt)
             derf_stats = derf_state(raw_model)
+            norm_affine_stats = rmsnorm_affine_state(raw_model)
             kv_decoder_stats = kv_decoder_state(raw_model)
 
             if not math.isfinite(val_loss):
@@ -908,11 +1079,16 @@ def train(args):
                             dataset,
                         )
 
-            elapsed = max(sync_now(device) - train_start, 1e-9)
+            now = sync_now(device)
+            eval_seconds += now - eval_start
+            elapsed = max(now - train_start, 1e-9)
+            train_elapsed = max(elapsed - eval_seconds, 1e-9)
+            total_tokens = total_opt_steps * effective_tokens
             mem_text = cuda_memory_text(device)
             opt_text = step_stats_text(opt_stats)
             rms_text = rms_state_text(weight_rms)
             derf_text = derf_state_text(derf_stats)
+            norm_affine_text = rmsnorm_affine_state_text(norm_affine_stats)
             kv_decoder_text = kv_decoder_state_text(kv_decoder_stats)
             logit_text = (
                 " | logits "
@@ -927,8 +1103,9 @@ def train(args):
                 f"derf_lr {derf_lr:.6f} kv_decoder_lr {kv_decoder_lr:.6f} | "
                 f"train {train_loss:.4f} | val {val_loss:.4f} | "
                 f"best_val {best_val:.4f} | train_seconds {elapsed:.3f} | "
-                f"tok/s {(total_opt_steps * effective_tokens) / elapsed:.0f}"
-                f"{mem_text}{logit_text}{rms_text}{derf_text}"
+                f"tok/s {total_tokens / elapsed:.0f} "
+                f"train_tok/s {total_tokens / train_elapsed:.0f}"
+                f"{mem_text}{logit_text}{rms_text}{derf_text}{norm_affine_text}"
                 f"{kv_decoder_text}{opt_text}"
             )
             memory = cuda_memory_stats(device)
@@ -946,11 +1123,15 @@ def train(args):
                 best_val=best_val,
                 max_val=max_val,
                 train_seconds=elapsed,
-                tokens_per_second=(total_opt_steps * effective_tokens) / elapsed,
+                train_compute_seconds=train_elapsed,
+                eval_seconds=eval_seconds,
+                tokens_per_second=total_tokens / elapsed,
+                train_tokens_per_second=total_tokens / train_elapsed,
                 cuda_memory=memory,
                 logit_stats=logit_stats,
                 weight_rms=weight_rms,
                 derf=derf_stats,
+                norm_affine=norm_affine_stats,
                 kv_decoder=kv_decoder_stats,
                 step_stats=opt_stats,
             )
@@ -1253,6 +1434,45 @@ def make_parser():
     p.add_argument("--d-model", type=int, default=384)
     p.add_argument("--rope-base", type=float, default=10000.0)
     p.add_argument(
+        "--resid-scale",
+        type=float,
+        default=1.0,
+        help="Pre-LN residual branch multiplier; DeepNorm uses its own residual alpha",
+    )
+    p.add_argument(
+        "--block-type",
+        choices=["preln", "deepnorm"],
+        default="preln",
+        help="Transformer block topology",
+    )
+    p.add_argument(
+        "--deepnorm-alpha",
+        type=float,
+        default=0.0,
+        help="DeepNorm residual multiplier; <=0 uses decoder-only default (2*n_layer)^(1/4)",
+    )
+    p.add_argument(
+        "--deepnorm-branch-scale",
+        type=float,
+        default=1.0,
+        help="fixed scalar multiplier on DeepNorm attention/MLP residual branches",
+    )
+    p.add_argument(
+        "--deepnorm-calibrate-branches",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "set fixed DeepNorm branch scales at init so branch/(alpha*x) "
+            "matches 1/sqrt(2*n_layer)"
+        ),
+    )
+    p.add_argument(
+        "--lns",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="apply LayerNorm Scaling in Pre-LN blocks by scaling norm outputs by 1/sqrt(layer)",
+    )
+    p.add_argument(
         "--kv-cache",
         choices=["full", "equivariant-lowrank"],
         default="full",
@@ -1288,7 +1508,7 @@ def make_parser():
     )
     p.add_argument(
         "--norm-type",
-        choices=["rmsnorm", "derf"],
+        choices=["rmsnorm", "rmsnorm-affine", "derf"],
         default="rmsnorm",
         help="activation transform used at pre-attn, pre-MLP, and final norm sites",
     )
@@ -1308,7 +1528,7 @@ def make_parser():
         "--derf-lr",
         type=float,
         default=0.001,
-        help="peak normalized-SGD learning rate for Derf shape and affine groups",
+        help="peak normalized-SGD learning rate for Derf shape and small norm affine groups",
     )
     p.add_argument(
         "--derf-state-half-life",
@@ -1386,6 +1606,15 @@ def make_parser():
     )
     for group in GROUP_NAMES:
         p.add_argument(f"--target-rms-{group}", type=float, default=None)
+    p.add_argument(
+        "--out-rms-rule",
+        choices=["fixed", "fan-in"],
+        default="fixed",
+        help=(
+            "default output-head radius when --target-rms-out is omitted; "
+            "fan-in uses 1/sqrt(d_model)"
+        ),
+    )
     p.add_argument(
         "--hidden-ulmo",
         choices=["streaming-svd", "gram-ns"],

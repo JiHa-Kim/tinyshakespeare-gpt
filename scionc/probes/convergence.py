@@ -231,12 +231,9 @@ class ConvergenceProbe:
         names = {"tok_emb.weight", "lm_head.weight"}
         block_ids = sorted({0, len(model.blocks) // 2, len(model.blocks) - 1})
         suffixes = (
-            "attn.q.weight",
-            "attn.k.weight",
-            "attn.v.weight",
+            "attn.qkv.weight",
             "attn.proj.weight",
-            "mlp.gate.weight",
-            "mlp.up.weight",
+            "mlp.up_gate.weight",
             "mlp.down.weight",
         )
         for block_id in block_ids:
