@@ -62,6 +62,98 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
 
 
+class EquivariantLowRankKV(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        n_head: int,
+        head_dim: int,
+        key_rank: int,
+        value_rank: int,
+    ):
+        super().__init__()
+        if head_dim % 2:
+            raise ValueError("head_dim must be even for RoPE-equivariant KV")
+        if key_rank <= 0:
+            raise ValueError(f"invalid KV key rank: {key_rank}")
+        if key_rank > n_head:
+            raise ValueError(
+                f"KV key rank {key_rank} cannot exceed n_head={n_head}"
+            )
+        if value_rank <= 0:
+            raise ValueError(f"invalid KV value rank: {value_rank}")
+        self.n_head = n_head
+        self.head_dim = head_dim
+        self.freq_count = head_dim // 2
+        self.key_rank = key_rank
+        self.value_rank = value_rank
+        self.k = nn.Linear(d_model, 2 * self.freq_count * key_rank, bias=False)
+        self.v = nn.Linear(d_model, value_rank, bias=False)
+        self.key_decoder = nn.Parameter(
+            torch.empty(self.freq_count, n_head, key_rank, 2)
+        )
+        self.value_decoder = nn.Parameter(torch.empty(n_head, value_rank, head_dim))
+        self.reset_parameters()
+
+    @property
+    def key_latent_dim(self) -> int:
+        return 2 * self.freq_count * self.key_rank
+
+    @property
+    def cache_dim(self) -> int:
+        return self.key_latent_dim + self.value_rank
+
+    @property
+    def original_cache_dim(self) -> int:
+        return 2 * self.n_head * self.head_dim
+
+    def decoder_parameters(self) -> tuple[nn.Parameter, nn.Parameter]:
+        return self.key_decoder, self.value_decoder
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.key_decoder, std=1.0 / math.sqrt(2 * self.key_rank))
+        nn.init.normal_(self.value_decoder, std=1.0 / math.sqrt(self.value_rank))
+
+    def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        bsz, seqlen, _ = x.shape
+        z_key = self.k(x).view(bsz, seqlen, self.freq_count, self.key_rank, 2)
+        z_value = self.v(x)
+        return z_key, z_value
+
+    def decode_keys(self, z_key: torch.Tensor) -> torch.Tensor:
+        basis = self.key_decoder.to(dtype=z_key.dtype)
+        bsz, seqlen = z_key.shape[:2]
+        z = z_key.permute(2, 0, 1, 3, 4).reshape(
+            self.freq_count, bsz * seqlen, 2 * self.key_rank
+        )
+        basis_real = basis[..., 0].permute(0, 2, 1)
+        basis_imag = basis[..., 1].permute(0, 2, 1)
+        row_real = torch.stack((basis_real, basis_imag), dim=-1)
+        row_imag = torch.stack((-basis_imag, basis_real), dim=-1)
+        decoder = torch.stack((row_real, row_imag), dim=2).reshape(
+            self.freq_count, 2 * self.key_rank, 2 * self.n_head
+        )
+        out = torch.bmm(z, decoder).reshape(
+            self.freq_count, bsz, seqlen, self.n_head, 2
+        )
+        return (
+            out.permute(1, 2, 3, 0, 4)
+            .contiguous()
+            .flatten(-2)
+        )
+
+    def decode_values(self, context: torch.Tensor) -> torch.Tensor:
+        decoder = self.value_decoder.to(dtype=context.dtype)
+        return torch.einsum("bhtr,hrd->bhtd", context, decoder)
+
+    def decode_value_tokens(self, z_value: torch.Tensor) -> torch.Tensor:
+        decoder = self.value_decoder.permute(0, 2, 1).reshape(
+            self.n_head * self.head_dim, self.value_rank
+        )
+        values = F.linear(z_value, decoder.to(dtype=z_value.dtype))
+        return values.view(z_value.size(0), z_value.size(1), self.n_head, self.head_dim)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -71,19 +163,38 @@ class CausalSelfAttention(nn.Module):
         rope_base: float = 10000.0,
         dropout: float = 0.0,
         attn_type: str = "softmax",
+        kv_cache: str = "full",
+        kv_key_rank: int = 3,
+        kv_value_rank: int = 192,
     ):
         super().__init__()
         if d_model % n_head:
             raise ValueError("d_model must be divisible by n_head")
         if attn_type not in {"softmax", "linear", "erf"}:
             raise ValueError(f"unsupported attention type: {attn_type}")
+        if kv_cache not in {"full", "equivariant-lowrank"}:
+            raise ValueError(f"unsupported KV cache type: {kv_cache}")
+        if kv_cache != "full" and attn_type != "softmax":
+            raise ValueError(
+                "equivariant low-rank KV cache currently expects softmax attention"
+            )
         self.n_head = n_head
         self.head_dim = d_model // n_head
         self.attn_type = attn_type
+        self.kv_cache = kv_cache
         self.kernel_attn_eps = 1e-6
-        self.q = nn.Linear(d_model, d_model, bias=False)
-        self.k = nn.Linear(d_model, d_model, bias=False)
-        self.v = nn.Linear(d_model, d_model, bias=False)
+        if kv_cache == "full":
+            self.q = nn.Linear(d_model, d_model, bias=False)
+            self.k = nn.Linear(d_model, d_model, bias=False)
+            self.v = nn.Linear(d_model, d_model, bias=False)
+            self.lowrank_kv = None
+        else:
+            self.q = nn.Linear(d_model, d_model, bias=False)
+            self.k = None
+            self.v = None
+            self.lowrank_kv = EquivariantLowRankKV(
+                d_model, n_head, self.head_dim, kv_key_rank, kv_value_rank
+            )
         self.proj = nn.Linear(d_model, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
         cos, sin = rotary_cache(block_size, self.head_dim, rope_base)
@@ -115,11 +226,40 @@ class CausalSelfAttention(nn.Module):
         weights = torch.erf(scores) + 1.0
         return self._normalized_kernel_attention(weights, v, dtype)
 
+    def _forward_lowrank_kv(self, x: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        if self.lowrank_kv is None:
+            raise RuntimeError("low-rank KV path called without a low-rank module")
+        bsz, seqlen, d_model = x.shape
+        z_key, z_value = self.lowrank_kv.encode(x)
+        k = self.lowrank_kv.decode_keys(z_key)
+        q = q.view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.transpose(1, 2)
+        cos = self.rope_cos[:seqlen].view(1, 1, seqlen, self.head_dim // 2)
+        sin = self.rope_sin[:seqlen].view(1, 1, seqlen, self.head_dim // 2)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+        # Equivalent to decoding after the weighted sum, but keeps SDPA's V
+        # dimension at head_dim for the dense training path.
+        v = self.lowrank_kv.decode_value_tokens(z_value).transpose(1, 2)
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, d_model)
+        return self.proj(y)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seqlen, d_model = x.shape
-        q = self.q(x).view(bsz, seqlen, self.n_head, self.head_dim)
-        k = self.k(x).view(bsz, seqlen, self.n_head, self.head_dim)
-        v = self.v(x).view(bsz, seqlen, self.n_head, self.head_dim)
+        q = self.q(x)
+        if self.lowrank_kv is not None:
+            return self.dropout(self._forward_lowrank_kv(x, q))
+        if self.q is None or self.k is None or self.v is None:
+            raise RuntimeError("full KV path called without full k/v projections")
+        k = self.k(x)
+        v = self.v(x)
+        q = q.view(bsz, seqlen, self.n_head, self.head_dim)
+        k = k.view(bsz, seqlen, self.n_head, self.head_dim)
+        v = v.view(bsz, seqlen, self.n_head, self.head_dim)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -147,7 +287,8 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.down(F.silu(self.gate(x)) * self.up(x)))
+        hidden = F.silu(self.gate(x)) * self.up(x)
+        return self.dropout(self.down(hidden))
 
 
 class Block(nn.Module):
@@ -163,11 +304,22 @@ class Block(nn.Module):
         derf_alpha: float = 0.5,
         derf_shift: float = 0.0,
         attn_type: str = "softmax",
+        kv_cache: str = "full",
+        kv_key_rank: int = 3,
+        kv_value_rank: int = 192,
     ):
         super().__init__()
         self.norm1 = make_norm(norm_type, d_model, derf_alpha, derf_shift)
         self.attn = CausalSelfAttention(
-            d_model, n_head, block_size, rope_base, dropout, attn_type
+            d_model,
+            n_head,
+            block_size,
+            rope_base,
+            dropout,
+            attn_type,
+            kv_cache,
+            kv_key_rank,
+            kv_value_rank,
         )
         self.norm2 = make_norm(norm_type, d_model, derf_alpha, derf_shift)
         self.mlp = MLP(d_model, hidden_dim, dropout)
@@ -191,6 +343,9 @@ class GPTConfig:
     derf_alpha: float = 0.5
     derf_shift: float = 0.0
     attn_type: str = "softmax"
+    kv_cache: str = "full"
+    kv_key_rank: int = 3
+    kv_value_rank: int = 192
 
     @property
     def hidden_dim(self) -> int:
@@ -215,6 +370,9 @@ class GPT(nn.Module):
                     cfg.derf_alpha,
                     cfg.derf_shift,
                     cfg.attn_type,
+                    cfg.kv_cache,
+                    cfg.kv_key_rank,
+                    cfg.kv_value_rank,
                 )
                 for _ in range(cfg.n_layer)
             ]
@@ -289,6 +447,8 @@ class BatchSource:
         block_size: int,
         batch_size: int,
         device: torch.device,
+        train_seed: int = 0,
+        val_seed: int = 1,
     ):
         self.block_size = block_size
         self.batch_size = batch_size
@@ -296,14 +456,40 @@ class BatchSource:
         self.train = train.to(device, non_blocking=True)
         self.val = val.to(device, non_blocking=True)
         self.offsets = torch.arange(block_size + 1, device=device)
+        self.train_generator = self.make_generator(device, train_seed)
+        self.val_generator = self.make_generator(device, val_seed)
 
-    def get(self, split: str):
+    @staticmethod
+    def make_generator(device: torch.device, seed: int) -> torch.Generator:
+        generator = (
+            torch.Generator(device=device)
+            if device.type == "cuda"
+            else torch.Generator()
+        )
+        generator.manual_seed(int(seed))
+        return generator
+
+    def get(self, split: str, generator: torch.Generator | None = None):
         data = self.train if split == "train" else self.val
+        if generator is None:
+            generator = self.train_generator if split == "train" else self.val_generator
         ix = torch.randint(
-            0, data.numel() - self.block_size, (self.batch_size, 1), device=self.device
+            0,
+            data.numel() - self.block_size,
+            (self.batch_size, 1),
+            device=self.device,
+            generator=generator,
         )
         chunk = data[ix + self.offsets]
         return chunk[:, :-1], chunk[:, 1:]
+
+    def seeded_batch(self, split: str, seed: int):
+        generator = self.make_generator(self.device, seed)
+        return self.get(split, generator)
+
+    def fixed_batches(self, split: str, batches: int, seed: int):
+        generator = self.make_generator(self.device, seed)
+        return tuple(self.get(split, generator) for _ in range(batches))
 
 
 def maybe_download_tiny_shakespeare(path: Path):

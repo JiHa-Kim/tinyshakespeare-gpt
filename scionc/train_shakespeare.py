@@ -31,6 +31,7 @@ from scionc.optim.setup import (
 )
 from scionc.models.gpt import (
     Derf,
+    EquivariantLowRankKV,
     GPT,
     BatchSource,
     CharDataset,
@@ -207,6 +208,8 @@ def estimate_loss(
     eval_iters: int,
     amp_dtype: torch.dtype | None,
     splits=("train", "val"),
+    fixed_batches: dict[str, tuple[tuple[torch.Tensor, torch.Tensor], ...]]
+    | None = None,
 ):
     was_training = model.training
     model.eval()
@@ -214,10 +217,13 @@ def estimate_loss(
     with amp_ctx(amp_dtype):
         for split in splits:
             total = 0.0
-            for _ in range(eval_iters):
-                _, loss = model(*source.get(split))
+            batches = fixed_batches.get(split) if fixed_batches else None
+            if batches is None:
+                batches = tuple(source.get(split) for _ in range(eval_iters))
+            for xb, yb in batches:
+                _, loss = model(xb, yb)
                 total += float(loss)
-            out[split] = total / eval_iters
+            out[split] = total / len(batches)
     model.train(was_training)
     return out
 
@@ -264,6 +270,7 @@ def estimate_val_metrics(
     eval_iters: int,
     amp_dtype: torch.dtype | None,
     collect_logit_stats: bool = False,
+    fixed_batches: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
 ) -> tuple[float, dict[str, float]]:
     was_training = model.training
     model.eval()
@@ -276,16 +283,18 @@ def estimate_val_metrics(
         "softmax_max_prob": 0.0,
         "target_prob": 0.0,
     }
+    batches = fixed_batches
+    if batches is None:
+        batches = tuple(source.get("val") for _ in range(eval_iters))
     with amp_ctx(amp_dtype):
-        for _ in range(eval_iters):
-            xb, yb = source.get("val")
+        for xb, yb in batches:
             logits, loss = model(xb, yb)
             total += float(loss)
             if collect_logit_stats:
                 update_logit_stats(logit_acc, logits, yb)
     model.train(was_training)
     stats = finalize_logit_stats(logit_acc) if collect_logit_stats else {}
-    return total / eval_iters, stats
+    return total / len(batches), stats
 
 
 def save_checkpoint(path: Path, model: GPT, dataset: CharDataset):
@@ -337,25 +346,57 @@ def maybe_compile(
         return model, 0.0
     ensure_compile_env()
     model = torch.compile(model)
-    xb, yb = source.get("train")
+    xb, yb = source.seeded_batch("train", resolve_compile_seed(args))
     t0 = sync_now(device)
     model.zero_grad(set_to_none=True)
     with amp_ctx(amp_dtype):
         _, loss = model(xb, yb)
     loss.backward()
     model.zero_grad(set_to_none=True)
+    was_training = model.training
+    model.eval()
+    with torch.no_grad(), amp_ctx(amp_dtype):
+        model(xb, yb)
+    model.train(was_training)
     return model, sync_now(device) - t0
+
+
+def resolve_data_seed(args) -> int:
+    return args.data_seed if args.data_seed is not None else args.seed
+
+
+def resolve_eval_seed(args) -> int:
+    return args.eval_seed if args.eval_seed is not None else args.seed + 1
+
+
+def resolve_compile_seed(args) -> int:
+    return args.compile_seed if args.compile_seed is not None else args.seed + 2
+
+
+def split_eval_seed(args, split: str) -> int:
+    offset = 0 if split == "val" else 1_000_003
+    return resolve_eval_seed(args) + offset
+
+
+def fixed_eval_batches(args, source: BatchSource):
+    if not args.fixed_eval_batches:
+        return None
+    return {
+        split: source.fixed_batches(split, args.eval_iters, split_eval_seed(args, split))
+        for split in ("train", "val")
+    }
 
 
 def configure_runtime(args) -> tuple[torch.device, torch.dtype | None]:
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+    torch.use_deterministic_algorithms(args.deterministic, warn_only=True)
     torch.set_float32_matmul_precision("high")
     if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = not args.deterministic
+        torch.backends.cudnn.allow_tf32 = not args.deterministic
+        torch.backends.cudnn.benchmark = not args.deterministic
 
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -390,6 +431,9 @@ def build_model(args, dataset: CharDataset, device: torch.device) -> GPT:
         derf_alpha=args.derf_alpha,
         derf_shift=args.derf_shift,
         attn_type=args.attn_type,
+        kv_cache=args.kv_cache,
+        kv_key_rank=args.kv_key_rank,
+        kv_value_rank=args.kv_value_rank,
     )
     return GPT(cfg).to(device)
 
@@ -441,6 +485,89 @@ def zero_derf_optimizers(
 def step_derf_optimizers(opts: dict[str, NormalizedSGD]) -> None:
     for opt in opts.values():
         opt.step()
+
+
+def kv_decoder_parameters(model: GPT) -> list[torch.Tensor]:
+    params = []
+    for module in model.modules():
+        if isinstance(module, EquivariantLowRankKV):
+            params.extend(p for p in module.decoder_parameters() if p.requires_grad)
+    return params
+
+
+def build_kv_decoder_optimizer(model: GPT, args) -> NormalizedSGD | None:
+    params = kv_decoder_parameters(model)
+    if not params:
+        return None
+    beta = retention_from_half_life(
+        count_increment(args), args.state_half_life, "kv_decoder_state_half_life"
+    )
+    return NormalizedSGD(params, args.kv_decoder_lr, beta)
+
+
+def kv_cache_summary(model: GPT) -> dict[str, float | int | str]:
+    modules = [m for m in model.modules() if isinstance(m, EquivariantLowRankKV)]
+    if not modules:
+        attn = model.blocks[0].attn
+        original = 2 * attn.n_head * attn.head_dim
+        return {
+            "type": "full",
+            "cache_dim": original,
+            "original_cache_dim": original,
+            "cache_ratio": 1.0,
+            "key_rank": attn.n_head,
+            "value_rank": attn.n_head * attn.head_dim,
+        }
+    module = modules[0]
+    return {
+        "type": "equivariant-lowrank",
+        "cache_dim": module.cache_dim,
+        "original_cache_dim": module.original_cache_dim,
+        "cache_ratio": module.cache_dim / module.original_cache_dim,
+        "key_rank": module.key_rank,
+        "value_rank": module.value_rank,
+    }
+
+
+def parameter_summary(model: GPT) -> dict[str, int]:
+    return {
+        "total": sum(p.numel() for p in model.parameters()),
+        "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
+    }
+
+
+@torch.no_grad()
+def kv_decoder_state(model: GPT) -> dict[str, float]:
+    key_values = []
+    value_values = []
+    for module in model.modules():
+        if isinstance(module, EquivariantLowRankKV):
+            key_values.append(module.key_decoder.detach().float().flatten())
+            value_values.append(module.value_decoder.detach().float().flatten())
+    if not key_values:
+        return {}
+    key = torch.cat(key_values)
+    value = torch.cat(value_values)
+    return {
+        "key_decoder_rms": float(key.square().mean().sqrt()),
+        "key_decoder_min": float(key.min()),
+        "key_decoder_max": float(key.max()),
+        "value_decoder_rms": float(value.square().mean().sqrt()),
+        "value_decoder_min": float(value.min()),
+        "value_decoder_max": float(value.max()),
+    }
+
+
+def kv_decoder_state_text(state: dict[str, float]) -> str:
+    if not state:
+        return ""
+    return (
+        " | kv_decoder "
+        f"k_rms={state['key_decoder_rms']:.3g},"
+        f"k=[{state['key_decoder_min']:.3g},{state['key_decoder_max']:.3g}],"
+        f"v_rms={state['value_decoder_rms']:.3g},"
+        f"v=[{state['value_decoder_min']:.3g},{state['value_decoder_max']:.3g}]"
+    )
 
 
 @torch.no_grad()
@@ -580,10 +707,18 @@ def train(args):
     raw_model = build_model(args, dataset, device)
     configure_derf_training(raw_model, args)
     source = BatchSource(
-        dataset.train, dataset.val, args.block_size, args.batch_size, device
+        dataset.train,
+        dataset.val,
+        args.block_size,
+        args.batch_size,
+        device,
+        train_seed=resolve_data_seed(args),
+        val_seed=resolve_eval_seed(args),
     )
+    eval_batches = fixed_eval_batches(args, source)
     opt = build_optimizer(raw_model, args, device)
     derf_opts = build_derf_optimizers(raw_model, args)
+    kv_decoder_opt = build_kv_decoder_optimizer(raw_model, args)
     conv_probe = (
         ConvergenceProbe(raw_model, opt, args) if args.track_convergence_stats else None
     )
@@ -602,8 +737,11 @@ def train(args):
     lr_peak = float(first_group.get("lr_peak", first_group["lr"]))
     beta = float(first_group.get("beta", math.nan))
     derf_beta = next(iter(derf_opts.values())).beta if derf_opts else math.nan
+    kv_decoder_beta = kv_decoder_opt.beta if kv_decoder_opt is not None else math.nan
     state_half_life = first_group.get("state_half_life", math.nan)
     io_weights = optimizer_io_label(raw_model)
+    params_info = parameter_summary(raw_model)
+    kv_info = kv_cache_summary(raw_model)
 
     group_text = format_optimizer_schedule(opt)
     print(
@@ -615,8 +753,16 @@ def train(args):
         f"optimizer={OPTIMIZER_NAME} update={args.hyperball_update} "
         f"norm={args.norm_type} derf_lr={args.derf_lr:.6f} "
         f"derf_beta={derf_beta:.6f} derf_shape={args.train_derf_shape} "
+        f"kv_cache={kv_info['type']} kv_dim={kv_info['cache_dim']}/"
+        f"{kv_info['original_cache_dim']} kv_ratio={kv_info['cache_ratio']:.3f} "
+        f"kv_key_rank={kv_info['key_rank']} kv_value_rank={kv_info['value_rank']} "
+        f"kv_decoder_lr={args.kv_decoder_lr:.6f} "
+        f"kv_decoder_beta={kv_decoder_beta:.6f} "
+        f"params={params_info['total']} trainable_params={params_info['trainable']} "
         f"dropout={args.dropout:.3f} "
         f"attn={args.attn_type} "
+        f"seed={args.seed} data_seed={resolve_data_seed(args)} "
+        f"eval_seed={resolve_eval_seed(args)} fixed_eval={args.fixed_eval_batches} "
         f"hidden_ulmo={args.hidden_ulmo} "
         f"io_weights={io_weights} embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
         f"qkv=split spi_iteration={args.spi_iteration} "
@@ -630,6 +776,11 @@ def train(args):
             "stable_steps": stable_steps,
             "decay_steps": decay_steps,
             "count_increment": effective_tokens,
+            "seed": args.seed,
+            "data_seed": resolve_data_seed(args),
+            "eval_seed": resolve_eval_seed(args),
+            "compile_seed": resolve_compile_seed(args),
+            "fixed_eval_batches": args.fixed_eval_batches,
         },
         optimizer={
             "name": OPTIMIZER_NAME,
@@ -640,16 +791,20 @@ def train(args):
             "derf_state_half_life": args.derf_state_half_life,
             "derf_beta": derf_beta,
             "derf_groups": list(derf_opts),
+            "kv_decoder_lr_peak": args.kv_decoder_lr,
+            "kv_decoder_beta": kv_decoder_beta,
             "update_rule": args.hyperball_update,
             "groups": group_text,
         },
         model={
+            "params": params_info,
             "dropout": args.dropout,
             "norm_type": args.norm_type,
             "derf_alpha": args.derf_alpha,
             "derf_shift": args.derf_shift,
             "train_derf_shape": args.train_derf_shape,
             "attn_type": args.attn_type,
+            "kv_cache": kv_info,
             "hidden_ulmo": args.hidden_ulmo,
             "io_weights": io_weights,
             "embed_ulmo": args.embed_ulmo,
@@ -696,6 +851,17 @@ def train(args):
             )
             for derf_group_opt in derf_opts.values():
                 derf_group_opt.lr = derf_lr
+        kv_decoder_lr = 0.0
+        if kv_decoder_opt is not None:
+            kv_decoder_lr = schedule_at_step(
+                step,
+                args.max_iters,
+                kv_decoder_opt.lr_peak,
+                args.schedule_floor * kv_decoder_opt.lr_peak,
+                warmup_steps,
+                decay_steps,
+            )
+            kv_decoder_opt.lr = kv_decoder_lr
 
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
             train_loss = float(last_train_loss)
@@ -705,6 +871,7 @@ def train(args):
                 args.eval_iters,
                 amp_dtype,
                 args.track_logit_stats,
+                eval_batches["val"] if eval_batches is not None else None,
             )
             last_val_loss = val_loss
             opt_stats = (
@@ -712,6 +879,7 @@ def train(args):
             )
             weight_rms = optimizer_rms_state(opt)
             derf_stats = derf_state(raw_model)
+            kv_decoder_stats = kv_decoder_state(raw_model)
 
             if not math.isfinite(val_loss):
                 diverged, diverge_reason = True, "nonfinite_eval_loss"
@@ -745,6 +913,7 @@ def train(args):
             opt_text = step_stats_text(opt_stats)
             rms_text = rms_state_text(weight_rms)
             derf_text = derf_state_text(derf_stats)
+            kv_decoder_text = kv_decoder_state_text(kv_decoder_stats)
             logit_text = (
                 " | logits "
                 f"std={logit_stats['logit_std']:.3f},"
@@ -755,11 +924,12 @@ def train(args):
             )
             print(
                 f"step {step:5d} | lr {lr:.6f} beta {beta:.6f} "
-                f"derf_lr {derf_lr:.6f} | "
+                f"derf_lr {derf_lr:.6f} kv_decoder_lr {kv_decoder_lr:.6f} | "
                 f"train {train_loss:.4f} | val {val_loss:.4f} | "
                 f"best_val {best_val:.4f} | train_seconds {elapsed:.3f} | "
                 f"tok/s {(total_opt_steps * effective_tokens) / elapsed:.0f}"
-                f"{mem_text}{logit_text}{rms_text}{derf_text}{opt_text}"
+                f"{mem_text}{logit_text}{rms_text}{derf_text}"
+                f"{kv_decoder_text}{opt_text}"
             )
             memory = cuda_memory_stats(device)
             metrics.write(
@@ -768,6 +938,7 @@ def train(args):
                 total_opt_steps=total_opt_steps,
                 lr=lr,
                 derf_lr=derf_lr,
+                kv_decoder_lr=kv_decoder_lr,
                 beta=beta,
                 lrs=current_lrs,
                 train_loss=train_loss,
@@ -780,6 +951,7 @@ def train(args):
                 logit_stats=logit_stats,
                 weight_rms=weight_rms,
                 derf=derf_stats,
+                kv_decoder=kv_decoder_stats,
                 step_stats=opt_stats,
             )
             if (
@@ -803,6 +975,8 @@ def train(args):
         opt.zero_grad(set_to_none=True)
         if derf_opts:
             zero_derf_optimizers(derf_opts, set_to_none=True)
+        if kv_decoder_opt is not None:
+            kv_decoder_opt.zero_grad(set_to_none=True)
         if conv_probe is not None:
             conv_probe.start_step(step)
         train_loss = None
@@ -848,6 +1022,8 @@ def train(args):
         opt.step()
         if derf_opts:
             step_derf_optimizers(derf_opts)
+        if kv_decoder_opt is not None:
+            kv_decoder_opt.step()
         line_stats = {}
         if stat_snapshot is not None:
             if args.track_step_stats:
@@ -1012,11 +1188,19 @@ def evaluate(args):
     dataset = CharDataset(data_path)
     model, _, _ = load_checkpoint(Path(args.out_path), device)
     source = BatchSource(
-        dataset.train, dataset.val, model.cfg.block_size, args.batch_size, device
+        dataset.train,
+        dataset.val,
+        model.cfg.block_size,
+        args.batch_size,
+        device,
+        train_seed=resolve_data_seed(args),
+        val_seed=resolve_eval_seed(args),
     )
-    losses = estimate_loss(model, source, args.eval_iters, amp_dtype)
+    eval_batches = fixed_eval_batches(args, source)
+    losses = estimate_loss(model, source, args.eval_iters, amp_dtype, fixed_batches=eval_batches)
     print(
         f"eval_iters {args.eval_iters} | batch_size {args.batch_size} | "
+        f"fixed_eval {args.fixed_eval_batches} | eval_seed {resolve_eval_seed(args)} | "
         f"train {losses['train']:.4f} | val {losses['val']:.4f}"
         f"{cuda_memory_text(device)}"
     )
@@ -1029,6 +1213,36 @@ def make_parser():
     p.add_argument("--out-path", default="out/hyperball_shakespeare.pt")
     p.add_argument("--device", default="")
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument(
+        "--data-seed",
+        type=int,
+        default=None,
+        help="seed for the independent training-batch RNG; defaults to --seed",
+    )
+    p.add_argument(
+        "--eval-seed",
+        type=int,
+        default=None,
+        help="seed for fixed evaluation batches; defaults to --seed + 1",
+    )
+    p.add_argument(
+        "--compile-seed",
+        type=int,
+        default=None,
+        help="seed for the compile warmup batch; defaults to --seed + 2",
+    )
+    p.add_argument(
+        "--fixed-eval-batches",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reuse the same sampled train/val eval batches at every evaluation",
+    )
+    p.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="request deterministic kernels and disable TF32/benchmark autotuning",
+    )
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
 
     p.add_argument("--block-size", type=int, default=256)
@@ -1038,6 +1252,30 @@ def make_parser():
     p.add_argument("--n-head", type=int, default=6)
     p.add_argument("--d-model", type=int, default=384)
     p.add_argument("--rope-base", type=float, default=10000.0)
+    p.add_argument(
+        "--kv-cache",
+        choices=["full", "equivariant-lowrank"],
+        default="full",
+        help="KV-cache architecture used by attention",
+    )
+    p.add_argument(
+        "--kv-key-rank",
+        type=int,
+        default=3,
+        help="complex head-mixing rank per RoPE frequency for low-rank KV",
+    )
+    p.add_argument(
+        "--kv-value-rank",
+        type=int,
+        default=192,
+        help="shared real value-cache rank for low-rank KV",
+    )
+    p.add_argument(
+        "--kv-decoder-lr",
+        type=float,
+        default=0.001,
+        help="peak normalized-SGD learning rate for low-rank KV decoder tensors",
+    )
     p.add_argument("--dropout", type=float, default=0.15)
     p.add_argument(
         "--attn-type",
