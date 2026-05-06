@@ -70,12 +70,17 @@ class CausalSelfAttention(nn.Module):
         block_size: int,
         rope_base: float = 10000.0,
         dropout: float = 0.0,
+        attn_type: str = "softmax",
     ):
         super().__init__()
         if d_model % n_head:
             raise ValueError("d_model must be divisible by n_head")
+        if attn_type not in {"softmax", "linear", "erf"}:
+            raise ValueError(f"unsupported attention type: {attn_type}")
         self.n_head = n_head
         self.head_dim = d_model // n_head
+        self.attn_type = attn_type
+        self.kernel_attn_eps = 1e-6
         self.q = nn.Linear(d_model, d_model, bias=False)
         self.k = nn.Linear(d_model, d_model, bias=False)
         self.v = nn.Linear(d_model, d_model, bias=False)
@@ -84,6 +89,31 @@ class CausalSelfAttention(nn.Module):
         cos, sin = rotary_cache(block_size, self.head_dim, rope_base)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
+        mask = torch.ones(block_size, block_size, dtype=torch.bool).tril()
+        self.register_buffer("causal_mask", mask, persistent=False)
+
+    def _normalized_kernel_attention(
+        self, weights: torch.Tensor, v: torch.Tensor, dtype: torch.dtype
+    ) -> torch.Tensor:
+        seqlen = weights.size(-1)
+        mask = self.causal_mask[:seqlen, :seqlen].view(1, 1, seqlen, seqlen)
+        weights = weights.masked_fill(~mask, 0.0)
+        denom = weights.sum(dim=-1, keepdim=True).clamp_min(self.kernel_attn_eps)
+        return ((weights @ v.float()) / denom).to(dtype)
+
+    def _linear_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        dtype = v.dtype
+        scale = self.head_dim**-0.25
+        q_feat = F.elu((q * scale).float()) + 1.0
+        k_feat = F.elu((k * scale).float()) + 1.0
+        weights = q_feat @ k_feat.transpose(-2, -1)
+        return self._normalized_kernel_attention(weights, v, dtype)
+
+    def _erf_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        dtype = v.dtype
+        scores = (q.float() @ k.float().transpose(-2, -1)) / math.sqrt(self.head_dim)
+        weights = torch.erf(scores) + 1.0
+        return self._normalized_kernel_attention(weights, v, dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seqlen, d_model = x.shape
@@ -98,7 +128,12 @@ class CausalSelfAttention(nn.Module):
         sin = self.rope_sin[:seqlen].view(1, 1, seqlen, self.head_dim // 2)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if self.attn_type == "softmax":
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        elif self.attn_type == "linear":
+            y = self._linear_attention(q, k, v)
+        else:
+            y = self._erf_attention(q, k, v)
         y = self.proj(y.transpose(1, 2).contiguous().view(bsz, seqlen, d_model))
         return self.dropout(y)
 
@@ -127,10 +162,13 @@ class Block(nn.Module):
         norm_type: str = "rmsnorm",
         derf_alpha: float = 0.5,
         derf_shift: float = 0.0,
+        attn_type: str = "softmax",
     ):
         super().__init__()
         self.norm1 = make_norm(norm_type, d_model, derf_alpha, derf_shift)
-        self.attn = CausalSelfAttention(d_model, n_head, block_size, rope_base, dropout)
+        self.attn = CausalSelfAttention(
+            d_model, n_head, block_size, rope_base, dropout, attn_type
+        )
         self.norm2 = make_norm(norm_type, d_model, derf_alpha, derf_shift)
         self.mlp = MLP(d_model, hidden_dim, dropout)
 
@@ -152,6 +190,7 @@ class GPTConfig:
     norm_type: str = "rmsnorm"
     derf_alpha: float = 0.5
     derf_shift: float = 0.0
+    attn_type: str = "softmax"
 
     @property
     def hidden_dim(self) -> int:
@@ -175,6 +214,7 @@ class GPT(nn.Module):
                     cfg.norm_type,
                     cfg.derf_alpha,
                     cfg.derf_shift,
+                    cfg.attn_type,
                 )
                 for _ in range(cfg.n_layer)
             ]

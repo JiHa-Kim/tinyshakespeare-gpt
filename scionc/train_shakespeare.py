@@ -389,16 +389,30 @@ def build_model(args, dataset: CharDataset, device: torch.device) -> GPT:
         norm_type=args.norm_type,
         derf_alpha=args.derf_alpha,
         derf_shift=args.derf_shift,
+        attn_type=args.attn_type,
     )
     return GPT(cfg).to(device)
+
+
+def configure_derf_training(model: GPT, args) -> None:
+    if args.train_derf_shape:
+        return
+    for module in model.modules():
+        if isinstance(module, Derf):
+            module.alpha.requires_grad_(False)
+            module.shift.requires_grad_(False)
 
 
 def derf_parameter_groups(model: GPT) -> dict[str, list[torch.Tensor]]:
     groups = {"shape": [], "affine": []}
     for module in model.modules():
         if isinstance(module, Derf):
-            groups["shape"].extend([module.alpha, module.shift])
-            groups["affine"].extend([module.gamma, module.beta])
+            groups["shape"].extend(
+                p for p in (module.alpha, module.shift) if p.requires_grad
+            )
+            groups["affine"].extend(
+                p for p in (module.gamma, module.beta) if p.requires_grad
+            )
     return groups
 
 
@@ -564,6 +578,7 @@ def train(args):
 
     dataset = load_dataset(args)
     raw_model = build_model(args, dataset, device)
+    configure_derf_training(raw_model, args)
     source = BatchSource(
         dataset.train, dataset.val, args.block_size, args.batch_size, device
     )
@@ -599,7 +614,9 @@ def train(args):
         f"state_half_life={state_half_life:.3g} beta={beta:.6f} "
         f"optimizer={OPTIMIZER_NAME} update={args.hyperball_update} "
         f"norm={args.norm_type} derf_lr={args.derf_lr:.6f} "
-        f"derf_beta={derf_beta:.6f} dropout={args.dropout:.3f} "
+        f"derf_beta={derf_beta:.6f} derf_shape={args.train_derf_shape} "
+        f"dropout={args.dropout:.3f} "
+        f"attn={args.attn_type} "
         f"hidden_ulmo={args.hidden_ulmo} "
         f"io_weights={io_weights} embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
         f"qkv=split spi_iteration={args.spi_iteration} "
@@ -631,6 +648,8 @@ def train(args):
             "norm_type": args.norm_type,
             "derf_alpha": args.derf_alpha,
             "derf_shift": args.derf_shift,
+            "train_derf_shape": args.train_derf_shape,
+            "attn_type": args.attn_type,
             "hidden_ulmo": args.hidden_ulmo,
             "io_weights": io_weights,
             "embed_ulmo": args.embed_ulmo,
@@ -1021,6 +1040,15 @@ def make_parser():
     p.add_argument("--rope-base", type=float, default=10000.0)
     p.add_argument("--dropout", type=float, default=0.15)
     p.add_argument(
+        "--attn-type",
+        choices=["softmax", "linear", "erf"],
+        default="softmax",
+        help=(
+            "attention kernel; linear is a normalized ELU+1 feature-kernel "
+            "reference, erf uses normalized 1+erf(score) weights"
+        ),
+    )
+    p.add_argument(
         "--norm-type",
         choices=["rmsnorm", "derf"],
         default="rmsnorm",
@@ -1049,6 +1077,12 @@ def make_parser():
         type=float,
         default=DEFAULT_STATE_HALF_LIFE,
         help="momentum half-life for Derf normalized-SGD updates",
+    )
+    p.add_argument(
+        "--train-derf-shape",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="train Derf alpha/shift; gamma/beta remain trainable when Derf is active",
     )
     p.add_argument(
         "--tie-weights",
