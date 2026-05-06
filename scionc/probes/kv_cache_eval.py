@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from scionc.kv_cache_spectrum import (
+from scionc.probes.kv_cache_spectrum import (
     allocate_budget,
     causal_attention,
     collect_grams,
