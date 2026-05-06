@@ -1,7 +1,7 @@
 # Hyperball Parametrization
 
 This note documents the active optimizer coordinates used by
-`scionc/train_shakespeare.py` after the switch to the Hyperball fixed-RMS
+`scionh/train_shakespeare.py` after the switch to the Hyperball fixed-RMS
 formulation.
 
 ## Constraint

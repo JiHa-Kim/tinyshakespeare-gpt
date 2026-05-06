@@ -1,6 +1,6 @@
 # 4-Moment Spectral Bound
 
-In `scionc/ulmos/core.py`, the ULMO optimizer requires a bound on the spectral norm (the maximum eigenvalue) of a matrix $X$ to safely compute the Gram-Newton-Schulz iteration. Given the Gram matrix $G = X X^T$, let its $n$ non-negative eigenvalues be $\lambda_1 \ge \lambda_2 \ge \dots \ge \lambda_n \ge 0$.
+In `scionh/ulmos/core.py`, the ULMO optimizer requires a bound on the spectral norm (the maximum eigenvalue) of a matrix $X$ to safely compute the Gram-Newton-Schulz iteration. Given the Gram matrix $G = X X^T$, let its $n$ non-negative eigenvalues be $\lambda_1 \ge \lambda_2 \ge \dots \ge \lambda_n \ge 0$.
 
 Instead of computing the exact maximum eigenvalue $\lambda_1$, we bound it using the first four moments of the eigenvalue distribution. We define the normalized sum of the $k$-th powers of the eigenvalues:
 

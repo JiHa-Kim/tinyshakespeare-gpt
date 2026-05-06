@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from scionc.probes.kv_cache_spectrum import (
+from scionh.probes.kv_cache_spectrum import (
     allocate_budget,
     causal_attention,
     collect_grams,
@@ -16,14 +16,14 @@ from scionc.probes.kv_cache_spectrum import (
     project_keys,
     project_values,
 )
-from scionc.models.gpt import (
+from scionh.models.gpt import (
     BatchSource,
     CharDataset,
     GPT,
     GPTConfig,
     maybe_download_tiny_shakespeare,
 )
-from scionc.train_shakespeare import load_checkpoint
+from scionh.training.checkpoints import load_checkpoint
 
 
 def amp_ctx(device: torch.device):

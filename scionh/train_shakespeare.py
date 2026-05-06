@@ -3,18 +3,23 @@ import json
 import math
 import time
 from contextlib import nullcontext
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
 
-from scionc.compile_env import ensure_compile_env
-from scionc.optim.parametrization import (
+from scionh.compile_env import ensure_compile_env
+from scionh.optim.parametrization import (
     resolve_schedule,
-    retention_from_half_life,
     schedule_at_step,
 )
-from scionc.optim.setup import (
+from scionh.optim.auxiliary import (
+    build_derf_optimizers,
+    build_kv_decoder_optimizer,
+    configure_derf_training,
+    step_derf_optimizers,
+    zero_derf_optimizers,
+)
+from scionh.optim.setup import (
     DEFAULT_HYPERBALL_UPDATE,
     DEFAULT_LEARNING_RATE,
     DEFAULT_STATE_HALF_LIFE,
@@ -29,18 +34,26 @@ from scionc.optim.setup import (
     resolve_hyperball_update,
     rms_state_text,
 )
-from scionc.models.gpt import (
-    Derf,
-    EquivariantLowRankKV,
+from scionh.models.deepnorm import (
+    calibrate_deepnorm_branches,
+    deepnorm_calibration_text,
+)
+from scionh.models.gpt import (
     GPT,
     BatchSource,
-    CharDataset,
-    GPTConfig,
-    RMSNorm,
-    maybe_download_tiny_shakespeare,
 )
-from scionc.probes.convergence import ConvergenceProbe
-from scionc.probes.line import (
+from scionh.models.inspection import (
+    derf_state,
+    derf_state_text,
+    kv_cache_summary,
+    kv_decoder_state,
+    kv_decoder_state_text,
+    parameter_summary,
+    rmsnorm_affine_state,
+    rmsnorm_affine_state_text,
+)
+from scionh.probes.convergence import ConvergenceProbe
+from scionh.probes.line import (
     apply_line_scale,
     capture_params,
     capture_rng,
@@ -52,10 +65,25 @@ from scionc.probes.line import (
     parse_line_scales,
     restore_rng,
 )
-from scionc.probes.optimizer_stats import (
+from scionh.probes.optimizer_stats import (
     accumulate_step_stats,
     capture_step_stats,
     consume_step_stats,
+    step_stats_text,
+)
+from scionh.training.checkpoints import (
+    load_checkpoint,
+    save_checkpoint,
+    save_eval_checkpoint,
+)
+from scionh.training.runtime import (
+    build_model,
+    configure_runtime,
+    fixed_eval_batches,
+    load_dataset,
+    resolve_compile_seed,
+    resolve_data_seed,
+    resolve_eval_seed,
 )
 
 
@@ -122,76 +150,6 @@ class MetricsLogger:
         if self.file is not None:
             self.file.close()
             self.file = None
-
-
-class NormalizedSGD:
-    """Scion-style normalized descent for small unconstrained parameter groups."""
-
-    def __init__(self, params, lr: float, beta: float, eps: float = 1e-12):
-        self.params = [p for p in params if p.requires_grad]
-        self.lr_peak = float(lr)
-        self.lr = float(lr)
-        self.beta = float(beta)
-        self.eps = eps
-        self.state: dict[torch.Tensor, torch.Tensor] = {}
-
-    def zero_grad(self, set_to_none: bool = True) -> None:
-        for p in self.params:
-            if p.grad is None:
-                continue
-            if set_to_none:
-                p.grad = None
-            else:
-                p.grad.zero_()
-
-    @torch.no_grad()
-    def step(self) -> None:
-        total = 0
-        sq = None
-        updates = []
-        for p in self.params:
-            if p.grad is None:
-                continue
-            if p.grad.is_sparse:
-                raise RuntimeError("NormalizedSGD does not support sparse gradients")
-            m = self.state.get(p)
-            if m is None:
-                m = torch.zeros_like(p, memory_format=torch.preserve_format)
-                self.state[p] = m
-            m.lerp_(p.grad, 1.0 - self.beta)
-            m32 = m.float()
-            value = m32.square().sum()
-            sq = value if sq is None else sq + value
-            total += p.numel()
-            updates.append((p, m))
-
-        if not updates or sq is None or total <= 0:
-            return
-        rms = (sq / total).sqrt()
-        if float(rms) <= self.eps:
-            return
-        for p, m in updates:
-            p.add_(m / rms.to(dtype=m.dtype), alpha=-self.lr)
-
-
-def step_stats_text(stats: dict[str, dict]) -> str:
-    if not stats:
-        return ""
-    parts = []
-    for name, values in stats.items():
-        parts.append(
-            f"{name}:cos={values['cos']:.3f},"
-            f"u/p={values['update_param_rms']:.2e},"
-            f"u/g={values['update_grad_rms']:.2e},"
-            f"g/p={values['grad_param_rms']:.2e},"
-            f"xg={values['param_grad_cos']:.3f},"
-            f"xu={values['param_update_cos']:.3f},"
-            f"ga/r={values['grad_abs_rms']:.3f},"
-            f"ua/r={values['update_abs_rms']:.3f},"
-            f"gk={values['grad_kurtosis']:.2e},"
-            f"uk={values['update_kurtosis']:.2e}"
-        )
-    return " | step_stats " + "; ".join(parts)
 
 
 def amp_ctx(amp_dtype: torch.dtype | None):
@@ -298,44 +256,6 @@ def estimate_val_metrics(
     return total / len(batches), stats
 
 
-def save_checkpoint(path: Path, model: GPT, dataset: CharDataset):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "model_cfg": asdict(model.cfg),
-            "chars": dataset.chars,
-        },
-        path,
-    )
-
-
-def save_eval_checkpoint(
-    path: Path,
-    step: int,
-    val_loss: float,
-    model: GPT,
-    dataset: CharDataset,
-    args,
-):
-    if args.save_interval <= 0 or step % args.save_interval != 0:
-        return
-    eval_path = path.with_name(
-        f"{path.stem}_step{step:05d}_val{val_loss:.4f}{path.suffix}"
-    )
-    save_checkpoint(eval_path, model, dataset)
-
-
-def load_checkpoint(path: Path, device: torch.device):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    chars = ckpt["chars"]
-    stoi = {ch: i for i, ch in enumerate(chars)}
-    itos = {i: ch for i, ch in enumerate(chars)}
-    model = GPT(GPTConfig(**ckpt["model_cfg"])).to(device)
-    model.load_state_dict(ckpt["model"])
-    return model, stoi, itos
-
-
 def maybe_compile(
     model: GPT,
     source: BatchSource,
@@ -360,407 +280,6 @@ def maybe_compile(
         model(xb, yb)
     model.train(was_training)
     return model, sync_now(device) - t0
-
-
-def resolve_data_seed(args) -> int:
-    return args.data_seed if args.data_seed is not None else args.seed
-
-
-def resolve_eval_seed(args) -> int:
-    return args.eval_seed if args.eval_seed is not None else args.seed + 1
-
-
-def resolve_compile_seed(args) -> int:
-    return args.compile_seed if args.compile_seed is not None else args.seed + 2
-
-
-def split_eval_seed(args, split: str) -> int:
-    offset = 0 if split == "val" else 1_000_003
-    return resolve_eval_seed(args) + offset
-
-
-def fixed_eval_batches(args, source: BatchSource):
-    if not args.fixed_eval_batches:
-        return None
-    return {
-        split: source.fixed_batches(split, args.eval_iters, split_eval_seed(args, split))
-        for split in ("train", "val")
-    }
-
-
-def configure_runtime(args) -> tuple[torch.device, torch.dtype | None]:
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    torch.use_deterministic_algorithms(args.deterministic, warn_only=True)
-    torch.set_float32_matmul_precision("high")
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = not args.deterministic
-        torch.backends.cudnn.allow_tf32 = not args.deterministic
-        torch.backends.cudnn.benchmark = not args.deterministic
-
-    device = torch.device(
-        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-    amp_dtype = (
-        torch.bfloat16
-        if device.type == "cuda" and torch.cuda.is_bf16_supported()
-        else None
-    )
-    return device, amp_dtype
-
-
-def load_dataset(args) -> CharDataset:
-    data_path = Path(args.data_path)
-    maybe_download_tiny_shakespeare(data_path)
-    return CharDataset(data_path)
-
-
-def build_model(args, dataset: CharDataset, device: torch.device) -> GPT:
-    cfg = GPTConfig(
-        vocab_size=len(dataset.chars),
-        block_size=args.block_size,
-        n_layer=args.n_layer,
-        n_head=args.n_head,
-        d_model=args.d_model,
-        rope_base=args.rope_base,
-        dropout=args.dropout,
-        tie_weights=args.tie_weights,
-        norm_type=args.norm_type,
-        derf_alpha=args.derf_alpha,
-        derf_shift=args.derf_shift,
-        attn_type=args.attn_type,
-        kv_cache=args.kv_cache,
-        kv_key_rank=args.kv_key_rank,
-        kv_value_rank=args.kv_value_rank,
-        resid_scale=args.resid_scale,
-        block_type=args.block_type,
-        deepnorm_alpha=args.deepnorm_alpha,
-        deepnorm_branch_scale=args.deepnorm_branch_scale,
-        lns=args.lns,
-    )
-    return GPT(cfg).to(device)
-
-
-def _rms_float(x: torch.Tensor) -> float:
-    return float(x.detach().float().square().mean().sqrt())
-
-
-@torch.no_grad()
-def calibrate_deepnorm_branches(
-    model: GPT, idx: torch.Tensor, eps: float = 1e-12
-) -> dict[str, float]:
-    if model.cfg.block_type != "deepnorm":
-        return {}
-
-    target_delta = 1.0 / math.sqrt(2.0 * model.cfg.n_layer)
-    was_training = model.training
-    model.eval()
-    attn_scales = []
-    mlp_scales = []
-    attn_ratios_before = []
-    mlp_ratios_before = []
-    attn_ratios_after = []
-    mlp_ratios_after = []
-    try:
-        x = model.tok_emb(idx)
-        for block in model.blocks:
-            if block.block_type != "deepnorm":
-                x = block(x)
-                continue
-            if block.post_attn_norm is None or block.post_mlp_norm is None:
-                raise RuntimeError("DeepNorm post-norms are missing")
-
-            alpha = float(block.deepnorm_alpha)
-            attn_out = block.attn(x)
-            attn_den = max(alpha * _rms_float(x), eps)
-            attn_raw = _rms_float(attn_out)
-            attn_ratio = attn_raw / attn_den
-            attn_scale = target_delta / max(attn_ratio, eps)
-            block.deepnorm_attn_scale.fill_(attn_scale)
-            x = block.post_attn_norm(alpha * x + attn_scale * attn_out)
-
-            mlp_out = block.mlp(x)
-            mlp_den = max(alpha * _rms_float(x), eps)
-            mlp_raw = _rms_float(mlp_out)
-            mlp_ratio = mlp_raw / mlp_den
-            mlp_scale = target_delta / max(mlp_ratio, eps)
-            block.deepnorm_mlp_scale.fill_(mlp_scale)
-            x = block.post_mlp_norm(alpha * x + mlp_scale * mlp_out)
-
-            attn_scales.append(attn_scale)
-            mlp_scales.append(mlp_scale)
-            attn_ratios_before.append(attn_ratio)
-            mlp_ratios_before.append(mlp_ratio)
-            attn_ratios_after.append(attn_ratio * attn_scale)
-            mlp_ratios_after.append(mlp_ratio * mlp_scale)
-    finally:
-        model.train(was_training)
-
-    def stats(values: list[float], prefix: str) -> dict[str, float]:
-        if not values:
-            return {}
-        return {
-            f"{prefix}_mean": sum(values) / len(values),
-            f"{prefix}_min": min(values),
-            f"{prefix}_max": max(values),
-        }
-
-    return {
-        "target_delta": target_delta,
-        **stats(attn_scales, "attn_scale"),
-        **stats(mlp_scales, "mlp_scale"),
-        **stats(attn_ratios_before, "attn_ratio_before"),
-        **stats(mlp_ratios_before, "mlp_ratio_before"),
-        **stats(attn_ratios_after, "attn_ratio_after"),
-        **stats(mlp_ratios_after, "mlp_ratio_after"),
-    }
-
-
-def deepnorm_calibration_text(stats: dict[str, float]) -> str:
-    if not stats:
-        return ""
-    return (
-        "deepnorm_calibration "
-        f"target_delta={stats['target_delta']:.6g} "
-        f"attn_scale={stats['attn_scale_mean']:.4g}"
-        f"[{stats['attn_scale_min']:.4g},{stats['attn_scale_max']:.4g}] "
-        f"mlp_scale={stats['mlp_scale_mean']:.4g}"
-        f"[{stats['mlp_scale_min']:.4g},{stats['mlp_scale_max']:.4g}] "
-        f"attn_ratio_before={stats['attn_ratio_before_mean']:.4g} "
-        f"mlp_ratio_before={stats['mlp_ratio_before_mean']:.4g}"
-    )
-
-
-def configure_derf_training(model: GPT, args) -> None:
-    if args.train_derf_shape:
-        return
-    for module in model.modules():
-        if isinstance(module, Derf):
-            module.alpha.requires_grad_(False)
-            module.shift.requires_grad_(False)
-
-
-def derf_parameter_groups(model: GPT) -> dict[str, list[torch.Tensor]]:
-    groups = {"shape": [], "affine": []}
-    for module in model.modules():
-        if isinstance(module, Derf):
-            groups["shape"].extend(
-                p for p in (module.alpha, module.shift) if p.requires_grad
-            )
-            groups["affine"].extend(
-                p for p in (module.gamma, module.beta) if p.requires_grad
-            )
-        elif isinstance(module, RMSNorm) and module.gamma is not None:
-            groups["affine"].append(module.gamma)
-    return groups
-
-
-def build_derf_optimizers(model: GPT, args) -> dict[str, NormalizedSGD]:
-    groups = {
-        name: params for name, params in derf_parameter_groups(model).items() if params
-    }
-    if not groups:
-        return {}
-    beta = retention_from_half_life(
-        count_increment(args), args.derf_state_half_life, "derf_state_half_life"
-    )
-    return {
-        name: NormalizedSGD(params, args.derf_lr, beta)
-        for name, params in groups.items()
-    }
-
-
-def zero_derf_optimizers(
-    opts: dict[str, NormalizedSGD], set_to_none: bool = True
-) -> None:
-    for opt in opts.values():
-        opt.zero_grad(set_to_none=set_to_none)
-
-
-def step_derf_optimizers(opts: dict[str, NormalizedSGD]) -> None:
-    for opt in opts.values():
-        opt.step()
-
-
-def kv_decoder_parameters(model: GPT) -> list[torch.Tensor]:
-    params = []
-    for module in model.modules():
-        if isinstance(module, EquivariantLowRankKV):
-            params.extend(p for p in module.decoder_parameters() if p.requires_grad)
-    return params
-
-
-def build_kv_decoder_optimizer(model: GPT, args) -> NormalizedSGD | None:
-    params = kv_decoder_parameters(model)
-    if not params:
-        return None
-    beta = retention_from_half_life(
-        count_increment(args), args.state_half_life, "kv_decoder_state_half_life"
-    )
-    return NormalizedSGD(params, args.kv_decoder_lr, beta)
-
-
-def kv_cache_summary(model: GPT) -> dict[str, float | int | str]:
-    modules = [m for m in model.modules() if isinstance(m, EquivariantLowRankKV)]
-    if not modules:
-        attn = model.blocks[0].attn
-        original = 2 * attn.n_head * attn.head_dim
-        return {
-            "type": "full",
-            "cache_dim": original,
-            "original_cache_dim": original,
-            "cache_ratio": 1.0,
-            "key_rank": attn.n_head,
-            "value_rank": attn.n_head * attn.head_dim,
-        }
-    module = modules[0]
-    return {
-        "type": "equivariant-lowrank",
-        "cache_dim": module.cache_dim,
-        "original_cache_dim": module.original_cache_dim,
-        "cache_ratio": module.cache_dim / module.original_cache_dim,
-        "key_rank": module.key_rank,
-        "value_rank": module.value_rank,
-    }
-
-
-def parameter_summary(model: GPT) -> dict[str, int]:
-    return {
-        "total": sum(p.numel() for p in model.parameters()),
-        "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
-    }
-
-
-@torch.no_grad()
-def kv_decoder_state(model: GPT) -> dict[str, float]:
-    key_values = []
-    value_values = []
-    for module in model.modules():
-        if isinstance(module, EquivariantLowRankKV):
-            key_values.append(module.key_decoder.detach().float().flatten())
-            value_values.append(module.value_decoder.detach().float().flatten())
-    if not key_values:
-        return {}
-    key = torch.cat(key_values)
-    value = torch.cat(value_values)
-    return {
-        "key_decoder_rms": float(key.square().mean().sqrt()),
-        "key_decoder_min": float(key.min()),
-        "key_decoder_max": float(key.max()),
-        "value_decoder_rms": float(value.square().mean().sqrt()),
-        "value_decoder_min": float(value.min()),
-        "value_decoder_max": float(value.max()),
-    }
-
-
-def kv_decoder_state_text(state: dict[str, float]) -> str:
-    if not state:
-        return ""
-    return (
-        " | kv_decoder "
-        f"k_rms={state['key_decoder_rms']:.3g},"
-        f"k=[{state['key_decoder_min']:.3g},{state['key_decoder_max']:.3g}],"
-        f"v_rms={state['value_decoder_rms']:.3g},"
-        f"v=[{state['value_decoder_min']:.3g},{state['value_decoder_max']:.3g}]"
-    )
-
-
-@torch.no_grad()
-def derf_state(model: GPT) -> dict[str, float]:
-    alphas = []
-    shifts = []
-    gammas = []
-    betas = []
-    for module in model.modules():
-        if isinstance(module, Derf):
-            alphas.append(float(module.alpha))
-            shifts.append(float(module.shift))
-            gammas.extend(float(x) for x in module.gamma.detach().flatten())
-            betas.extend(float(x) for x in module.beta.detach().flatten())
-    if not alphas:
-        return {}
-    return {
-        "alpha_mean": sum(alphas) / len(alphas),
-        "alpha_min": min(alphas),
-        "alpha_max": max(alphas),
-        "shift_mean": sum(shifts) / len(shifts),
-        "shift_min": min(shifts),
-        "shift_max": max(shifts),
-        "gamma_mean": sum(gammas) / len(gammas),
-        "gamma_min": min(gammas),
-        "gamma_max": max(gammas),
-        "beta_mean": sum(betas) / len(betas),
-        "beta_min": min(betas),
-        "beta_max": max(betas),
-    }
-
-
-def derf_state_text(state: dict[str, float]) -> str:
-    if not state:
-        return ""
-    return (
-        " | derf "
-        f"a={state['alpha_mean']:.3g}"
-        f"[{state['alpha_min']:.3g},{state['alpha_max']:.3g}],"
-        f"s={state['shift_mean']:.3g}"
-        f"[{state['shift_min']:.3g},{state['shift_max']:.3g}],"
-        f"g={state['gamma_mean']:.3g}"
-        f"[{state['gamma_min']:.3g},{state['gamma_max']:.3g}],"
-        f"b={state['beta_mean']:.3g}"
-        f"[{state['beta_min']:.3g},{state['beta_max']:.3g}]"
-    )
-
-
-@torch.no_grad()
-def rmsnorm_affine_state(model: GPT) -> dict[str, float]:
-    values = []
-    final_values = []
-    block_values = []
-    for name, module in model.named_modules():
-        if not isinstance(module, RMSNorm) or module.gamma is None:
-            continue
-        gamma = module.gamma.detach().float().flatten()
-        values.append(gamma)
-        if name == "norm_f":
-            final_values.append(gamma)
-        else:
-            block_values.append(gamma)
-    if not values:
-        return {}
-
-    def tensor_stats(prefix: str, parts: list[torch.Tensor]) -> dict[str, float]:
-        if not parts:
-            return {}
-        x = torch.cat(parts)
-        return {
-            f"{prefix}_mean": float(x.mean()),
-            f"{prefix}_rms": float(x.square().mean().sqrt()),
-            f"{prefix}_min": float(x.min()),
-            f"{prefix}_max": float(x.max()),
-        }
-
-    return {
-        **tensor_stats("gamma", values),
-        **tensor_stats("block_gamma", block_values),
-        **tensor_stats("final_gamma", final_values),
-    }
-
-
-def rmsnorm_affine_state_text(state: dict[str, float]) -> str:
-    if not state:
-        return ""
-    final = ""
-    if "final_gamma_rms" in state:
-        final = f",final_rms={state['final_gamma_rms']:.3g}"
-    return (
-        " | norm_affine "
-        f"g_mean={state['gamma_mean']:.3g},g_rms={state['gamma_rms']:.3g},"
-        f"g=[{state['gamma_min']:.3g},{state['gamma_max']:.3g}]"
-        f"{final}"
-    )
 
 
 def resolve_training_schedule(args) -> tuple[int, int, int]:
@@ -1364,9 +883,7 @@ def sample_report(args, texts: list[str]) -> str:
 @torch.inference_mode()
 def evaluate(args):
     device, amp_dtype = configure_runtime(args)
-    data_path = Path(args.data_path)
-    maybe_download_tiny_shakespeare(data_path)
-    dataset = CharDataset(data_path)
+    dataset = load_dataset(args)
     model, _, _ = load_checkpoint(Path(args.out_path), device)
     source = BatchSource(
         dataset.train,

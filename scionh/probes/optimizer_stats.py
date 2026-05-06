@@ -167,3 +167,23 @@ def add_optional_object_stats(
                 / ((update_sq * mom_sq) ** 0.5 + eps),
             }
         )
+
+
+def step_stats_text(stats: dict[str, dict]) -> str:
+    if not stats:
+        return ""
+    parts = []
+    for name, values in stats.items():
+        parts.append(
+            f"{name}:cos={values['cos']:.3f},"
+            f"u/p={values['update_param_rms']:.2e},"
+            f"u/g={values['update_grad_rms']:.2e},"
+            f"g/p={values['grad_param_rms']:.2e},"
+            f"xg={values['param_grad_cos']:.3f},"
+            f"xu={values['param_update_cos']:.3f},"
+            f"ga/r={values['grad_abs_rms']:.3f},"
+            f"ua/r={values['update_abs_rms']:.3f},"
+            f"gk={values['grad_kurtosis']:.2e},"
+            f"uk={values['update_kurtosis']:.2e}"
+        )
+    return " | step_stats " + "; ".join(parts)

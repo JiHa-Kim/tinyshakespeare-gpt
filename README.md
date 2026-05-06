@@ -1,12 +1,12 @@
-# Minimal ScionC Repo
+# Tiny Shakespeare GPT
 
-A compact ScionC sandbox organized by category:
+A compact Tiny Shakespeare GPT research sandbox organized by category:
 
-- `scionc/optim/`: Hyperball optimizer and schedule parametrization helpers.
-- `scionc/ulmos/`: ULMOs, Gram-NS, and streaming SVD helpers.
-- `scionc/models/`: compact GPT model and tiny Shakespeare data utilities.
-- `scionc/probes/`: convergence, line, and optimizer-step stats probes.
-- `scionc/train_shakespeare.py`: training entrypoint.
+- `scionh/optim/`: Hyperball optimizer and schedule parametrization helpers.
+- `scionh/ulmos/`: ULMOs, Gram-NS, and streaming SVD helpers.
+- `scionh/models/`: compact GPT model and tiny Shakespeare data utilities.
+- `scionh/probes/`: convergence, line, and optimizer-step stats probes.
+- `scionh/train_shakespeare.py`: training entrypoint.
 
 ## Active Recipe: Hyperball
 
@@ -69,7 +69,7 @@ and applies one or more streaming subspace steps per optimizer update.
 ## Recommended Command
 
 ```bash
-uv run python -m scionc.train_shakespeare \
+uv run python -m scionh.train_shakespeare \
   --mode train \
   --out-path out/hyperball_2k.pt \
   --sample-out out/hyperball_2k_samples.md \
@@ -87,7 +87,7 @@ uv run python -m scionc.train_shakespeare \
 Evaluate the saved checkpoint with more batches:
 
 ```bash
-uv run python -m scionc.train_shakespeare \
+uv run python -m scionh.train_shakespeare \
   --mode eval \
   --device cuda \
   --out-path out/hyperball_2k.pt \

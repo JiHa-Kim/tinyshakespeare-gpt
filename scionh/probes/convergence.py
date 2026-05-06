@@ -3,8 +3,8 @@ from dataclasses import dataclass
 
 import torch
 
-from scionc.ulmos.core import gram_newton_schulz_polar
-from scionc.models.gpt import GPT
+from scionh.ulmos.core import gram_newton_schulz_polar
+from scionh.models.gpt import GPT
 
 
 @dataclass

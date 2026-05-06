@@ -2,15 +2,15 @@ import math
 
 import torch
 
-from scionc.models.gpt import EquivariantLowRankKV, GPT
-from scionc.optim.parametrization import (
+from scionh.models.gpt import EquivariantLowRankKV, GPT
+from scionh.optim.parametrization import (
     retention_from_half_life,
     schedule_at_step,
     scheduled_learning_rate,
 )
-from scionc.optim.scion import Hyperball
-from scionc.ulmos.core import ColNormULMO, GramNewtonSchulzULMO, RowNormULMO, SignULMO
-from scionc.ulmos.streaming_svd import StreamingSVDULMO
+from scionh.optim.scion import Hyperball
+from scionh.ulmos.core import ColNormULMO, GramNewtonSchulzULMO, RowNormULMO, SignULMO
+from scionh.ulmos.streaming_svd import StreamingSVDULMO
 
 DEFAULT_TARGET_RMS = {
     "embed": 0.70,

@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 
-from scionc.compile_env import ensure_compile_env
+from scionh.compile_env import ensure_compile_env
 
 _GNSGroupKey = tuple[tuple[int, ...], torch.dtype, torch.device]
 _GNSGroupItem = tuple[int, torch.Tensor, torch.Tensor, bool]

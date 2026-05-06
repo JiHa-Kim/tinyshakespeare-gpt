@@ -5,17 +5,16 @@ from pathlib import Path
 
 import torch
 
-from scionc.models.gpt import BatchSource, GPT, apply_rope
-from scionc.optim.setup import build_optimizer
-from scionc.train_shakespeare import (
+from scionh.models.deepnorm import calibrate_deepnorm_branches
+from scionh.models.gpt import BatchSource, GPT, apply_rope
+from scionh.optim.auxiliary import configure_derf_training
+from scionh.optim.setup import build_optimizer, resolve_hyperball_update
+from scionh.train_shakespeare import make_parser
+from scionh.training.runtime import (
     build_model,
-    calibrate_deepnorm_branches,
-    configure_derf_training,
     configure_runtime,
     load_dataset,
-    make_parser,
     resolve_data_seed,
-    resolve_hyperball_update,
 )
 
 

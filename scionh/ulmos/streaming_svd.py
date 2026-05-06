@@ -1,6 +1,6 @@
 import torch
 
-from scionc.ulmos.core import ULMOGeometry
+from scionh.ulmos.core import ULMOGeometry
 
 _SVDGroupKey = tuple[tuple[int, ...], torch.dtype, torch.device]
 _SVDItem = tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, bool, float]

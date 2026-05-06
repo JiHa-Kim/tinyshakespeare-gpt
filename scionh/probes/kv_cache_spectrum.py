@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from scionc.models.gpt import (
+from scionh.models.gpt import (
     BatchSource,
     CharDataset,
     GPT,
@@ -14,7 +14,7 @@ from scionc.models.gpt import (
     apply_rope,
     maybe_download_tiny_shakespeare,
 )
-from scionc.train_shakespeare import load_checkpoint
+from scionh.training.checkpoints import load_checkpoint
 
 
 def complex_pairs(x: torch.Tensor) -> torch.Tensor:
