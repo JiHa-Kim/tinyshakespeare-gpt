@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -199,14 +200,90 @@ def run_line_probe(
     }
 
 
-def train(args):
-    args.hyperball_update = resolve_hyperball_update(args)
-    device, amp_dtype = configure_runtime(args)
-    metrics = MetricsLogger(args.metrics_jsonl, args.run_name)
-    line_curve_scales = parse_line_scales(args.line_curve_scales)
-    if line_curve_scales:
-        args.track_line_probe = True
+@dataclass
+class TrainingComponents:
+    metrics: MetricsLogger
+    dataset: object
+    raw_model: GPT
+    source: BatchSource
+    eval_batches: dict | None
+    opt: object
+    derf_opts: dict
+    kv_decoder_opt: object | None
+    conv_probe: ConvergenceProbe | None
+    model: object
+    compile_seconds: float
+    deepnorm_calibration: dict
 
+
+@dataclass
+class TrainingSchedule:
+    warmup_steps: int
+    stable_steps: int
+    decay_steps: int
+    effective_tokens: int
+
+
+@dataclass
+class TrainingMetadata:
+    lr_peak: float
+    beta: float
+    derf_beta: float
+    kv_decoder_beta: float
+    state_half_life: float
+    io_weights: str
+    params_info: dict
+    kv_info: dict
+    deepnorm_alpha: float
+    group_text: str
+
+
+@dataclass
+class TrainingProgress:
+    train_start: float
+    total_opt_steps: int = 0
+    best_val: float = field(default_factory=lambda: float("inf"))
+    max_val: float = field(default_factory=lambda: float("-inf"))
+    last_train_loss: float = field(default_factory=lambda: float("nan"))
+    last_val_loss: float = field(default_factory=lambda: float("nan"))
+    initial_val: float | None = None
+    diverged: bool = False
+    diverge_reason: str = ""
+    eval_seconds: float = 0.0
+    step_stat_accum: dict = field(default_factory=dict)
+
+    def mark_diverged(self, reason: str) -> None:
+        self.diverged = True
+        self.diverge_reason = reason
+
+
+@dataclass
+class StepRates:
+    all_lrs: dict
+    lr: float
+    derf_lr: float
+    kv_decoder_lr: float
+
+
+@dataclass
+class EvalTiming:
+    elapsed: float
+    train_elapsed: float
+    total_tokens: int
+
+
+@dataclass
+class LineProbeContext:
+    batch: tuple[torch.Tensor, torch.Tensor] | None = None
+    rng_before: object | None = None
+    loss_before: float | None = None
+    params_before: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+
+
+def build_training_components(
+    args, device: torch.device, amp_dtype: torch.dtype | None
+) -> TrainingComponents:
+    metrics = MetricsLogger(args.metrics_jsonl, args.run_name)
     dataset = load_dataset(args)
     raw_model = build_model(args, dataset, device)
     configure_derf_training(raw_model, args)
@@ -221,61 +298,106 @@ def train(args):
     )
     eval_batches = fixed_eval_batches(args, source)
     opt = build_optimizer(raw_model, args, device)
-    deepnorm_calibration = {}
-    if args.deepnorm_calibrate_branches:
-        idx, _targets = source.seeded_batch("train", resolve_data_seed(args))
-        deepnorm_calibration = calibrate_deepnorm_branches(raw_model, idx)
-        text = deepnorm_calibration_text(deepnorm_calibration)
-        if text:
-            print(text)
+    deepnorm_calibration = maybe_calibrate_deepnorm(raw_model, source, args)
     derf_opts = build_derf_optimizers(raw_model, args)
     kv_decoder_opt = build_kv_decoder_optimizer(raw_model, args)
-    conv_probe = (
-        ConvergenceProbe(raw_model, opt, args) if args.track_convergence_stats else None
-    )
-    if conv_probe is not None:
-        conv_probe.register_hooks(raw_model)
-        if args.compile:
-            print("compile_disabled_for_convergence_stats")
-            args.compile = False
+    conv_probe = build_convergence_probe(raw_model, opt, args)
     model, compile_seconds = maybe_compile(raw_model, source, args, amp_dtype, device)
     if compile_seconds:
         print(f"compile_seconds {compile_seconds:.3f}")
+    return TrainingComponents(
+        metrics=metrics,
+        dataset=dataset,
+        raw_model=raw_model,
+        source=source,
+        eval_batches=eval_batches,
+        opt=opt,
+        derf_opts=derf_opts,
+        kv_decoder_opt=kv_decoder_opt,
+        conv_probe=conv_probe,
+        model=model,
+        compile_seconds=compile_seconds,
+        deepnorm_calibration=deepnorm_calibration,
+    )
 
+
+def maybe_calibrate_deepnorm(raw_model: GPT, source: BatchSource, args) -> dict:
+    if not args.deepnorm_calibrate_branches:
+        return {}
+    idx, _targets = source.seeded_batch("train", resolve_data_seed(args))
+    calibration = calibrate_deepnorm_branches(raw_model, idx)
+    text = deepnorm_calibration_text(calibration)
+    if text:
+        print(text)
+    return calibration
+
+
+def build_convergence_probe(raw_model: GPT, opt, args) -> ConvergenceProbe | None:
+    if not args.track_convergence_stats:
+        return None
+    conv_probe = ConvergenceProbe(raw_model, opt, args)
+    conv_probe.register_hooks(raw_model)
+    if args.compile:
+        print("compile_disabled_for_convergence_stats")
+        args.compile = False
+    return conv_probe
+
+
+def make_training_schedule(args) -> TrainingSchedule:
     warmup_steps, stable_steps, decay_steps = resolve_training_schedule(args)
-    effective_tokens = count_increment(args)
-    first_group = opt.param_groups[0]
-    lr_peak = float(first_group.get("lr_peak", first_group["lr"]))
-    beta = float(first_group.get("beta", math.nan))
-    derf_beta = next(iter(derf_opts.values())).beta if derf_opts else math.nan
-    kv_decoder_beta = kv_decoder_opt.beta if kv_decoder_opt is not None else math.nan
-    state_half_life = first_group.get("state_half_life", math.nan)
-    io_weights = optimizer_io_label(raw_model)
-    params_info = parameter_summary(raw_model)
-    kv_info = kv_cache_summary(raw_model)
-    deepnorm_alpha = raw_model.cfg.resolved_deepnorm_alpha
+    return TrainingSchedule(
+        warmup_steps=warmup_steps,
+        stable_steps=stable_steps,
+        decay_steps=decay_steps,
+        effective_tokens=count_increment(args),
+    )
 
-    group_text = format_optimizer_schedule(opt)
+
+def collect_training_metadata(
+    raw_model: GPT, opt, derf_opts: dict, kv_decoder_opt
+) -> TrainingMetadata:
+    first_group = opt.param_groups[0]
+    return TrainingMetadata(
+        lr_peak=float(first_group.get("lr_peak", first_group["lr"])),
+        beta=float(first_group.get("beta", math.nan)),
+        derf_beta=next(iter(derf_opts.values())).beta if derf_opts else math.nan,
+        kv_decoder_beta=kv_decoder_opt.beta if kv_decoder_opt is not None else math.nan,
+        state_half_life=float(first_group.get("state_half_life", math.nan)),
+        io_weights=optimizer_io_label(raw_model),
+        params_info=parameter_summary(raw_model),
+        kv_info=kv_cache_summary(raw_model),
+        deepnorm_alpha=raw_model.cfg.resolved_deepnorm_alpha,
+        group_text=format_optimizer_schedule(opt),
+    )
+
+
+def print_training_config(
+    args, schedule: TrainingSchedule, metadata: TrainingMetadata
+) -> None:
+    kv_info = metadata.kv_info
+    params_info = metadata.params_info
     print(
         "schedule "
-        f"warmup_steps={warmup_steps} stable_steps={stable_steps} decay_steps={decay_steps} "
-        f"count_increment={effective_tokens} "
-        f"lr_peak={lr_peak:.6f} "
-        f"state_half_life={state_half_life:.3g} beta={beta:.6f} "
+        f"warmup_steps={schedule.warmup_steps} "
+        f"stable_steps={schedule.stable_steps} decay_steps={schedule.decay_steps} "
+        f"count_increment={schedule.effective_tokens} "
+        f"lr_peak={metadata.lr_peak:.6f} "
+        f"state_half_life={metadata.state_half_life:.3g} "
+        f"beta={metadata.beta:.6f} "
         f"optimizer={OPTIMIZER_NAME} update={args.hyperball_update} "
         f"compile_mode={args.compile_mode} "
         f"norm={args.norm_type} derf_lr={args.derf_lr:.6f} "
-        f"derf_beta={derf_beta:.6f} derf_shape={args.train_derf_shape} "
+        f"derf_beta={metadata.derf_beta:.6f} derf_shape={args.train_derf_shape} "
         f"kv_cache={kv_info['type']} kv_dim={kv_info['cache_dim']}/"
         f"{kv_info['original_cache_dim']} kv_ratio={kv_info['cache_ratio']:.3f} "
         f"kv_key_rank={kv_info['key_rank']} kv_value_rank={kv_info['value_rank']} "
         f"kv_decoder_lr={args.kv_decoder_lr:.6f} "
-        f"kv_decoder_beta={kv_decoder_beta:.6f} "
+        f"kv_decoder_beta={metadata.kv_decoder_beta:.6f} "
         f"params={params_info['total']} trainable_params={params_info['trainable']} "
         f"dropout={args.dropout:.3f} "
         f"resid_scale={args.resid_scale:.6f} "
         f"block_type={args.block_type} "
-        f"deepnorm_alpha={deepnorm_alpha:.6g} "
+        f"deepnorm_alpha={metadata.deepnorm_alpha:.6g} "
         f"deepnorm_branch_scale={args.deepnorm_branch_scale:.6g} "
         f"deepnorm_calibrate={args.deepnorm_calibrate_branches} "
         f"lns={args.lns} "
@@ -283,18 +405,29 @@ def train(args):
         f"seed={args.seed} data_seed={resolve_data_seed(args)} "
         f"eval_seed={resolve_eval_seed(args)} fixed_eval={args.fixed_eval_batches} "
         f"hidden_ulmo={args.hidden_ulmo} "
-        f"io_weights={io_weights} embed_ulmo={args.embed_ulmo} out_ulmo={args.out_ulmo} "
+        f"io_weights={metadata.io_weights} embed_ulmo={args.embed_ulmo} "
+        f"out_ulmo={args.out_ulmo} "
         f"qkv=fused spi_iteration={args.spi_iteration} "
-        f"groups={group_text}"
+        f"groups={metadata.group_text}"
     )
+
+
+def write_config_metrics(
+    args,
+    metrics: MetricsLogger,
+    schedule: TrainingSchedule,
+    metadata: TrainingMetadata,
+    deepnorm_calibration: dict,
+    derf_opts: dict,
+) -> None:
     metrics.write(
         "config",
         args=vars(args),
         schedule={
-            "warmup_steps": warmup_steps,
-            "stable_steps": stable_steps,
-            "decay_steps": decay_steps,
-            "count_increment": effective_tokens,
+            "warmup_steps": schedule.warmup_steps,
+            "stable_steps": schedule.stable_steps,
+            "decay_steps": schedule.decay_steps,
+            "count_increment": schedule.effective_tokens,
             "seed": args.seed,
             "data_seed": resolve_data_seed(args),
             "eval_seed": resolve_eval_seed(args),
@@ -303,24 +436,24 @@ def train(args):
         },
         optimizer={
             "name": OPTIMIZER_NAME,
-            "lr_peak": lr_peak,
-            "state_half_life": state_half_life,
-            "beta": beta,
+            "lr_peak": metadata.lr_peak,
+            "state_half_life": metadata.state_half_life,
+            "beta": metadata.beta,
             "derf_lr_peak": args.derf_lr,
             "derf_state_half_life": args.derf_state_half_life,
-            "derf_beta": derf_beta,
+            "derf_beta": metadata.derf_beta,
             "derf_groups": list(derf_opts),
             "kv_decoder_lr_peak": args.kv_decoder_lr,
-            "kv_decoder_beta": kv_decoder_beta,
+            "kv_decoder_beta": metadata.kv_decoder_beta,
             "update_rule": args.hyperball_update,
-            "groups": group_text,
+            "groups": metadata.group_text,
         },
         model={
-            "params": params_info,
+            "params": metadata.params_info,
             "dropout": args.dropout,
             "resid_scale": args.resid_scale,
             "block_type": args.block_type,
-            "deepnorm_alpha": deepnorm_alpha,
+            "deepnorm_alpha": metadata.deepnorm_alpha,
             "deepnorm_branch_scale": args.deepnorm_branch_scale,
             "deepnorm_calibrate_branches": args.deepnorm_calibrate_branches,
             "deepnorm_calibration": deepnorm_calibration,
@@ -330,284 +463,511 @@ def train(args):
             "derf_shift": args.derf_shift,
             "train_derf_shape": args.train_derf_shape,
             "attn_type": args.attn_type,
-            "kv_cache": kv_info,
+            "kv_cache": metadata.kv_info,
             "hidden_ulmo": args.hidden_ulmo,
-            "io_weights": io_weights,
+            "io_weights": metadata.io_weights,
             "embed_ulmo": args.embed_ulmo,
             "out_ulmo": args.out_ulmo,
             "qkv": "fused",
             "spi_iteration": args.spi_iteration,
         },
     )
+
+
+def warn_training_options(args, line_curve_scales: list[float]) -> None:
     if args.track_line_probe and args.grad_accum != 1:
         print("line_probe_disabled_requires_grad_accum_1")
     if line_curve_scales:
         print("line_curve_scales " + ",".join(f"{x:g}" for x in line_curve_scales))
 
-    total_opt_steps = 0
-    best_val = float("inf")
-    max_val = float("-inf")
-    last_train_loss = float("nan")
-    last_val_loss = float("nan")
-    initial_val = None
-    diverged = False
-    diverge_reason = ""
-    train_start = sync_now(device)
-    eval_seconds = 0.0
-    step_stat_accum = {}
 
-    for step in range(args.max_iters):
-        current_lrs = apply_scheduled_lr(
-            opt,
-            step,
-            args.max_iters,
-            warmup_steps,
-            decay_steps,
-            args.schedule_floor,
+def schedule_step_rates(
+    args,
+    opt,
+    derf_opts: dict,
+    kv_decoder_opt,
+    step: int,
+    schedule: TrainingSchedule,
+) -> StepRates:
+    current_lrs = apply_scheduled_lr(
+        opt,
+        step,
+        args.max_iters,
+        schedule.warmup_steps,
+        schedule.decay_steps,
+        args.schedule_floor,
+    )
+    derf_lr = schedule_derf_lr(args, derf_opts, step, schedule)
+    kv_decoder_lr = schedule_kv_decoder_lr(args, kv_decoder_opt, step, schedule)
+    return StepRates(
+        all_lrs=current_lrs,
+        lr=current_lrs.get("hidden", next(iter(current_lrs.values()))),
+        derf_lr=derf_lr,
+        kv_decoder_lr=kv_decoder_lr,
+    )
+
+
+def schedule_derf_lr(
+    args, derf_opts: dict, step: int, schedule: TrainingSchedule
+) -> float:
+    if not derf_opts:
+        return 0.0
+    lr = schedule_at_step(
+        step,
+        args.max_iters,
+        args.derf_lr,
+        args.schedule_floor * args.derf_lr,
+        schedule.warmup_steps,
+        schedule.decay_steps,
+    )
+    for derf_group_opt in derf_opts.values():
+        derf_group_opt.lr = lr
+    return lr
+
+
+def schedule_kv_decoder_lr(args, kv_decoder_opt, step: int, schedule: TrainingSchedule) -> float:
+    if kv_decoder_opt is None:
+        return 0.0
+    lr = schedule_at_step(
+        step,
+        args.max_iters,
+        kv_decoder_opt.lr_peak,
+        args.schedule_floor * kv_decoder_opt.lr_peak,
+        schedule.warmup_steps,
+        schedule.decay_steps,
+    )
+    kv_decoder_opt.lr = lr
+    return lr
+
+
+def should_evaluate(args, step: int) -> bool:
+    return step % args.eval_interval == 0 or step == args.max_iters - 1
+
+
+def run_eval_step(
+    args,
+    components: TrainingComponents,
+    schedule: TrainingSchedule,
+    metadata: TrainingMetadata,
+    progress: TrainingProgress,
+    rates: StepRates,
+    step: int,
+    amp_dtype: torch.dtype | None,
+    device: torch.device,
+) -> None:
+    eval_start = sync_now(device)
+    train_loss = float(progress.last_train_loss)
+    val_loss, logit_stats = estimate_val_metrics(
+        components.model,
+        components.source,
+        args.eval_iters,
+        amp_dtype,
+        args.track_logit_stats,
+        components.eval_batches["val"] if components.eval_batches is not None else None,
+    )
+    progress.last_val_loss = val_loss
+    eval_stats = collect_eval_stats(args, components, progress)
+    update_eval_tracking(progress, args, step, val_loss, components)
+
+    now = sync_now(device)
+    progress.eval_seconds += now - eval_start
+    timing = current_eval_timing(progress, schedule, now)
+    print_eval_status(
+        step,
+        train_loss,
+        val_loss,
+        timing,
+        rates,
+        metadata,
+        eval_stats,
+        logit_stats,
+        device,
+        progress,
+    )
+    memory = cuda_memory_stats(device)
+    write_eval_metrics(
+        components.metrics,
+        step,
+        train_loss,
+        val_loss,
+        timing,
+        rates,
+        metadata,
+        progress,
+        memory,
+        eval_stats,
+        logit_stats,
+    )
+    enforce_cuda_memory_limit(progress, args, memory)
+
+
+def collect_eval_stats(
+    args, components: TrainingComponents, progress: TrainingProgress
+) -> dict:
+    return {
+        "opt": consume_step_stats(progress.step_stat_accum)
+        if args.track_step_stats
+        else {},
+        "weight_rms": optimizer_rms_state(components.opt),
+        "derf": derf_state(components.raw_model),
+        "norm_affine": rmsnorm_affine_state(components.raw_model),
+        "kv_decoder": kv_decoder_state(components.raw_model),
+    }
+
+
+def update_eval_tracking(
+    progress: TrainingProgress,
+    args,
+    step: int,
+    val_loss: float,
+    components: TrainingComponents,
+) -> None:
+    if not math.isfinite(val_loss):
+        progress.mark_diverged("nonfinite_eval_loss")
+        return
+
+    prev_best = progress.best_val
+    if progress.initial_val is None:
+        progress.initial_val = val_loss
+    progress.best_val = min(progress.best_val, val_loss)
+    progress.max_val = max(progress.max_val, val_loss)
+
+    if step > 0 and val_loss > progress.initial_val * args.diverge_mult:
+        progress.mark_diverged(f"val_loss_exceeded_{args.diverge_mult:.2f}x_initial")
+
+    save_eval_artifacts(args, step, val_loss, prev_best, components)
+
+
+def save_eval_artifacts(
+    args,
+    step: int,
+    val_loss: float,
+    prev_best: float,
+    components: TrainingComponents,
+) -> None:
+    if args.no_save:
+        return
+    out_path = Path(args.out_path)
+    if val_loss < prev_best:
+        save_checkpoint(out_path, components.raw_model, components.dataset)
+    save_eval_checkpoint(
+        out_path, step, val_loss, components.raw_model, components.dataset, args
+    )
+    if step == args.max_iters - 1:
+        save_checkpoint(
+            out_path.with_name(f"{out_path.stem}_final{out_path.suffix}"),
+            components.raw_model,
+            components.dataset,
         )
-        lr = current_lrs.get("hidden", next(iter(current_lrs.values())))
-        derf_lr = 0.0
-        if derf_opts:
-            derf_lr = schedule_at_step(
-                step,
-                args.max_iters,
-                args.derf_lr,
-                args.schedule_floor * args.derf_lr,
-                warmup_steps,
-                decay_steps,
-            )
-            for derf_group_opt in derf_opts.values():
-                derf_group_opt.lr = derf_lr
-        kv_decoder_lr = 0.0
-        if kv_decoder_opt is not None:
-            kv_decoder_lr = schedule_at_step(
-                step,
-                args.max_iters,
-                kv_decoder_opt.lr_peak,
-                args.schedule_floor * kv_decoder_opt.lr_peak,
-                warmup_steps,
-                decay_steps,
-            )
-            kv_decoder_opt.lr = kv_decoder_lr
 
-        if step % args.eval_interval == 0 or step == args.max_iters - 1:
-            eval_start = sync_now(device)
-            train_loss = float(last_train_loss)
-            val_loss, logit_stats = estimate_val_metrics(
-                model,
-                source,
-                args.eval_iters,
-                amp_dtype,
-                args.track_logit_stats,
-                eval_batches["val"] if eval_batches is not None else None,
-            )
-            last_val_loss = val_loss
-            opt_stats = (
-                consume_step_stats(step_stat_accum) if args.track_step_stats else {}
-            )
-            weight_rms = optimizer_rms_state(opt)
-            derf_stats = derf_state(raw_model)
-            norm_affine_stats = rmsnorm_affine_state(raw_model)
-            kv_decoder_stats = kv_decoder_state(raw_model)
 
-            if not math.isfinite(val_loss):
-                diverged, diverge_reason = True, "nonfinite_eval_loss"
-            else:
-                prev_best = best_val
-                if initial_val is None:
-                    initial_val = val_loss
-                best_val = min(best_val, val_loss)
-                max_val = max(max_val, val_loss)
-                if step > 0 and val_loss > initial_val * args.diverge_mult:
-                    diverged = True
-                    diverge_reason = (
-                        f"val_loss_exceeded_{args.diverge_mult:.2f}x_initial"
-                    )
-                if not args.no_save and val_loss < prev_best:
-                    save_checkpoint(Path(args.out_path), raw_model, dataset)
-                if not args.no_save:
-                    save_eval_checkpoint(
-                        Path(args.out_path), step, val_loss, raw_model, dataset, args
-                    )
-                    if step == args.max_iters - 1:
-                        path = Path(args.out_path)
-                        save_checkpoint(
-                            path.with_name(f"{path.stem}_final{path.suffix}"),
-                            raw_model,
-                            dataset,
-                        )
+def current_eval_timing(
+    progress: TrainingProgress, schedule: TrainingSchedule, now: float
+) -> EvalTiming:
+    elapsed = max(now - progress.train_start, 1e-9)
+    train_elapsed = max(elapsed - progress.eval_seconds, 1e-9)
+    total_tokens = progress.total_opt_steps * schedule.effective_tokens
+    return EvalTiming(elapsed, train_elapsed, total_tokens)
 
-            now = sync_now(device)
-            eval_seconds += now - eval_start
-            elapsed = max(now - train_start, 1e-9)
-            train_elapsed = max(elapsed - eval_seconds, 1e-9)
-            total_tokens = total_opt_steps * effective_tokens
-            mem_text = cuda_memory_text(device)
-            opt_text = step_stats_text(opt_stats)
-            rms_text = rms_state_text(weight_rms)
-            derf_text = derf_state_text(derf_stats)
-            norm_affine_text = rmsnorm_affine_state_text(norm_affine_stats)
-            kv_decoder_text = kv_decoder_state_text(kv_decoder_stats)
-            logit_text = (
-                " | logits "
-                f"std={logit_stats['logit_std']:.3f},"
-                f"H={logit_stats['softmax_entropy']:.3f},"
-                f"pmax={logit_stats['softmax_max_prob']:.3f}"
-                if logit_stats
-                else ""
-            )
-            print(
-                f"step {step:5d} | lr {lr:.6f} beta {beta:.6f} "
-                f"derf_lr {derf_lr:.6f} kv_decoder_lr {kv_decoder_lr:.6f} | "
-                f"train {train_loss:.4f} | val {val_loss:.4f} | "
-                f"best_val {best_val:.4f} | train_seconds {elapsed:.3f} | "
-                f"tok/s {total_tokens / elapsed:.0f} "
-                f"train_tok/s {total_tokens / train_elapsed:.0f}"
-                f"{mem_text}{logit_text}{rms_text}{derf_text}{norm_affine_text}"
-                f"{kv_decoder_text}{opt_text}"
-            )
-            memory = cuda_memory_stats(device)
-            metrics.write(
-                "eval",
-                step=step,
-                total_opt_steps=total_opt_steps,
-                lr=lr,
-                derf_lr=derf_lr,
-                kv_decoder_lr=kv_decoder_lr,
-                beta=beta,
-                lrs=current_lrs,
-                train_loss=train_loss,
-                val_loss=val_loss,
-                best_val=best_val,
-                max_val=max_val,
-                train_seconds=elapsed,
-                train_compute_seconds=train_elapsed,
-                eval_seconds=eval_seconds,
-                tokens_per_second=total_tokens / elapsed,
-                train_tokens_per_second=total_tokens / train_elapsed,
-                cuda_memory=memory,
-                logit_stats=logit_stats,
-                weight_rms=weight_rms,
-                derf=derf_stats,
-                norm_affine=norm_affine_stats,
-                kv_decoder=kv_decoder_stats,
-                step_stats=opt_stats,
-            )
-            if (
-                args.max_cuda_reserved_gb > 0
-                and memory
-                and memory["reserved_gb"] > args.max_cuda_reserved_gb
-            ):
-                diverged = True
-                diverge_reason = (
-                    f"cuda_reserved_{memory['reserved_gb']:.2f}G_exceeded_"
-                    f"{args.max_cuda_reserved_gb:.2f}G"
-                )
-        if diverged:
-            print(f"diverged {diverge_reason}")
-            break
 
-        line_active = line_probe_active(args, step)
-        line_batch = None
-        line_rng_before = None
-        line_loss_before = None
-        opt.zero_grad(set_to_none=True)
-        if derf_opts:
-            zero_derf_optimizers(derf_opts, set_to_none=True)
-        if kv_decoder_opt is not None:
-            kv_decoder_opt.zero_grad(set_to_none=True)
-        if conv_probe is not None:
-            conv_probe.start_step(step)
-        train_loss = None
-        for micro_step in range(args.grad_accum):
-            batch = source.get("train")
-            if line_active and micro_step == 0:
-                line_batch = batch
-                line_rng_before = capture_rng(device)
-            with amp_ctx(amp_dtype):
-                _, loss = model(*batch)
-                loss = loss / args.grad_accum
-            loss_value = loss.detach()
-            if line_active and micro_step == 0:
-                line_loss_before = float(loss_value)
-            train_loss = loss_value if train_loss is None else train_loss + loss_value
-            loss.backward()
-        if diverged:
-            print(f"diverged {diverge_reason}")
-            break
-        last_train_loss = train_loss if train_loss is not None else float("nan")
+def print_eval_status(
+    step: int,
+    train_loss: float,
+    val_loss: float,
+    timing: EvalTiming,
+    rates: StepRates,
+    metadata: TrainingMetadata,
+    eval_stats: dict,
+    logit_stats: dict,
+    device: torch.device,
+    progress: TrainingProgress,
+) -> None:
+    print(
+        f"step {step:5d} | lr {rates.lr:.6f} beta {metadata.beta:.6f} "
+        f"derf_lr {rates.derf_lr:.6f} "
+        f"kv_decoder_lr {rates.kv_decoder_lr:.6f} | "
+        f"train {train_loss:.4f} | val {val_loss:.4f} | "
+        f"best_val {progress.best_val:.4f} | train_seconds {timing.elapsed:.3f} | "
+        f"tok/s {timing.total_tokens / timing.elapsed:.0f} "
+        f"train_tok/s {timing.total_tokens / timing.train_elapsed:.0f}"
+        f"{cuda_memory_text(device)}{logit_stats_text(logit_stats)}"
+        f"{rms_state_text(eval_stats['weight_rms'])}"
+        f"{derf_state_text(eval_stats['derf'])}"
+        f"{rmsnorm_affine_state_text(eval_stats['norm_affine'])}"
+        f"{kv_decoder_state_text(eval_stats['kv_decoder'])}"
+        f"{step_stats_text(eval_stats['opt'])}"
+    )
 
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
-        if conv_probe is not None:
-            conv_text = conv_probe.capture(step, current_lrs)
-            if conv_text:
-                print(conv_text)
-                metrics.write(
-                    "convergence",
-                    step=step,
-                    total_opt_steps=total_opt_steps,
-                    lrs=current_lrs,
-                    groups=conv_probe.summary,
-                )
-        line_params_before = (
-            capture_params(raw_model.parameters())
-            if line_active and line_curve_scales
-            else None
+
+def logit_stats_text(logit_stats: dict) -> str:
+    if not logit_stats:
+        return ""
+    return (
+        " | logits "
+        f"std={logit_stats['logit_std']:.3f},"
+        f"H={logit_stats['softmax_entropy']:.3f},"
+        f"pmax={logit_stats['softmax_max_prob']:.3f}"
+    )
+
+
+def write_eval_metrics(
+    metrics: MetricsLogger,
+    step: int,
+    train_loss: float,
+    val_loss: float,
+    timing: EvalTiming,
+    rates: StepRates,
+    metadata: TrainingMetadata,
+    progress: TrainingProgress,
+    memory: dict,
+    eval_stats: dict,
+    logit_stats: dict,
+) -> None:
+    metrics.write(
+        "eval",
+        step=step,
+        total_opt_steps=progress.total_opt_steps,
+        lr=rates.lr,
+        derf_lr=rates.derf_lr,
+        kv_decoder_lr=rates.kv_decoder_lr,
+        beta=metadata.beta,
+        lrs=rates.all_lrs,
+        train_loss=train_loss,
+        val_loss=val_loss,
+        best_val=progress.best_val,
+        max_val=progress.max_val,
+        train_seconds=timing.elapsed,
+        train_compute_seconds=timing.train_elapsed,
+        eval_seconds=progress.eval_seconds,
+        tokens_per_second=timing.total_tokens / timing.elapsed,
+        train_tokens_per_second=timing.total_tokens / timing.train_elapsed,
+        cuda_memory=memory,
+        logit_stats=logit_stats,
+        weight_rms=eval_stats["weight_rms"],
+        derf=eval_stats["derf"],
+        norm_affine=eval_stats["norm_affine"],
+        kv_decoder=eval_stats["kv_decoder"],
+        step_stats=eval_stats["opt"],
+    )
+
+
+def enforce_cuda_memory_limit(
+    progress: TrainingProgress, args, memory: dict[str, float]
+) -> None:
+    if (
+        args.max_cuda_reserved_gb > 0
+        and memory
+        and memory["reserved_gb"] > args.max_cuda_reserved_gb
+    ):
+        progress.mark_diverged(
+            f"cuda_reserved_{memory['reserved_gb']:.2f}G_exceeded_"
+            f"{args.max_cuda_reserved_gb:.2f}G"
         )
-        stat_snapshot = (
-            capture_step_stats(opt) if args.track_step_stats or line_active else None
-        )
-        opt.step()
-        if derf_opts:
-            step_derf_optimizers(derf_opts)
-        if kv_decoder_opt is not None:
-            kv_decoder_opt.step()
-        line_stats = {}
-        if stat_snapshot is not None:
-            if args.track_step_stats:
-                accumulate_step_stats(step_stat_accum, stat_snapshot)
-            if line_active:
-                line_stat_accum = {}
-                accumulate_step_stats(line_stat_accum, stat_snapshot)
-                line_stats = consume_step_stats(line_stat_accum)
-        total_opt_steps = step + 1
-        if line_active:
-            line_record = run_line_probe(
-                model,
-                step,
-                line_batch,
-                line_rng_before,
-                line_loss_before,
-                line_params_before,
-                line_curve_scales,
-                line_stats,
-                amp_dtype,
-                device,
-            )
-            if line_record:
-                metrics.write(
-                    "line_probe",
-                    step=step,
-                    total_opt_steps=total_opt_steps,
-                    **line_record,
-                )
 
-    if not (args.skip_sample or diverged):
-        prompt = args.prompt or "\n"
-        x = torch.tensor([dataset.encode(prompt)], dtype=torch.long, device=device)
-        texts = generate_texts(
-            raw_model,
-            x,
-            dataset.decode,
-            args.sample_count,
-            args.sample_tokens,
-            args.temperature,
-            args.top_k,
-        )
-        if not write_sample_report(args, texts):
-            print_samples(texts)
 
+def run_training_step(
+    args,
+    components: TrainingComponents,
+    progress: TrainingProgress,
+    rates: StepRates,
+    line_curve_scales: list[float],
+    step: int,
+    amp_dtype: torch.dtype | None,
+    device: torch.device,
+) -> None:
+    line_active = line_probe_active(args, step)
+    line_context = LineProbeContext()
+    zero_training_optimizers(components)
+    if components.conv_probe is not None:
+        components.conv_probe.start_step(step)
+
+    train_loss = accumulate_microbatches(
+        components.model,
+        components.source,
+        args,
+        amp_dtype,
+        device,
+        line_active,
+        line_context,
+    )
+    progress.last_train_loss = (
+        float(train_loss) if train_loss is not None else float("nan")
+    )
+    apply_gradient_clipping(args, components.raw_model)
+    capture_convergence(components, progress, rates, step)
+
+    if line_active and line_curve_scales:
+        line_context.params_before = capture_params(components.raw_model.parameters())
+
+    stat_snapshot = capture_training_step_stats(args, components.opt, line_active)
+    step_training_optimizers(components)
+    line_stats = consume_training_step_stats(
+        args, progress.step_stat_accum, stat_snapshot, line_active
+    )
+    progress.total_opt_steps = step + 1
+    record_line_probe(
+        args,
+        components,
+        progress,
+        line_context,
+        line_curve_scales,
+        line_stats,
+        step,
+        amp_dtype,
+        device,
+        line_active,
+    )
+
+
+def zero_training_optimizers(components: TrainingComponents) -> None:
+    components.opt.zero_grad(set_to_none=True)
+    if components.derf_opts:
+        zero_derf_optimizers(components.derf_opts, set_to_none=True)
+    if components.kv_decoder_opt is not None:
+        components.kv_decoder_opt.zero_grad(set_to_none=True)
+
+
+def accumulate_microbatches(
+    model,
+    source: BatchSource,
+    args,
+    amp_dtype: torch.dtype | None,
+    device: torch.device,
+    line_active: bool,
+    line_context: LineProbeContext,
+) -> torch.Tensor | None:
+    train_loss = None
+    for micro_step in range(args.grad_accum):
+        batch = source.get("train")
+        if line_active and micro_step == 0:
+            line_context.batch = batch
+            line_context.rng_before = capture_rng(device)
+        with amp_ctx(amp_dtype):
+            _, loss = model(*batch)
+            loss = loss / args.grad_accum
+        loss_value = loss.detach()
+        if line_active and micro_step == 0:
+            line_context.loss_before = float(loss_value)
+        train_loss = loss_value if train_loss is None else train_loss + loss_value
+        loss.backward()
+    return train_loss
+
+
+def apply_gradient_clipping(args, raw_model: GPT) -> None:
+    if args.grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
+
+
+def capture_convergence(
+    components: TrainingComponents,
+    progress: TrainingProgress,
+    rates: StepRates,
+    step: int,
+) -> None:
+    if components.conv_probe is None:
+        return
+    conv_text = components.conv_probe.capture(step, rates.all_lrs)
+    if not conv_text:
+        return
+    print(conv_text)
+    components.metrics.write(
+        "convergence",
+        step=step,
+        total_opt_steps=progress.total_opt_steps,
+        lrs=rates.all_lrs,
+        groups=components.conv_probe.summary,
+    )
+
+
+def capture_training_step_stats(args, opt, line_active: bool):
+    if args.track_step_stats or line_active:
+        return capture_step_stats(opt)
+    return None
+
+
+def step_training_optimizers(components: TrainingComponents) -> None:
+    components.opt.step()
+    if components.derf_opts:
+        step_derf_optimizers(components.derf_opts)
+    if components.kv_decoder_opt is not None:
+        components.kv_decoder_opt.step()
+
+
+def consume_training_step_stats(
+    args, step_stat_accum: dict, stat_snapshot, line_active: bool
+) -> dict:
+    if stat_snapshot is None:
+        return {}
+    if args.track_step_stats:
+        accumulate_step_stats(step_stat_accum, stat_snapshot)
+    if not line_active:
+        return {}
+    line_stat_accum = {}
+    accumulate_step_stats(line_stat_accum, stat_snapshot)
+    return consume_step_stats(line_stat_accum)
+
+
+def record_line_probe(
+    args,
+    components: TrainingComponents,
+    progress: TrainingProgress,
+    line_context: LineProbeContext,
+    line_curve_scales: list[float],
+    line_stats: dict,
+    step: int,
+    amp_dtype: torch.dtype | None,
+    device: torch.device,
+    line_active: bool,
+) -> None:
+    if not line_active:
+        return
+    line_record = run_line_probe(
+        components.model,
+        step,
+        line_context.batch,
+        line_context.rng_before,
+        line_context.loss_before,
+        line_context.params_before,
+        line_curve_scales,
+        line_stats,
+        amp_dtype,
+        device,
+    )
+    if not line_record:
+        return
+    components.metrics.write(
+        "line_probe",
+        step=step,
+        total_opt_steps=progress.total_opt_steps,
+        **line_record,
+    )
+
+
+def maybe_generate_samples(
+    args,
+    raw_model: GPT,
+    dataset,
+    device: torch.device,
+    diverged: bool,
+) -> None:
+    if args.skip_sample or diverged:
+        return
+    prompt = args.prompt or "\n"
+    x = torch.tensor([dataset.encode(prompt)], dtype=torch.long, device=device)
+    texts = generate_texts(
+        raw_model,
+        x,
+        dataset.decode,
+        args.sample_count,
+        args.sample_tokens,
+        args.temperature,
+        args.top_k,
+    )
+    if not write_sample_report(args, texts):
+        print_samples(texts)
+
+
+def print_ulmo_stats(opt) -> None:
     for group in opt.param_groups:
         stats = getattr(group.get("ulmo"), "stats", None)
         if stats:
@@ -616,22 +976,102 @@ def train(args):
                 + " ".join(f"{k}={v}" for k, v in stats.items())
             )
 
-    last_train_loss = float(last_train_loss)
-    result = {
-        "best_val": best_val,
-        "final_train": last_train_loss,
-        "final_val": last_val_loss,
+
+def final_training_result(
+    progress: TrainingProgress,
+    schedule: TrainingSchedule,
+    compile_seconds: float,
+) -> dict:
+    return {
+        "best_val": progress.best_val,
+        "final_train": progress.last_train_loss,
+        "final_val": progress.last_val_loss,
         "compile_seconds": compile_seconds,
-        "initial_val": float("nan") if initial_val is None else initial_val,
-        "max_val": max_val,
-        "diverged": diverged,
-        "diverge_reason": diverge_reason,
-        "warmup_steps": warmup_steps,
-        "stable_steps": stable_steps,
-        "decay_steps": decay_steps,
+        "initial_val": float("nan")
+        if progress.initial_val is None
+        else progress.initial_val,
+        "max_val": progress.max_val,
+        "diverged": progress.diverged,
+        "diverge_reason": progress.diverge_reason,
+        "warmup_steps": schedule.warmup_steps,
+        "stable_steps": schedule.stable_steps,
+        "decay_steps": schedule.decay_steps,
     }
-    metrics.write("final", **result)
-    metrics.close()
+
+
+def train(args):
+    args.hyperball_update = resolve_hyperball_update(args)
+    device, amp_dtype = configure_runtime(args)
+    line_curve_scales = parse_line_scales(args.line_curve_scales)
+    if line_curve_scales:
+        args.track_line_probe = True
+
+    components = build_training_components(args, device, amp_dtype)
+    schedule = make_training_schedule(args)
+    metadata = collect_training_metadata(
+        components.raw_model,
+        components.opt,
+        components.derf_opts,
+        components.kv_decoder_opt,
+    )
+    print_training_config(args, schedule, metadata)
+    write_config_metrics(
+        args,
+        components.metrics,
+        schedule,
+        metadata,
+        components.deepnorm_calibration,
+        components.derf_opts,
+    )
+    warn_training_options(args, line_curve_scales)
+
+    progress = TrainingProgress(train_start=sync_now(device))
+    for step in range(args.max_iters):
+        rates = schedule_step_rates(
+            args,
+            components.opt,
+            components.derf_opts,
+            components.kv_decoder_opt,
+            step,
+            schedule,
+        )
+        if should_evaluate(args, step):
+            run_eval_step(
+                args,
+                components,
+                schedule,
+                metadata,
+                progress,
+                rates,
+                step,
+                amp_dtype,
+                device,
+            )
+        if progress.diverged:
+            print(f"diverged {progress.diverge_reason}")
+            break
+        run_training_step(
+            args,
+            components,
+            progress,
+            rates,
+            line_curve_scales,
+            step,
+            amp_dtype,
+            device,
+        )
+
+    maybe_generate_samples(
+        args,
+        components.raw_model,
+        components.dataset,
+        device,
+        progress.diverged,
+    )
+    print_ulmo_stats(components.opt)
+    result = final_training_result(progress, schedule, components.compile_seconds)
+    components.metrics.write("final", **result)
+    components.metrics.close()
     return result
 
 

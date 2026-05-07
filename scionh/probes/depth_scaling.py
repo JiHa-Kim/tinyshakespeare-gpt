@@ -77,12 +77,7 @@ def _attention_simplex_stats(module, x: torch.Tensor) -> dict[str, float]:
     }
 
 
-def collect_depth_scaling_diagnostics(
-    model: GPT, idx: torch.Tensor, targets: torch.Tensor
-) -> dict:
-    records: dict[int, dict] = {}
-    handles = []
-
+def _register_depth_hooks(model: GPT, records: dict[int, dict]) -> list:
     def pre_hook(layer: int):
         def hook(_module, inputs):
             x = inputs[0]
@@ -129,6 +124,7 @@ def collect_depth_scaling_diagnostics(
 
         return hook
 
+    handles = []
     for layer, block in enumerate(model.blocks):
         handles.append(block.register_forward_pre_hook(pre_hook(layer)))
         handles.append(block.register_forward_hook(fwd_hook(layer)))
@@ -136,7 +132,15 @@ def collect_depth_scaling_diagnostics(
         handles.append(block.attn.register_forward_hook(attn_out_hook(layer)))
         handles.append(block.mlp.register_forward_pre_hook(mlp_pre_hook(layer)))
         handles.append(block.mlp.register_forward_hook(mlp_out_hook(layer)))
+    return handles
 
+
+def _run_depth_probe(
+    model: GPT,
+    idx: torch.Tensor,
+    targets: torch.Tensor,
+    handles: list,
+) -> float:
     was_training = model.training
     model.eval()
     model.zero_grad(set_to_none=True)
@@ -145,75 +149,106 @@ def collect_depth_scaling_diagnostics(
         if loss is None:
             raise RuntimeError("depth diagnostics require targets")
         loss.backward()
+        return float(loss.detach())
     finally:
         for handle in handles:
             handle.remove()
         model.train(was_training)
 
-    layers = []
-    for layer in sorted(records):
-        rec = records[layer]
-        x = rec["input"]
-        y = rec["output"]
-        gx = x.grad
-        gy = y.grad
-        x_rms = _rms(x)
-        y_rms = _rms(y)
-        delta_rms = _rms(y - x)
-        attn_branch_ratio = math.nan
-        mlp_branch_ratio = math.nan
-        attn_scale = math.nan
-        mlp_scale = math.nan
-        if rec["block_type"] == "deepnorm":
-            block = model.blocks[layer]
-            attn_scale = float(block.deepnorm_attn_scale)
-            mlp_scale = float(block.deepnorm_mlp_scale)
-            alpha = float(rec["deepnorm_alpha"])
-            attn_out = rec.get("attn_out")
-            if attn_out is not None and x_rms > 0.0:
-                attn_branch_ratio = attn_scale * _rms(attn_out) / (alpha * x_rms)
-            mlp_input = rec.get("mlp_input")
-            mlp_out = rec.get("mlp_out")
-            if mlp_input is not None and mlp_out is not None:
-                mlp_input_rms = _rms(mlp_input)
-                if mlp_input_rms > 0.0:
-                    mlp_branch_ratio = (
-                        mlp_scale * _rms(mlp_out) / (alpha * mlp_input_rms)
-                    )
-        grad_in_rms = _rms(gx) if gx is not None else math.nan
-        grad_out_rms = _rms(gy) if gy is not None else math.nan
-        grad_transport = (
-            grad_in_rms / grad_out_rms
-            if grad_out_rms and math.isfinite(grad_out_rms)
-            else math.nan
-        )
-        ranks = _effective_rank(y)
-        layers.append(
-            {
-                "layer": layer,
-                "block_type": rec["block_type"],
-                "deepnorm_alpha": rec["deepnorm_alpha"],
-                "lns_scale": rec["lns_scale"],
-                "input_rms": x_rms,
-                "output_rms": y_rms,
-                "delta_rms": delta_rms,
-                "delta_ratio": delta_rms / x_rms if x_rms > 0.0 else math.nan,
-                "attn_scale": attn_scale,
-                "mlp_scale": mlp_scale,
-                "attn_branch_ratio": attn_branch_ratio,
-                "mlp_branch_ratio": mlp_branch_ratio,
-                "grad_in_rms": grad_in_rms,
-                "grad_out_rms": grad_out_rms,
-                "grad_transport": grad_transport,
-                **ranks,
-                "attn_entropy": rec.get("attn_entropy", math.nan),
-                "attn_entropy_norm": rec.get("attn_entropy_norm", math.nan),
-                "attn_eff_support_frac": rec.get("attn_eff_support_frac", math.nan),
-                "attn_max_prob": rec.get("attn_max_prob", math.nan),
-                "attn_score_rms": rec.get("attn_score_rms", math.nan),
-            }
-        )
 
+def _deepnorm_branch_stats(
+    model: GPT, layer: int, rec: dict, x_rms: float
+) -> dict[str, float]:
+    if rec["block_type"] != "deepnorm":
+        return {
+            "attn_scale": math.nan,
+            "mlp_scale": math.nan,
+            "attn_branch_ratio": math.nan,
+            "mlp_branch_ratio": math.nan,
+        }
+
+    block = model.blocks[layer]
+    attn_scale = float(block.deepnorm_attn_scale)
+    mlp_scale = float(block.deepnorm_mlp_scale)
+    alpha = float(rec["deepnorm_alpha"])
+    return {
+        "attn_scale": attn_scale,
+        "mlp_scale": mlp_scale,
+        "attn_branch_ratio": _attn_branch_ratio(rec, attn_scale, alpha, x_rms),
+        "mlp_branch_ratio": _mlp_branch_ratio(rec, mlp_scale, alpha),
+    }
+
+
+def _attn_branch_ratio(
+    rec: dict, attn_scale: float, alpha: float, x_rms: float
+) -> float:
+    attn_out = rec.get("attn_out")
+    if attn_out is None or x_rms <= 0.0:
+        return math.nan
+    return attn_scale * _rms(attn_out) / (alpha * x_rms)
+
+
+def _mlp_branch_ratio(rec: dict, mlp_scale: float, alpha: float) -> float:
+    mlp_input = rec.get("mlp_input")
+    mlp_out = rec.get("mlp_out")
+    if mlp_input is None or mlp_out is None:
+        return math.nan
+    mlp_input_rms = _rms(mlp_input)
+    if mlp_input_rms <= 0.0:
+        return math.nan
+    return mlp_scale * _rms(mlp_out) / (alpha * mlp_input_rms)
+
+
+def _layer_diagnostics(model: GPT, layer: int, rec: dict) -> dict:
+    x = rec["input"]
+    y = rec["output"]
+    x_rms = _rms(x)
+    y_rms = _rms(y)
+    delta_rms = _rms(y - x)
+    grad_in_rms = _rms(x.grad) if x.grad is not None else math.nan
+    grad_out_rms = _rms(y.grad) if y.grad is not None else math.nan
+    grad_transport = (
+        grad_in_rms / grad_out_rms
+        if grad_out_rms and math.isfinite(grad_out_rms)
+        else math.nan
+    )
+    return {
+        "layer": layer,
+        "block_type": rec["block_type"],
+        "deepnorm_alpha": rec["deepnorm_alpha"],
+        "lns_scale": rec["lns_scale"],
+        "input_rms": x_rms,
+        "output_rms": y_rms,
+        "delta_rms": delta_rms,
+        "delta_ratio": delta_rms / x_rms if x_rms > 0.0 else math.nan,
+        **_deepnorm_branch_stats(model, layer, rec, x_rms),
+        "grad_in_rms": grad_in_rms,
+        "grad_out_rms": grad_out_rms,
+        "grad_transport": grad_transport,
+        **_effective_rank(y),
+        "attn_entropy": rec.get("attn_entropy", math.nan),
+        "attn_entropy_norm": rec.get("attn_entropy_norm", math.nan),
+        "attn_eff_support_frac": rec.get("attn_eff_support_frac", math.nan),
+        "attn_max_prob": rec.get("attn_max_prob", math.nan),
+        "attn_score_rms": rec.get("attn_score_rms", math.nan),
+    }
+
+
+def _finite_field(layers: list[dict], field: str) -> list[float]:
+    return [row[field] for row in layers if math.isfinite(row[field])]
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else math.nan
+
+
+def _geomean(values: list[float]) -> float:
+    if not values:
+        return math.nan
+    return math.exp(sum(math.log(x) for x in values) / len(values))
+
+
+def _depth_summary(model: GPT, loss: float, layers: list[dict]) -> dict:
     finite_transport = [
         max(1e-30, row["grad_transport"])
         for row in layers
@@ -224,50 +259,40 @@ def collect_depth_scaling_diagnostics(
         for row in layers
         if math.isfinite(row["entropy_rank"])
     ]
-    finite_attn_entropy = [
-        row["attn_entropy_norm"]
-        for row in layers
-        if math.isfinite(row["attn_entropy_norm"])
-    ]
-    finite_attn_branch = [
-        row["attn_branch_ratio"]
-        for row in layers
-        if math.isfinite(row["attn_branch_ratio"])
-    ]
-    finite_mlp_branch = [
-        row["mlp_branch_ratio"]
-        for row in layers
-        if math.isfinite(row["mlp_branch_ratio"])
-    ]
-    summary = {
-        "loss": float(loss.detach()),
+    finite_attn_entropy = _finite_field(layers, "attn_entropy_norm")
+    finite_attn_branch = _finite_field(layers, "attn_branch_ratio")
+    finite_mlp_branch = _finite_field(layers, "mlp_branch_ratio")
+    return {
+        "loss": loss,
         "layers": len(layers),
         "d_model": model.cfg.d_model,
         "block_type": model.cfg.block_type,
         "deepnorm_alpha": model.cfg.resolved_deepnorm_alpha,
         "lns": model.cfg.lns,
-        "grad_transport_geomean": math.exp(
-            sum(math.log(x) for x in finite_transport) / len(finite_transport)
-        )
-        if finite_transport
-        else math.nan,
+        "grad_transport_geomean": _geomean(finite_transport),
         "grad_transport_min": min(finite_transport) if finite_transport else math.nan,
         "grad_transport_max": max(finite_transport) if finite_transport else math.nan,
         "entropy_rank_frac_min": min(finite_rank_frac) if finite_rank_frac else math.nan,
         "entropy_rank_frac_last": finite_rank_frac[-1] if finite_rank_frac else math.nan,
-        "attn_entropy_norm_mean": sum(finite_attn_entropy) / len(finite_attn_entropy)
-        if finite_attn_entropy
-        else math.nan,
+        "attn_entropy_norm_mean": _mean(finite_attn_entropy),
         "attn_entropy_norm_min": min(finite_attn_entropy)
         if finite_attn_entropy
         else math.nan,
-        "attn_branch_ratio_mean": sum(finite_attn_branch) / len(finite_attn_branch)
-        if finite_attn_branch
-        else math.nan,
-        "mlp_branch_ratio_mean": sum(finite_mlp_branch) / len(finite_mlp_branch)
-        if finite_mlp_branch
-        else math.nan,
+        "attn_branch_ratio_mean": _mean(finite_attn_branch),
+        "mlp_branch_ratio_mean": _mean(finite_mlp_branch),
     }
+
+
+def collect_depth_scaling_diagnostics(
+    model: GPT, idx: torch.Tensor, targets: torch.Tensor
+) -> dict:
+    records: dict[int, dict] = {}
+    handles = _register_depth_hooks(model, records)
+    loss = _run_depth_probe(model, idx, targets, handles)
+    layers = [
+        _layer_diagnostics(model, layer, records[layer]) for layer in sorted(records)
+    ]
+    summary = _depth_summary(model, loss, layers)
     return {"summary": summary, "layers": layers}
 
 
