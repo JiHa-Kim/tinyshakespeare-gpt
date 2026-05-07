@@ -14,6 +14,7 @@ class ConvergenceItem:
     opt_group: dict
     param: torch.Tensor
     ulmo: object
+    state: dict
 
 
 _SpectralPowerKey = tuple[int, str]
@@ -23,6 +24,9 @@ _PrevState = tuple[torch.Tensor, torch.Tensor] | None
 _ConvergenceRecord = tuple[ConvergenceItem, torch.Tensor, _PrevState]
 _SpectralDualRequest = tuple[int, ConvergenceItem, torch.Tensor]
 _SpectralDualGroupKey = tuple[torch.device, tuple[int, int]]
+_NuclearRequest = tuple[int, torch.Tensor]
+_NuclearGroupKey = tuple[torch.device, tuple[int, int]]
+_SpectralOracleResult = tuple[float, torch.Tensor]
 _STREAMING_POWER_COLD_STEPS = 4
 _STREAMING_POWER_WARM_STEPS = 1
 _NUCLEAR_SUPPORT_STEPS = 7
@@ -113,9 +117,16 @@ def is_spectral_ulmo(ulmo) -> bool:
     return bool(ulmo.geometry.is_spectral)
 
 
+def uses_global_spectral_support(ulmo) -> bool:
+    return bool(ulmo.geometry.kind == "spectral")
+
+
 def dual_norm(
     x: torch.Tensor, ulmo, eps: float = 1e-12, param: torch.Tensor | None = None
 ) -> float:
+    custom = getattr(ulmo, "dual_norm", None)
+    if custom is not None:
+        return float(custom(x, eps))
     x = x.float()
     geometry = ulmo.geometry
     if geometry.is_spectral:
@@ -150,7 +161,9 @@ def spectral_nuclear_support_batch(
     eps: float = 1e-7,
     work_dtype: torch.dtype | None = torch.float16,
 ) -> torch.Tensor:
-    polar = gram_newton_schulz_polar(batch, steps, eps, work_dtype, 1.05).float()
+    polar = gram_newton_schulz_polar(
+        batch, steps, eps, work_dtype, 1.05, compile_scale=False
+    ).float()
     return (batch.float() * polar).sum(dim=(-2, -1)).abs()
 
 
@@ -172,6 +185,9 @@ def spectral_nuclear_support_estimate(
 
 
 def primal_norm(x: torch.Tensor, ulmo, eps: float = 1e-12) -> float:
+    custom = getattr(ulmo, "primal_norm", None)
+    if custom is not None:
+        return float(custom(x, eps))
     x = x.float()
     geometry = ulmo.geometry
     if geometry.is_spectral:
@@ -179,12 +195,67 @@ def primal_norm(x: torch.Tensor, ulmo, eps: float = 1e-12) -> float:
     return float(geometry.primal_norm(x, eps))
 
 
-def stable_rank_from_input(x: torch.Tensor, eps: float = 1e-12) -> float:
+def activation_stats_from_input(
+    x: torch.Tensor, eps: float = 1e-12
+) -> dict[str, object]:
     flat = x.detach().reshape(-1, x.size(-1)).float()
     gram = (flat.mT @ flat).float()
     fro_sq = gram.diagonal().sum().clamp_min(eps)
     op_sq = torch.linalg.eigvalsh(gram).amax().clamp_min(eps)
-    return float(fro_sq / op_sq)
+    return {
+        "fro": float(fro_sq.sqrt()),
+        "op": float(op_sq.sqrt()),
+        "stable_rank": float(fro_sq / op_sq),
+        "gram": gram.detach(),
+        "kind": "linear",
+    }
+
+
+def activation_norms_from_input(x: torch.Tensor, eps: float = 1e-12) -> dict[str, float]:
+    stats = activation_stats_from_input(x, eps)
+    return {
+        "fro": float(stats["fro"]),
+        "op": float(stats["op"]),
+        "stable_rank": float(stats["stable_rank"]),
+    }
+
+
+def stable_rank_from_input(x: torch.Tensor, eps: float = 1e-12) -> float:
+    return activation_norms_from_input(x, eps)["stable_rank"]
+
+
+def token_indicator_stats(tokens: torch.Tensor, eps: float = 1e-12) -> dict[str, object]:
+    flat = tokens.detach().reshape(-1)
+    total = int(flat.numel())
+    if total <= 0:
+        counts = torch.zeros(0, dtype=torch.float32, device=tokens.device)
+        return {
+            "fro": 0.0,
+            "op": eps**0.5,
+            "stable_rank": 0.0,
+            "counts": counts,
+            "kind": "embedding",
+        }
+    counts = torch.bincount(flat.to(dtype=torch.long)).float()
+    max_count = float(counts.max()) if counts.numel() else 0.0
+    fro_sq = float(total)
+    op_sq = max(max_count, eps)
+    return {
+        "fro": fro_sq**0.5,
+        "op": op_sq**0.5,
+        "stable_rank": fro_sq / op_sq,
+        "counts": counts.detach(),
+        "kind": "embedding",
+    }
+
+
+def token_indicator_norms(tokens: torch.Tensor, eps: float = 1e-12) -> dict[str, float]:
+    stats = token_indicator_stats(tokens, eps)
+    return {
+        "fro": float(stats["fro"]),
+        "op": float(stats["op"]),
+        "stable_rank": float(stats["stable_rank"]),
+    }
 
 
 class ConvergenceProbe:
@@ -197,8 +268,9 @@ class ConvergenceProbe:
         self.keep_prev_gpu = False
         self.prev: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.prev_gpu: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.input_sr: dict[int, float] = {}
+        self.input_norms: dict[int, dict[str, object]] = {}
         self.summary: dict[str, dict[str, float]] = {}
+        self.details: list[dict[str, float | str | list[int]]] = []
         self.spectral_norms = StreamingSpectralNormEstimator(self.eps)
         self.support_steps = max(
             1,
@@ -212,6 +284,7 @@ class ConvergenceProbe:
                 group.get("name", "group"),
                 group,
                 group["ulmo"],
+                opt.state[p],
             )
             for group in opt.param_groups
             for p in group["params"]
@@ -223,8 +296,8 @@ class ConvergenceProbe:
                 continue
             if keep is not None and name not in keep:
                 continue
-            group, opt_group, ulmo = groups[id(p)]
-            items.append(ConvergenceItem(name, group, opt_group, p, ulmo))
+            group, opt_group, ulmo, state = groups[id(p)]
+            items.append(ConvergenceItem(name, group, opt_group, p, ulmo, state))
         return items
 
     def _probe_names(self, model: GPT) -> set[str]:
@@ -247,26 +320,34 @@ class ConvergenceProbe:
         )
         self.keep_prev_gpu = self.interval > 0 and (step + 1) % self.interval == 0
         if self.active:
-            self.input_sr.clear()
+            self.input_norms.clear()
+            self.details = []
 
     def register_hooks(self, model: GPT):
         selected = {id(item.param) for item in self.items}
         handles = []
         for module in model.modules():
-            if not isinstance(module, torch.nn.Linear):
+            if not isinstance(module, (torch.nn.Embedding, torch.nn.Linear)):
                 continue
             weight = getattr(module, "weight", None)
             if weight is None or id(weight) not in selected:
                 continue
-            handles.append(module.register_forward_pre_hook(self._make_hook(weight)))
+            handles.append(module.register_forward_pre_hook(self._make_hook(module, weight)))
         return handles
 
-    def _make_hook(self, weight: torch.Tensor):
+    def _make_hook(self, module: torch.nn.Module, weight: torch.Tensor):
         def hook(module, inputs):
             if not (self.active and module.training and torch.is_grad_enabled()):
                 return
             with torch.no_grad():
-                self.input_sr[id(weight)] = stable_rank_from_input(inputs[0], self.eps)
+                if isinstance(module, torch.nn.Embedding):
+                    self.input_norms[id(weight)] = token_indicator_stats(
+                        inputs[0], self.eps
+                    )
+                else:
+                    self.input_norms[id(weight)] = activation_stats_from_input(
+                        inputs[0], self.eps
+                    )
 
         return hook
 
@@ -362,9 +443,83 @@ class ConvergenceProbe:
                 results[key] = max(float(value) * scales[key], 0.0)
         return results
 
+    def _effective_momentum(
+        self, item: ConvergenceItem, grad: torch.Tensor
+    ) -> torch.Tensor:
+        beta = float(item.opt_group.get("beta", 0.0))
+        previous = item.state.get("m")
+        if previous is None:
+            return grad.detach() * (1.0 - beta)
+        return previous.detach().to(device=grad.device, dtype=grad.dtype).lerp(
+            grad.detach(), 1.0 - beta
+        )
+
+    def _momentum_spectral_oracle_stats(
+        self, records: list[_ConvergenceRecord]
+    ) -> dict[int, _SpectralOracleResult]:
+        requests: list[tuple[int, torch.Tensor, bool]] = []
+        for item, grad, _ in records:
+            momentum = self._effective_momentum(item, grad)
+            if momentum.ndim != 2 or momentum.numel() == 0:
+                continue
+            work = momentum.detach().float()
+            transposed = work.size(0) < work.size(1)
+            if work.size(0) < work.size(1):
+                work = work.mT
+            requests.append((id(item.param), work, transposed))
+        return self._spectral_oracle_stats(requests)
+
+    def _spectral_oracle_stats(
+        self, requests: list[tuple[int, torch.Tensor, bool]]
+    ) -> dict[int, _SpectralOracleResult]:
+        results: dict[int, _SpectralOracleResult] = {}
+        groups: dict[_NuclearGroupKey, list[tuple[int, torch.Tensor, bool]]] = {}
+        for key, work, transposed in requests:
+            groups.setdefault((work.device, tuple(work.shape)), []).append(
+                (key, work, transposed)
+            )
+
+        for items in groups.values():
+            batch = torch.stack([x for _, x, _ in items]).contiguous()
+            polar = gram_newton_schulz_polar(
+                batch,
+                self.support_steps,
+                1e-7,
+                torch.float16 if batch.is_cuda else torch.float32,
+                1.05,
+                compile_scale=False,
+            ).float()
+            trace_norm = (batch.float() * polar).sum(dim=(-2, -1)).abs()
+            for (key, _, transposed), value, polar_item in zip(
+                items, trace_norm.detach().cpu().tolist(), polar, strict=True
+            ):
+                atom = polar_item.mT if transposed else polar_item
+                results[key] = (max(float(value), 0.0), atom.detach())
+        return results
+
+    def _nuclear_norms(self, requests: list[_NuclearRequest]) -> dict[int, float]:
+        results: dict[int, float] = {}
+        groups: dict[_NuclearGroupKey, list[_NuclearRequest]] = {}
+        for key, work in requests:
+            groups.setdefault((work.device, tuple(work.shape)), []).append((key, work))
+
+        for items in groups.values():
+            batch = torch.stack([x for _, x in items]).contiguous()
+            trace_norm = spectral_nuclear_support_batch(
+                batch,
+                self.support_steps,
+                1e-7,
+                torch.float16 if batch.is_cuda else torch.float32,
+            )
+            for (key, _), value in zip(
+                items, trace_norm.detach().cpu().tolist(), strict=True
+            ):
+                results[key] = max(float(value), 0.0)
+        return results
+
     def _can_stream_spectral_norm(self, item: ConvergenceItem, x: torch.Tensor) -> bool:
         return (
-            is_spectral_ulmo(item.ulmo)
+            uses_global_spectral_support(item.ulmo)
             and x.ndim == 2
             and x.numel() > 0
             and x.device.type == "cuda"
@@ -427,23 +582,212 @@ class ConvergenceProbe:
         self._append(stats, "action_eff", lr * l1hat)
         return current_grad, current_param
 
-    def _append_spec_ratio(
+    def _spectral_reference_scale(
+        self, item: ConvergenceItem, x: torch.Tensor
+    ) -> float:
+        if x.ndim != 2 or x.size(1) <= 0:
+            return 1.0
+        scale = math.sqrt(x.size(0) / x.size(1))
+        if item.name == "tok_emb.weight":
+            return max(1.0, scale)
+        return scale
+
+    def _sign_atom(self, x: torch.Tensor) -> torch.Tensor:
+        return x.detach().float().sign().mul(-1.0 / max(x.size(1), 1))
+
+    def _colnorm_atom(self, item: ConvergenceItem, x: torch.Tensor) -> torch.Tensor:
+        transpose = item.group in {"embed", "out"}
+        oriented = x.detach().float().mT if transpose else x.detach().float()
+        norms = torch.linalg.vector_norm(oriented, dim=0, keepdim=True).clamp_min(
+            self.eps
+        )
+        atom = oriented.div(norms).mul(-math.sqrt(max(oriented.size(0), 1)))
+        return atom.mT if transpose else atom
+
+    def _frobenius_atom(self, x: torch.Tensor) -> torch.Tensor:
+        work = x.detach().float()
+        norm = torch.linalg.vector_norm(work).clamp_min(self.eps)
+        return work.mul(-math.sqrt(max(work.numel(), 1)) / norm)
+
+    def _activation_curvature(
+        self, item: ConvergenceItem, atom: torch.Tensor
+    ) -> float | None:
+        input_norms = self.input_norms.get(id(item.param))
+        if input_norms is None or atom.ndim != 2:
+            return None
+
+        z = atom.detach().float()
+        kind = input_norms.get("kind")
+        if kind == "embedding":
+            counts = input_norms.get("counts")
+            if not isinstance(counts, torch.Tensor):
+                return None
+            counts = counts.to(device=z.device, dtype=torch.float32)
+            rows = min(z.size(0), counts.numel())
+            if rows <= 0:
+                return 0.0
+            value = z[:rows].square().sum(dim=1).mul(counts[:rows]).sum()
+            return float(value.clamp_min(0.0))
+
+        gram = input_norms.get("gram")
+        if not isinstance(gram, torch.Tensor) or gram.size(0) != z.size(1):
+            return None
+        gram = gram.to(device=z.device, dtype=torch.float32)
+        value = (z @ gram).mul(z).sum()
+        return float(value.clamp_min(0.0))
+
+    def _oracle_prediction_stats(
+        self,
+        item: ConvergenceItem,
+        grad: torch.Tensor,
+        momentum: torch.Tensor,
+        spectral: _SpectralOracleResult | None,
+    ) -> dict[str, float]:
+        if grad.ndim != 2 or momentum.ndim != 2:
+            return {}
+
+        atoms = {
+            "sign": self._sign_atom(momentum),
+            "colnorm": self._colnorm_atom(item, momentum),
+            "fro": self._frobenius_atom(momentum),
+        }
+        if spectral is not None:
+            _, polar = spectral
+            scale = self._spectral_reference_scale(item, momentum)
+            atoms["spectral"] = polar.to(device=momentum.device).mul(-scale)
+
+        grad_f = grad.detach().float()
+        mom_f = momentum.detach().float()
+        grad_norm = float(torch.linalg.vector_norm(grad_f))
+        mom_norm = float(torch.linalg.vector_norm(mom_f))
+        out: dict[str, float] = {}
+
+        for name, atom in atoms.items():
+            curvature = self._activation_curvature(item, atom)
+            atom_norm = float(torch.linalg.vector_norm(atom))
+            if curvature is None or curvature <= self.eps or atom_norm <= self.eps:
+                continue
+
+            loss_pair = -float((grad_f * atom).sum())
+            mom_pair = -float((mom_f * atom).sum())
+            loss_pred = max(loss_pair, 0.0) ** 2 / max(curvature, self.eps)
+            mom_pred = max(mom_pair, 0.0) ** 2 / max(curvature, self.eps)
+            out[f"loss_pair_{name}"] = loss_pair
+            out[f"mom_pair_{name}"] = mom_pair
+            out[f"loss_pred_{name}"] = loss_pred
+            out[f"mom_pred_{name}"] = mom_pred
+            out[f"loss_align_{name}"] = loss_pair / (
+                grad_norm * atom_norm + self.eps
+            )
+            out[f"mom_align_{name}"] = mom_pair / (mom_norm * atom_norm + self.eps)
+
+        base = out.get("loss_pred_fro")
+        if base is not None and base > self.eps:
+            for name in ("spectral", "colnorm", "sign"):
+                value = out.get(f"loss_pred_{name}")
+                if value is not None:
+                    out[f"loss_pred_{name}_over_fro"] = value / base
+        mom_base = out.get("mom_pred_fro")
+        if mom_base is not None and mom_base > self.eps:
+            for name in ("spectral", "colnorm", "sign"):
+                value = out.get(f"mom_pred_{name}")
+                if value is not None:
+                    out[f"mom_pred_{name}_over_fro"] = value / mom_base
+        return out
+
+    def _typed_policy_oracle(self, item: ConvergenceItem) -> str | None:
+        if item.group == "embed":
+            return "colnorm"
+        if item.group == "hidden":
+            return "spectral"
+        if item.group == "out":
+            return "sign"
+        return None
+
+    def _append_paper_stats(
         self,
         stats: dict[str, list[float]],
         item: ConvergenceItem,
         grad: torch.Tensor,
-        grad_dual: float,
+        momentum: torch.Tensor,
+        spectral: _SpectralOracleResult | None,
     ) -> None:
-        input_sr = self.input_sr.get(id(item.param))
-        if input_sr is None or grad.ndim != 2 or not is_spectral_ulmo(item.ulmo):
+        input_norms = self.input_norms.get(id(item.param))
+        if input_norms is None or momentum.ndim != 2 or spectral is None:
             return
-
-        scale = max(spectral_ulmo_scale(grad, item.ulmo), self.eps)
-        fro_sq = float(grad.detach().float().square().sum().clamp_min(self.eps))
-        nuc = grad_dual / scale
-        self._append(
-            stats, "spec_ratio", (nuc * nuc / fro_sq) / max(input_sr, self.eps)
+        momentum_nuclear, _ = spectral
+        momentum_fro = float(torch.linalg.vector_norm(momentum.detach().float()))
+        grad_fro = float(torch.linalg.vector_norm(grad.detach().float()))
+        if momentum_fro <= self.eps:
+            return
+        momentum_nr = (momentum_nuclear / momentum_fro) ** 2
+        input_fro = float(input_norms["fro"])
+        input_op = float(input_norms["op"])
+        input_sr = float(input_norms["stable_rank"])
+        ratio = momentum_nr / max(input_sr, self.eps)
+        pred_fro_bound = momentum_fro * momentum_fro / max(input_op * input_op, self.eps)
+        pred_spectral_bound = (
+            momentum_nuclear * momentum_nuclear / max(input_fro * input_fro, self.eps)
         )
+        grad_mom_cos = float((grad.detach().float() * momentum.detach().float()).sum())
+        grad_mom_cos /= max(grad_fro * momentum_fro, self.eps)
+
+        self._append(stats, "momentum_nuclear_rank", momentum_nr)
+        self._append(stats, "input_stable_rank", input_sr)
+        self._append(stats, "paper_ratio_momentum", ratio)
+        self._append(stats, "spec_ratio", ratio)
+        self._append(stats, "pred_fro_bound_momentum", pred_fro_bound)
+        self._append(stats, "pred_spectral_bound_momentum", pred_spectral_bound)
+        self._append(stats, "grad_momentum_cos", grad_mom_cos)
+
+        predictions = self._oracle_prediction_stats(item, grad, momentum, spectral)
+        for key, value in predictions.items():
+            self._append(stats, key, value)
+        typed_policy = self._typed_policy_oracle(item)
+        if typed_policy is not None:
+            for prefix in (
+                "loss_pair",
+                "mom_pair",
+                "loss_pred",
+                "mom_pred",
+                "loss_align",
+                "mom_align",
+            ):
+                value = predictions.get(f"{prefix}_{typed_policy}")
+                if value is not None:
+                    self._append(stats, f"{prefix}_typed_policy", value)
+            for prefix in ("loss_pred", "mom_pred"):
+                value = predictions.get(f"{prefix}_{typed_policy}_over_fro")
+                if value is not None:
+                    self._append(stats, f"{prefix}_typed_policy_over_fro", value)
+
+        detail = {
+            "name": item.name,
+            "group": item.group,
+            "shape": list(momentum.shape),
+            "paper_matrix": "post_ema_momentum",
+            "typed_policy_oracle": typed_policy or "",
+            "momentum_nuclear": momentum_nuclear,
+            "momentum_fro": momentum_fro,
+            "momentum_nuclear_rank": momentum_nr,
+            "grad_fro": grad_fro,
+            "grad_momentum_cos": grad_mom_cos,
+            "input_fro": input_fro,
+            "input_op": input_op,
+            "input_stable_rank": input_sr,
+            "paper_ratio_momentum": ratio,
+            "pred_fro_bound_momentum": pred_fro_bound,
+            "pred_spectral_bound_momentum": pred_spectral_bound,
+        }
+        if typed_policy is not None:
+            detail["loss_pred_typed_policy_over_fro"] = predictions.get(
+                f"loss_pred_{typed_policy}_over_fro", float("nan")
+            )
+            detail["mom_pred_typed_policy_over_fro"] = predictions.get(
+                f"mom_pred_{typed_policy}_over_fro", float("nan")
+            )
+        detail.update(predictions)
+        self.details.append(detail)
 
     def _append_report_stats(
         self,
@@ -455,18 +799,26 @@ class ConvergenceProbe:
         streaming_dparam: dict[int, float],
         spectral_gdual: dict[int, float],
         spectral_dgrad: dict[int, float],
+        spectral_momentum: dict[int, _SpectralOracleResult],
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         key = id(item.param)
         stats = grouped.setdefault(item.group, {})
         current_grad = None
         current_param = None
+        momentum = self._effective_momentum(item, grad)
         grad_dual = spectral_gdual.get(key)
         if grad_dual is None:
             current_grad = self._cpu_tensor(grad, current_grad)
             grad_dual = dual_norm(current_grad, item.ulmo, self.eps, item.param)
+        spectral = spectral_momentum.get(key)
+        if spectral is not None and uses_global_spectral_support(item.ulmo):
+            mom_dual = spectral[0] * spectral_ulmo_scale(momentum, item.ulmo)
+        else:
+            mom_dual = dual_norm(momentum, item.ulmo, self.eps, item.param)
 
         lr = current_lrs.get(item.group, float("nan"))
         self._append(stats, "gdual", grad_dual)
+        self._append(stats, "mdual", mom_dual)
         self._append(stats, "lr", lr)
         current_grad, current_param = self._append_change_stats(
             stats,
@@ -480,7 +832,7 @@ class ConvergenceProbe:
             current_grad,
             current_param,
         )
-        self._append_spec_ratio(stats, item, grad, grad_dual)
+        self._append_paper_stats(stats, item, grad, momentum, spectral)
         return current_grad, current_param
 
     def _store_previous(
@@ -529,6 +881,9 @@ class ConvergenceProbe:
         streaming_dparam = self._streaming_dparam_norms(records) if report else {}
         spectral_gdual = self._spectral_grad_dual_norms(records) if report else {}
         spectral_dgrad = self._spectral_dgrad_dual_norms(records) if report else {}
+        spectral_momentum = (
+            self._momentum_spectral_oracle_stats(records) if report else {}
+        )
 
         for item, grad, previous in records:
             streamable = self._can_stream_spectral_norm(item, item.param)
@@ -545,6 +900,7 @@ class ConvergenceProbe:
                     streaming_dparam,
                     spectral_gdual,
                     spectral_dgrad,
+                    spectral_momentum,
                 )
 
             self._store_previous(item, grad, streamable, current_grad, current_param)
@@ -580,10 +936,41 @@ class ConvergenceProbe:
             gdual = median(stats.get("gdual", []))
             group_summary["gdual"] = gdual
             fields.append(f"g*={gdual:.2e}")
+            mdual = median(stats.get("mdual", []))
+            group_summary["mdual"] = mdual
+            fields.append(f"m*={mdual:.2e}")
             if stats.get("spec_ratio"):
                 spec_ratio = median(stats["spec_ratio"])
                 group_summary["spec_ratio"] = spec_ratio
                 fields.append(f"Rspec={spec_ratio:.2f}")
+            if stats.get("momentum_nuclear_rank"):
+                momentum_nr = median(stats["momentum_nuclear_rank"])
+                input_sr = median(stats.get("input_stable_rank", []))
+                paper_ratio = median(stats.get("paper_ratio_momentum", []))
+                group_summary.update(
+                    {
+                        "momentum_nuclear_rank": momentum_nr,
+                        "input_stable_rank": input_sr,
+                        "paper_ratio_momentum": paper_ratio,
+                    }
+                )
+                fields.append(f"nrM={momentum_nr:.2f}")
+                fields.append(f"srA={input_sr:.2f}")
+                fields.append(f"nr/sr={paper_ratio:.2f}")
+            for stat_name, label in (
+                ("loss_pred_typed_policy_over_fro", "policy/F"),
+                ("loss_pred_spectral_over_fro", "predS/F"),
+                ("loss_pred_colnorm_over_fro", "predC/F"),
+                ("loss_pred_sign_over_fro", "predSign/F"),
+            ):
+                if stats.get(stat_name):
+                    value = median(stats[stat_name])
+                    group_summary[stat_name] = value
+                    fields.append(f"{label}={value:.2f}")
+            if stats.get("grad_momentum_cos"):
+                grad_mom_cos = median(stats["grad_momentum_cos"])
+                group_summary["grad_momentum_cos"] = grad_mom_cos
+                fields.append(f"gMcos={grad_mom_cos:.2f}")
             self.summary[name] = group_summary
             parts.append(f"{name}: " + ",".join(fields))
         if not parts:

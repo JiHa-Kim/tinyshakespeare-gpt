@@ -6,6 +6,7 @@ A compact Tiny Shakespeare GPT research sandbox organized by category:
 - `scionh/ulmos/`: ULMOs, Gram-NS, and streaming SVD helpers.
 - `scionh/models/`: compact GPT model and tiny Shakespeare data utilities.
 - `scionh/probes/`: convergence, line, and optimizer-step stats probes.
+- `scionh/experiments/`: command generators for registered experiment matrices.
 - `scionh/train_shakespeare.py`: training entrypoint.
 
 ## Active Recipe: Hyperball
@@ -65,6 +66,48 @@ product already needed by the polynomial iteration.
 
 `--hidden-ulmo streaming-svd` keeps a per-parameter cached right-singular basis
 and applies one or more streaming subspace steps per optimizer update.
+
+Additional hidden-matrix oracle arms are available for controlled geometry
+experiments:
+
+- `frobenius`: Euclidean/Frobenius steepest descent direction.
+- `colnorm`, `rownorm`, `sign`: non-spectral norm-ball LMOs.
+- `svd`: exact polar-factor spectral oracle for small correctness baselines.
+- `blockwise-gram-ns`, `blockwise-svd`: row/column-partitioned spectral oracles
+  for shardwise/blockwise comparisons (`--block-ulmo-axis`, `--block-ulmo-parts`).
+
+To generate a registered command matrix with convergence stats and per-run
+JSONL metrics:
+
+```bash
+uv run python -m scionh.experiments.oracle_sweep \
+  --matrix screening \
+  --arms hidden_gram_ns,hidden_frobenius \
+  --seeds 1337,1338,1339 \
+  --device cuda
+```
+
+Omit `--arms` for the full matrix. Add `--run` to execute the generated
+commands. Existing completed JSONL runs are skipped by default; use
+`--force-rerun` only when replacing a run intentionally.
+
+Use `--matrix spectral-shape` for the streaming-SVD oracle family that sweeps
+the power/Schatten continuum, alignment-targeted power responses,
+effective-rank targets, and capped stable-rank targets.
+
+Summarize completed JSONL runs:
+
+```bash
+uv run python -m scionh.experiments.oracle_summary _local/oracle_lab/runs
+```
+
+The aggregate summary reports paired validation deltas against
+`hidden_gram_ns`, paired win counts, median throughput, and small-sample 95%
+confidence intervals for the validation-loss delta. In the current screens,
+`hidden_streaming_svd` is the strongest replacement candidate for Gram-NS:
+it improves validation in the small model and in a wider `d_model=128` check
+while remaining cheaper. `hidden_rownorm` is still the cheap non-spectral
+candidate, but its validation win appears width-sensitive.
 
 ## Recommended Command
 

@@ -114,4 +114,9 @@ Primary coordinates:
   tangent-projected geodesic comparison.
 - `--target-rms-{embed,hidden,out}`: initialization RMS targets. Defaults are
   `embed=0.70`, `hidden=0.051`, `out=0.022`. After init, R is frozen.
+- `--hidden-ulmo`: hidden matrix oracle. Besides the default `gram-ns`, use
+  `streaming-svd`, `svd`, `blockwise-gram-ns`, `blockwise-svd`, `frobenius`,
+  `colnorm`, `rownorm`, or `sign`.
+- `--block-ulmo-axis`, `--block-ulmo-parts`: row/column partitioning for
+  blockwise spectral oracles.
 - `--warmup-iters`, `--decay-frac`, etc.: WSD schedule shape.

@@ -9,7 +9,15 @@ from scionh.optim.parametrization import (
     scheduled_learning_rate,
 )
 from scionh.optim.scion import Hyperball
-from scionh.ulmos.core import ColNormULMO, GramNewtonSchulzULMO, RowNormULMO, SignULMO
+from scionh.ulmos.core import (
+    BlockwiseSpectralULMO,
+    ColNormULMO,
+    FrobeniusULMO,
+    GramNewtonSchulzULMO,
+    RowNormULMO,
+    SVDULMO,
+    SignULMO,
+)
 from scionh.ulmos.streaming_svd import StreamingSVDULMO
 
 DEFAULT_TARGET_RMS = {
@@ -31,6 +39,27 @@ DEFAULT_LEARNING_RATES = {
     "out": 0.003499994640607136,
 }
 DEFAULT_LEARNING_RATE = None  # global override; None uses group defaults
+HIDDEN_ULMO_CHOICES = (
+    "gram-ns",
+    "streaming-svd",
+    "svd",
+    "blockwise-gram-ns",
+    "blockwise-svd",
+    "frobenius",
+    "colnorm",
+    "rownorm",
+    "sign",
+)
+EDGE_ULMO_CHOICES = (
+    "colnorm",
+    "sign",
+    "rownorm",
+    "frobenius",
+    "gram-ns",
+    "svd",
+    "blockwise-gram-ns",
+    "blockwise-svd",
+)
 
 
 def resolve_hyperball_update(args) -> str:
@@ -79,16 +108,65 @@ def resolve_group_state_half_life(args, group: str) -> float:
     return float(half_life)
 
 
-def make_hidden_ulmo(args, work_dtype: torch.dtype):
-    if args.hidden_ulmo == "gram-ns":
-        return GramNewtonSchulzULMO(steps=args.pe_steps, work_dtype=work_dtype)
+def make_streaming_svd_ulmo(args, input_like: bool = False):
     return StreamingSVDULMO(
         steps=args.spi_steps,
         ridge=args.spi_ridge,
         refresh_interval=args.spi_refresh_interval,
         refresh_threshold=args.spi_refresh_threshold,
         iteration=args.spi_iteration,
+        input_like=input_like,
     )
+
+
+def make_blockwise_spectral_ulmo(
+    args,
+    method: str,
+    work_dtype: torch.dtype,
+    input_like: bool = False,
+):
+    return BlockwiseSpectralULMO(
+        method=method,
+        steps=args.pe_steps,
+        parts=args.block_ulmo_parts,
+        axis=args.block_ulmo_axis,
+        work_dtype=work_dtype,
+        input_like=input_like,
+    )
+
+
+def make_matrix_ulmo(
+    kind: str,
+    args,
+    work_dtype: torch.dtype,
+    input_like: bool = False,
+    transpose_colnorm: bool = False,
+):
+    if kind == "gram-ns":
+        return GramNewtonSchulzULMO(
+            steps=args.pe_steps, work_dtype=work_dtype, input_like=input_like
+        )
+    if kind == "streaming-svd":
+        return make_streaming_svd_ulmo(args, input_like)
+    if kind == "svd":
+        return SVDULMO(input_like=input_like)
+    if kind == "blockwise-gram-ns":
+        return make_blockwise_spectral_ulmo(args, "gram-ns", work_dtype, input_like)
+    if kind == "blockwise-svd":
+        return make_blockwise_spectral_ulmo(args, "svd", work_dtype, input_like)
+    if kind == "frobenius":
+        return FrobeniusULMO()
+    if kind == "colnorm":
+        return ColNormULMO(transpose=transpose_colnorm)
+    if kind == "rownorm":
+        return RowNormULMO()
+    if kind == "sign":
+        return SignULMO()
+    raise ValueError(f"unsupported matrix ULMO: {kind}")
+
+
+def make_hidden_ulmo(args, work_dtype: torch.dtype):
+    return make_matrix_ulmo(args.hidden_ulmo, args, work_dtype)
 
 
 def input_output_tied(model: GPT) -> bool:
@@ -99,14 +177,16 @@ def optimizer_io_label(model: GPT) -> str:
     return "tied" if input_output_tied(model) else "untied"
 
 
-def make_edge_ulmo(kind: str):
-    if kind == "colnorm":
-        return ColNormULMO(transpose=True)
-    if kind == "rownorm":
-        return RowNormULMO()
-    if kind == "sign":
-        return SignULMO()
-    raise ValueError(f"unsupported edge ULMO: {kind}")
+def make_edge_ulmo(
+    kind: str, args, work_dtype: torch.dtype, input_like: bool = False
+):
+    return make_matrix_ulmo(
+        kind,
+        args,
+        work_dtype,
+        input_like=input_like,
+        transpose_colnorm=True,
+    )
 
 
 def hidden_params(model: GPT) -> list[torch.Tensor]:
@@ -127,12 +207,20 @@ def optimizer_group_specs(model: GPT, args, work_dtype: torch.dtype):
         (
             "embed",
             [model.tok_emb.weight],
-            SignULMO() if tied else make_edge_ulmo(args.embed_ulmo),
+            SignULMO() if tied else make_edge_ulmo(
+                args.embed_ulmo, args, work_dtype, input_like=True
+            ),
         ),
         ("hidden", hidden_params(model), make_hidden_ulmo(args, work_dtype)),
     ]
     if not tied:
-        specs.append(("out", [model.lm_head.weight], make_edge_ulmo(args.out_ulmo)))
+        specs.append(
+            (
+                "out",
+                [model.lm_head.weight],
+                make_edge_ulmo(args.out_ulmo, args, work_dtype),
+            )
+        )
     return specs
 
 
@@ -140,11 +228,16 @@ def optimizer_group_specs(model: GPT, args, work_dtype: torch.dtype):
 def init_and_freeze_radii_(groups: list[dict]) -> None:
     """Initialize weights using geometry, then record R = ‖W‖_rms per block."""
     for group in groups:
-        geometry = group["ulmo"].geometry
+        ulmo = group["ulmo"]
+        init = getattr(ulmo, "init_", None)
+        geometry = ulmo.geometry
         target_rms = group.get("target_rms")
         if target_rms is not None:
             for p in group["params"]:
-                geometry.init_(p, float(target_rms))
+                if init is None:
+                    geometry.init_(p, float(target_rms))
+                else:
+                    init(p, float(target_rms))
 
 
 @torch.no_grad()

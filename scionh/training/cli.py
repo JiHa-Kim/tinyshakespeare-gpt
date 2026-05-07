@@ -4,7 +4,9 @@ from scionh.optim.setup import (
     DEFAULT_HYPERBALL_UPDATE,
     DEFAULT_LEARNING_RATE,
     DEFAULT_STATE_HALF_LIFE,
+    EDGE_ULMO_CHOICES,
     GROUP_NAMES,
+    HIDDEN_ULMO_CHOICES,
 )
 
 
@@ -265,23 +267,35 @@ def _add_optimizer_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--hidden-ulmo",
-        choices=["streaming-svd", "gram-ns"],
+        choices=HIDDEN_ULMO_CHOICES,
         default="gram-ns",
         help="hidden-matrix ULMO",
     )
     parser.add_argument(
         "--embed-ulmo",
-        choices=["colnorm", "sign", "rownorm"],
+        choices=EDGE_ULMO_CHOICES,
         default="colnorm",
         help="embedding-table ULMO; tied weights force Sign",
     )
     parser.add_argument(
         "--out-ulmo",
-        choices=["sign", "colnorm", "rownorm"],
+        choices=EDGE_ULMO_CHOICES,
         default="sign",
         help="output-head ULMO",
     )
     parser.add_argument("--pe-steps", type=int, default=5, help="Gram-NS coefficient steps")
+    parser.add_argument(
+        "--block-ulmo-parts",
+        type=int,
+        default=2,
+        help="number of row/column partitions for blockwise spectral ULMOs",
+    )
+    parser.add_argument(
+        "--block-ulmo-axis",
+        choices=["rows", "cols"],
+        default="rows",
+        help="partition axis for blockwise spectral ULMOs",
+    )
     parser.add_argument("--spi-steps", type=int, default=1)
     parser.add_argument("--spi-ridge", type=float, default=1e-3)
     parser.add_argument(

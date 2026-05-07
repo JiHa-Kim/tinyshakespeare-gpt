@@ -407,7 +407,8 @@ def print_training_config(
         f"hidden_ulmo={args.hidden_ulmo} "
         f"io_weights={metadata.io_weights} embed_ulmo={args.embed_ulmo} "
         f"out_ulmo={args.out_ulmo} "
-        f"qkv=fused spi_iteration={args.spi_iteration} "
+        f"qkv=fused block_ulmo={args.block_ulmo_axis}/{args.block_ulmo_parts} "
+        f"spi_iteration={args.spi_iteration} "
         f"groups={metadata.group_text}"
     )
 
@@ -465,6 +466,8 @@ def write_config_metrics(
             "attn_type": args.attn_type,
             "kv_cache": metadata.kv_info,
             "hidden_ulmo": args.hidden_ulmo,
+            "block_ulmo_parts": args.block_ulmo_parts,
+            "block_ulmo_axis": args.block_ulmo_axis,
             "io_weights": metadata.io_weights,
             "embed_ulmo": args.embed_ulmo,
             "out_ulmo": args.out_ulmo,
@@ -876,6 +879,7 @@ def capture_convergence(
         total_opt_steps=progress.total_opt_steps,
         lrs=rates.all_lrs,
         groups=components.conv_probe.summary,
+        items=components.conv_probe.details,
     )
 
 
@@ -967,20 +971,40 @@ def maybe_generate_samples(
         print_samples(texts)
 
 
-def print_ulmo_stats(opt) -> None:
+def ulmo_stats_state(opt) -> dict[str, dict[str, float | int]]:
+    out = {}
     for group in opt.param_groups:
-        stats = getattr(group.get("ulmo"), "stats", None)
+        ulmo = group.get("ulmo")
+        final_stats = getattr(ulmo, "final_stats", None)
+        stats = final_stats() if final_stats is not None else getattr(ulmo, "stats", None)
         if stats:
-            print(
-                f"{group.get('name', 'group')}_ulmo_stats "
-                + " ".join(f"{k}={v}" for k, v in stats.items())
-            )
+            calls = int(stats.get("calls", 0))
+            active_calls = int(stats.get("active_calls", 0)) or calls
+            values = {}
+            for key, value in stats.items():
+                if key.endswith("_sum") and active_calls:
+                    values[f"{key[:-4]}_mean"] = float(value) / active_calls
+                else:
+                    values[key] = value
+            out[group.get("name", "group")] = values
+    return out
+
+
+def print_ulmo_stats(opt) -> dict[str, dict[str, float | int]]:
+    stats = ulmo_stats_state(opt)
+    for name, values in stats.items():
+        print(
+            f"{name}_ulmo_stats "
+            + " ".join(f"{key}={value:g}" for key, value in values.items())
+        )
+    return stats
 
 
 def final_training_result(
     progress: TrainingProgress,
     schedule: TrainingSchedule,
     compile_seconds: float,
+    ulmo_stats: dict[str, dict[str, float | int]],
 ) -> dict:
     return {
         "best_val": progress.best_val,
@@ -996,6 +1020,7 @@ def final_training_result(
         "warmup_steps": schedule.warmup_steps,
         "stable_steps": schedule.stable_steps,
         "decay_steps": schedule.decay_steps,
+        "ulmo_stats": ulmo_stats,
     }
 
 
@@ -1068,8 +1093,13 @@ def train(args):
         device,
         progress.diverged,
     )
-    print_ulmo_stats(components.opt)
-    result = final_training_result(progress, schedule, components.compile_seconds)
+    ulmo_stats = print_ulmo_stats(components.opt)
+    result = final_training_result(
+        progress,
+        schedule,
+        components.compile_seconds,
+        ulmo_stats,
+    )
     components.metrics.write("final", **result)
     components.metrics.close()
     return result

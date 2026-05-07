@@ -173,6 +173,31 @@ def _spectral_atom_sq(p: torch.Tensor, input_like: bool = False) -> float:
     return min(rows, cols) * scale_sq / (rows * cols)
 
 
+def _blockwise_spectral_atom_sq(
+    p: torch.Tensor,
+    parts: int,
+    axis: str,
+    input_like: bool = False,
+) -> float:
+    rows, cols = _view_shape(p)
+    if rows <= 0 or cols <= 0:
+        return 0.0
+    dim = 0 if axis == "rows" else 1
+    scale_sq = rows / cols
+    if input_like:
+        scale_sq = max(1.0, scale_sq)
+    rank_sum = sum(
+        min(block.size(0), block.size(1))
+        for block in torch.tensor_split(p, parts, dim=dim)
+        if block.numel()
+    )
+    return rank_sum * scale_sq / (rows * cols)
+
+
+def _frobenius_atom_sq(p: torch.Tensor) -> float:
+    return 1.0 if p.numel() else 0.0
+
+
 def _target_radius(p: torch.Tensor, atom_sq: float, target_rms: float) -> float:
     return target_rms if atom_sq <= 0.0 else target_rms / math.sqrt(atom_sq)
 
@@ -187,7 +212,14 @@ class ULMOGeometry:
         transpose: bool = False,
         input_like: bool = False,
     ):
-        if kind not in {"colnorm", "rownorm", "sign", "spectral"}:
+        if kind not in {
+            "colnorm",
+            "rownorm",
+            "sign",
+            "frobenius",
+            "spectral",
+            "block_spectral",
+        }:
             raise ValueError(f"invalid ULMO geometry: {kind}")
         self.kind = kind
         self.eps = eps
@@ -196,7 +228,7 @@ class ULMOGeometry:
 
     @property
     def is_spectral(self) -> bool:
-        return self.kind == "spectral"
+        return self.kind in {"spectral", "block_spectral"}
 
     def scale(self, x: torch.Tensor) -> float:
         if not self.is_spectral:
@@ -207,7 +239,9 @@ class ULMOGeometry:
     def atom_sq(self, p: torch.Tensor) -> float:
         if self.kind == "colnorm":
             return 1.0
-        if self.kind == "spectral":
+        if self.kind == "frobenius":
+            return _frobenius_atom_sq(p)
+        if self.is_spectral:
             return _spectral_atom_sq(p, self.input_like)
         _, cols = _view_shape(p, self.transpose)
         return 0.0 if cols <= 0 else 1.0 / (cols * cols)
@@ -222,6 +256,12 @@ class ULMOGeometry:
             return float(
                 torch.linalg.vector_norm(y, dim=1).sum() / math.sqrt(max(y.size(1), 1))
             )
+        if self.kind == "frobenius":
+            return float(torch.linalg.vector_norm(y) * math.sqrt(max(y.numel(), 1)))
+        if self.is_spectral:
+            if y.ndim != 2:
+                return float(torch.linalg.vector_norm(y).clamp_min(eps))
+            return float(torch.linalg.matrix_norm(y, ord="nuc") * self.scale(y))
         return float(y.abs().sum() / max(y.size(1), 1))
 
     def primal_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
@@ -234,6 +274,14 @@ class ULMOGeometry:
             return float(
                 torch.linalg.vector_norm(y, dim=1).max() * math.sqrt(max(y.size(1), 1))
             )
+        if self.kind == "frobenius":
+            return float(
+                torch.linalg.vector_norm(y) / math.sqrt(max(y.numel(), 1))
+            )
+        if self.is_spectral:
+            if y.ndim != 2:
+                return float(torch.linalg.vector_norm(y).clamp_min(eps))
+            return float(torch.linalg.matrix_norm(y, ord=2) / self.scale(y))
         return float(y.abs().max() * max(y.size(1), 1))
 
     @torch.no_grad()
@@ -245,6 +293,8 @@ class ULMOGeometry:
             return init_rownorm_(p, radius, self.eps, self.transpose)
         if self.kind == "sign":
             return init_sign_(p, radius, self.transpose)
+        if self.kind == "frobenius":
+            return init_frobenius_(p, radius, self.eps)
         return init_spectral_(p, radius, self.input_like)
 
 
@@ -295,6 +345,7 @@ def gram_newton_schulz_polar(
     fp32_eps: float = _FP32_EPS,
     refine_steps: int = _MOMENT4_REFINE_STEPS,
     feas_tol: float = _MOMENT4_FEAS_TOL,
+    compile_scale: bool = True,
 ) -> torch.Tensor:
     if g.ndim < 2:
         raise ValueError(
@@ -324,7 +375,9 @@ def gram_newton_schulz_polar(
     gram = torch.bmm(x, x.mT)
     gram_square = torch.bmm(gram, gram)
     scale_gram = (
-        _scale_gram_and_first_poly_cuda if x.is_cuda else _scale_gram_and_first_poly
+        _scale_gram_and_first_poly_cuda
+        if compile_scale and x.is_cuda
+        else _scale_gram_and_first_poly
     )
     gram, z, x_scale = scale_gram(
         x,
@@ -415,113 +468,193 @@ class SignULMO:
         return _oriented(y, self.geometry.transpose)
 
 
-def _singular_alignment(
-    sigma: torch.Tensor,
-    weights: torch.Tensor,
-    eps: float,
-) -> float:
-    denom = torch.linalg.vector_norm(sigma) * torch.linalg.vector_norm(weights)
-    if float(denom) <= 0.0:
-        return 0.0
-    tiny = torch.finfo(denom.dtype).tiny
-    return float((sigma * weights).sum() / denom.clamp_min(tiny))
+class FrobeniusULMO:
+    __slots__ = ("eps", "geometry")
+
+    def __init__(self, eps: float = 1e-12):
+        self.eps = eps
+        self.geometry = ULMOGeometry("frobenius", eps=eps)
+
+    def __call__(self, w: torch.Tensor) -> torch.Tensor:
+        scale = math.sqrt(max(w.numel(), 1))
+        norm = torch.linalg.vector_norm(w).clamp_min(self.eps)
+        return w.mul(-scale / norm)
+
+    def batch(
+        self, tensors: list[torch.Tensor], params: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        return [self(x) for x, _ in zip(tensors, params, strict=True)]
 
 
-def _singular_effective_rank(weights: torch.Tensor, eps: float) -> float:
-    mass = weights.square()
-    total = float(mass.sum())
-    if total <= eps:
-        return 0.0
-    probs = (mass / total).clamp_min(eps)
-    entropy = -(probs * probs.log()).sum()
-    return float(entropy.exp())
+def svd_polar(g: torch.Tensor) -> torch.Tensor:
+    if g.ndim < 2:
+        raise ValueError("svd_polar expects a matrix or batch of matrices")
+    dtype = g.dtype
+    u, _, vh = torch.linalg.svd(g.float(), full_matrices=False)
+    return (u @ vh).to(dtype=dtype)
 
 
-def _singular_stable_rank(weights: torch.Tensor, eps: float) -> float:
-    mass = weights.square()
-    peak = float(mass.max()) if mass.numel() else 0.0
-    total = float(mass.sum())
-    if peak <= eps or total <= eps:
-        return 0.0
-    return total / peak
+class SVDULMO:
+    __slots__ = ("geometry",)
+
+    def __init__(self, input_like: bool = False):
+        self.geometry = ULMOGeometry("spectral", input_like=input_like)
+
+    def __call__(self, v: torch.Tensor) -> torch.Tensor:
+        if v.ndim != 2:
+            raise ValueError("SVDULMO expects a 2D tensor")
+        return svd_polar(v).mul_(-self.geometry.scale(v))
+
+    def batch(
+        self, tensors: list[torch.Tensor], params: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        out: list[torch.Tensor | None] = [None] * len(tensors)
+        groups: dict[_GNSGroupKey, list[_GNSGroupItem]] = {}
+
+        for i, (x, _) in enumerate(zip(tensors, params, strict=True)):
+            if x.ndim != 2:
+                out[i] = self(x)
+                continue
+            transposed = False
+            key = (tuple(x.shape), x.dtype, x.device)
+            groups.setdefault(key, []).append((i, x, x, transposed))
+
+        for items in groups.values():
+            y_batch = svd_polar(torch.stack([x for _, x, _, _ in items]))
+            scale = y_batch.new_tensor(
+                [-self.geometry.scale(x) for _, x, _, _ in items]
+            )
+            y_batch.mul_(scale.reshape(-1, 1, 1))
+            for j, (i, _, _, _) in enumerate(items):
+                out[i] = y_batch[j]
+
+        if any(x is None for x in out):
+            raise RuntimeError("batched SVDULMO missed an output")
+        return out
 
 
-def _power_response_weights(
-    sigma: torch.Tensor,
-    alpha: float,
-    eps: float,
-) -> torch.Tensor:
-    if sigma.numel() == 0 or float(sigma.max()) <= 0.0:
-        return torch.zeros_like(sigma)
-    if alpha <= eps:
-        return torch.ones_like(sigma)
-    return sigma.clamp_min(0.0).pow(alpha)
-
-
-def _power_alignment(sigma: torch.Tensor, alpha: float, eps: float) -> float:
-    return _singular_alignment(
-        sigma,
-        _power_response_weights(sigma, alpha, eps),
-        eps,
+class BlockwiseSpectralULMO:
+    __slots__ = (
+        "method",
+        "steps",
+        "parts",
+        "axis",
+        "eps",
+        "work_dtype",
+        "bound_safety",
+        "geometry",
     )
 
+    def __init__(
+        self,
+        method: str = "gram-ns",
+        steps: int = 5,
+        parts: int = 2,
+        axis: str = "rows",
+        eps: float = 1e-7,
+        work_dtype: torch.dtype | None = None,
+        input_like: bool = False,
+        bound_safety: float = 1.05,
+    ):
+        if method not in {"gram-ns", "svd"}:
+            raise ValueError(f"invalid blockwise spectral method: {method}")
+        if parts <= 0:
+            raise ValueError(f"invalid blockwise part count: {parts}")
+        if axis not in {"rows", "cols"}:
+            raise ValueError(f"invalid blockwise axis: {axis}")
+        self.method = method
+        self.steps = steps
+        self.parts = parts
+        self.axis = axis
+        self.eps = eps
+        self.work_dtype = work_dtype
+        self.bound_safety = bound_safety
+        self.geometry = ULMOGeometry("block_spectral", input_like=input_like)
 
-def _power_effective_rank(sigma: torch.Tensor, alpha: float, eps: float) -> float:
-    return _singular_effective_rank(
-        _power_response_weights(sigma, alpha, eps),
-        eps,
-    )
+    def _dim(self) -> int:
+        return 0 if self.axis == "rows" else 1
 
+    def _blocks(self, x: torch.Tensor) -> list[torch.Tensor]:
+        return [
+            block
+            for block in torch.tensor_split(x, self.parts, dim=self._dim())
+            if block.numel()
+        ]
 
-def _capped_response_weights(
-    sigma: torch.Tensor,
-    target_rank: int,
-    eps: float,
-    search_steps: int,
-) -> torch.Tensor:
-    if sigma.numel() == 0 or float(sigma.max()) <= 0.0:
-        return torch.zeros_like(sigma)
+    def _polar(self, x: torch.Tensor) -> torch.Tensor:
+        if self.method == "svd":
+            return svd_polar(x)
+        return gram_newton_schulz_polar(
+            x,
+            self.steps,
+            self.eps,
+            self.work_dtype,
+            self.bound_safety,
+        )
 
-    rank = max(1, min(int(target_rank), sigma.numel()))
-    if rank <= 1:
-        return sigma / torch.linalg.vector_norm(sigma).clamp_min(eps)
+    def __call__(self, v: torch.Tensor) -> torch.Tensor:
+        if v.ndim != 2:
+            raise ValueError("BlockwiseSpectralULMO expects a 2D tensor")
+        dim = self._dim()
+        blocks = torch.tensor_split(v, self.parts, dim=dim)
+        out = [
+            block.clone() if not block.numel() else self._polar(block)
+            for block in blocks
+        ]
+        return torch.cat(out, dim=dim).mul_(-self.geometry.scale(v))
 
-    cap = 1.0 / math.sqrt(rank)
-    lo = 0.0
-    hi = 1.0 / max(float(sigma.max()), eps)
-    for _ in range(32):
-        if float(torch.linalg.vector_norm(torch.minimum(sigma * hi, sigma.new_tensor(cap)))) >= 1.0:
-            break
-        hi *= 2.0
+    @torch.no_grad()
+    def init_(self, p: torch.Tensor, target_rms: float) -> torch.Tensor:
+        atom_sq = _blockwise_spectral_atom_sq(
+            p,
+            self.parts,
+            self.axis,
+            self.geometry.input_like,
+        )
+        radius = _target_radius(p, atom_sq, target_rms)
+        return init_blockwise_spectral_(
+            p,
+            radius,
+            self.parts,
+            self.axis,
+            self.geometry.input_like,
+        )
 
-    cap_t = sigma.new_tensor(cap)
-    for _ in range(search_steps):
-        mid = 0.5 * (lo + hi)
-        weights = torch.minimum(sigma * mid, cap_t)
-        if float(torch.linalg.vector_norm(weights)) >= 1.0:
-            hi = mid
-        else:
-            lo = mid
+    def batch(
+        self, tensors: list[torch.Tensor], params: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        return [self(x) for x, _ in zip(tensors, params, strict=True)]
 
-    weights = torch.minimum(sigma * hi, cap_t)
-    norm = torch.linalg.vector_norm(weights)
-    if float(norm) < 1.0 - 1e-5:
-        remaining = 1.0 - float(norm.square())
-        if remaining > 0.0:
-            order = torch.argsort(sigma)
-            sq = weights.square()
-            cap_sq = cap * cap
-            for idx in order.tolist():
-                slack = cap_sq - float(sq[idx])
-                if slack <= 0.0:
-                    continue
-                add = min(slack, remaining)
-                sq[idx] = sq[idx] + add
-                remaining -= add
-                if remaining <= 1e-6:
-                    break
-            weights = sq.sqrt()
-    return weights / torch.linalg.vector_norm(weights).clamp_min(eps)
+    def _nuclear_support(self, x: torch.Tensor) -> float:
+        if self.method == "svd":
+            return float(torch.linalg.matrix_norm(x.float(), ord="nuc"))
+        work = x.float()
+        if work.size(0) < work.size(1):
+            work = work.mT
+        polar = gram_newton_schulz_polar(
+            work.unsqueeze(0),
+            self.steps,
+            self.eps,
+            self.work_dtype,
+            self.bound_safety,
+        )[0].float()
+        return float((work * polar).sum().abs())
+
+    def dual_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
+        if x.ndim != 2 or x.numel() == 0:
+            return float(torch.linalg.vector_norm(x.float()))
+        support = sum(self._nuclear_support(block) for block in self._blocks(x))
+        return max(support * self.geometry.scale(x), eps)
+
+    def primal_norm(self, x: torch.Tensor, eps: float = 1e-12) -> float:
+        if x.ndim != 2 or x.numel() == 0:
+            return float(torch.linalg.vector_norm(x.float()))
+        scale = self.geometry.scale(x)
+        values = [
+            float(torch.linalg.matrix_norm(block.float(), ord=2))
+            for block in self._blocks(x)
+        ]
+        return max(values, default=0.0) / max(scale, eps)
 
 
 class GramNewtonSchulzULMO:
@@ -658,6 +791,41 @@ def init_sign_(
     x = w.mT if transpose else w
     x.copy_(torch.randn_like(x).sign_())
     x.mul_(radius / x.size(1))
+    return w
+
+
+@torch.no_grad()
+def init_frobenius_(
+    w: torch.Tensor,
+    radius: float = 1.0,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    nn.init.normal_(w)
+    scale = radius * math.sqrt(max(w.numel(), 1))
+    w.div_(torch.linalg.vector_norm(w).clamp_min_(eps)).mul_(scale)
+    return w
+
+
+@torch.no_grad()
+def init_blockwise_spectral_(
+    w: torch.Tensor,
+    radius: float = 1.0,
+    parts: int = 2,
+    axis: str = "rows",
+    input_like: bool = False,
+) -> torch.Tensor:
+    rows, cols = _view_shape(w)
+    scale = math.sqrt(rows / cols)
+    if input_like:
+        scale = max(1.0, scale)
+    dim = 0 if axis == "rows" else 1
+    for block in torch.tensor_split(w, parts, dim=dim):
+        if not block.numel():
+            continue
+        block_fp = block.data.double()
+        nn.init.orthogonal_(block_fp)
+        block_fp.mul_(radius * scale)
+        block.data.copy_(block_fp.to(dtype=block.dtype))
     return w
 
 
