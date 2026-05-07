@@ -57,6 +57,17 @@ def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
         help="request deterministic kernels and disable TF32/benchmark autotuning",
     )
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--compile-mode",
+        choices=[
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ],
+        default="default",
+        help="torch.compile mode; reduce-overhead is useful for fast iteration",
+    )
 
 
 def _add_model_args(parser: argparse.ArgumentParser) -> None:

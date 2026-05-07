@@ -101,7 +101,10 @@ def maybe_compile(
     if not (args.compile and hasattr(torch, "compile")):
         return model, 0.0
     ensure_compile_env()
-    model = torch.compile(model)
+    compile_kwargs = {}
+    if args.compile_mode != "default":
+        compile_kwargs["mode"] = args.compile_mode
+    model = torch.compile(model, **compile_kwargs)
     xb, yb = source.seeded_batch("train", resolve_compile_seed(args))
     t0 = sync_now(device)
     model.zero_grad(set_to_none=True)
@@ -260,6 +263,7 @@ def train(args):
         f"lr_peak={lr_peak:.6f} "
         f"state_half_life={state_half_life:.3g} beta={beta:.6f} "
         f"optimizer={OPTIMIZER_NAME} update={args.hyperball_update} "
+        f"compile_mode={args.compile_mode} "
         f"norm={args.norm_type} derf_lr={args.derf_lr:.6f} "
         f"derf_beta={derf_beta:.6f} derf_shape={args.train_derf_shape} "
         f"kv_cache={kv_info['type']} kv_dim={kv_info['cache_dim']}/"
