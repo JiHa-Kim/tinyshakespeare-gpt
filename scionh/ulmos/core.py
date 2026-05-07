@@ -415,6 +415,115 @@ class SignULMO:
         return _oriented(y, self.geometry.transpose)
 
 
+def _singular_alignment(
+    sigma: torch.Tensor,
+    weights: torch.Tensor,
+    eps: float,
+) -> float:
+    denom = torch.linalg.vector_norm(sigma) * torch.linalg.vector_norm(weights)
+    if float(denom) <= 0.0:
+        return 0.0
+    tiny = torch.finfo(denom.dtype).tiny
+    return float((sigma * weights).sum() / denom.clamp_min(tiny))
+
+
+def _singular_effective_rank(weights: torch.Tensor, eps: float) -> float:
+    mass = weights.square()
+    total = float(mass.sum())
+    if total <= eps:
+        return 0.0
+    probs = (mass / total).clamp_min(eps)
+    entropy = -(probs * probs.log()).sum()
+    return float(entropy.exp())
+
+
+def _singular_stable_rank(weights: torch.Tensor, eps: float) -> float:
+    mass = weights.square()
+    peak = float(mass.max()) if mass.numel() else 0.0
+    total = float(mass.sum())
+    if peak <= eps or total <= eps:
+        return 0.0
+    return total / peak
+
+
+def _power_response_weights(
+    sigma: torch.Tensor,
+    alpha: float,
+    eps: float,
+) -> torch.Tensor:
+    if sigma.numel() == 0 or float(sigma.max()) <= 0.0:
+        return torch.zeros_like(sigma)
+    if alpha <= eps:
+        return torch.ones_like(sigma)
+    return sigma.clamp_min(0.0).pow(alpha)
+
+
+def _power_alignment(sigma: torch.Tensor, alpha: float, eps: float) -> float:
+    return _singular_alignment(
+        sigma,
+        _power_response_weights(sigma, alpha, eps),
+        eps,
+    )
+
+
+def _power_effective_rank(sigma: torch.Tensor, alpha: float, eps: float) -> float:
+    return _singular_effective_rank(
+        _power_response_weights(sigma, alpha, eps),
+        eps,
+    )
+
+
+def _capped_response_weights(
+    sigma: torch.Tensor,
+    target_rank: int,
+    eps: float,
+    search_steps: int,
+) -> torch.Tensor:
+    if sigma.numel() == 0 or float(sigma.max()) <= 0.0:
+        return torch.zeros_like(sigma)
+
+    rank = max(1, min(int(target_rank), sigma.numel()))
+    if rank <= 1:
+        return sigma / torch.linalg.vector_norm(sigma).clamp_min(eps)
+
+    cap = 1.0 / math.sqrt(rank)
+    lo = 0.0
+    hi = 1.0 / max(float(sigma.max()), eps)
+    for _ in range(32):
+        if float(torch.linalg.vector_norm(torch.minimum(sigma * hi, sigma.new_tensor(cap)))) >= 1.0:
+            break
+        hi *= 2.0
+
+    cap_t = sigma.new_tensor(cap)
+    for _ in range(search_steps):
+        mid = 0.5 * (lo + hi)
+        weights = torch.minimum(sigma * mid, cap_t)
+        if float(torch.linalg.vector_norm(weights)) >= 1.0:
+            hi = mid
+        else:
+            lo = mid
+
+    weights = torch.minimum(sigma * hi, cap_t)
+    norm = torch.linalg.vector_norm(weights)
+    if float(norm) < 1.0 - 1e-5:
+        remaining = 1.0 - float(norm.square())
+        if remaining > 0.0:
+            order = torch.argsort(sigma)
+            sq = weights.square()
+            cap_sq = cap * cap
+            for idx in order.tolist():
+                slack = cap_sq - float(sq[idx])
+                if slack <= 0.0:
+                    continue
+                add = min(slack, remaining)
+                sq[idx] = sq[idx] + add
+                remaining -= add
+                if remaining <= 1e-6:
+                    break
+            weights = sq.sqrt()
+    return weights / torch.linalg.vector_norm(weights).clamp_min(eps)
+
+
 class GramNewtonSchulzULMO:
     __slots__ = (
         "steps",
