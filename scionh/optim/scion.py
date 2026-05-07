@@ -1,4 +1,5 @@
 import math
+from collections import defaultdict
 
 import torch
 from torch.optim import Optimizer
@@ -68,6 +69,10 @@ class Hyperball(Optimizer):
             update_rule = group.get("update_rule", "retract")
             updates = self._updates(group["ulmo"], entries)
 
+            if update_rule == "retract":
+                self._retract_group_(entries, updates, lr)
+                continue
+
             for (_, p, _), u in zip(entries, updates, strict=True):
                 state = self.state[p]
                 R = state["R"]
@@ -76,16 +81,6 @@ class Hyperball(Optimizer):
 
                 d = p.numel()
                 w_hat = p.data / R
-
-                if update_rule == "retract":
-                    u_rms = (u.square().sum() / d).sqrt()
-                    if float(u_rms) <= 0.0:
-                        continue
-                    w_hat = w_hat + lr * (u / u_rms)
-                    w_hat_rms = (w_hat.square().sum() / d).sqrt()
-                    w_hat = w_hat / w_hat_rms
-                    p.data.copy_(R * w_hat)
-                    continue
 
                 inner_rms = (u * w_hat).sum() / d
                 tangent = u - inner_rms * w_hat
@@ -104,6 +99,8 @@ class Hyperball(Optimizer):
     def _collect_entries(self, group) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
         beta = float(group["beta"])
         entries = []
+        momenta = []
+        grads = []
         for param_index, p in enumerate(group["params"]):
             g = p.grad
             if g is None:
@@ -119,9 +116,130 @@ class Hyperball(Optimizer):
                 state["R"] = float((p.data.square().sum() / d).sqrt())
 
             m = state["m"]
-            m.lerp_(g, 1.0 - beta)
+            momenta.append(m)
+            grads.append(g)
             entries.append((param_index, p, m))
+        if momenta:
+            torch._foreach_lerp_(momenta, grads, 1.0 - beta)
         return entries
+
+    def _retract_group_(
+        self,
+        entries: list[tuple[int, torch.Tensor, torch.Tensor]],
+        updates: list[torch.Tensor],
+        lr: float,
+    ) -> None:
+        params = []
+        dirs = []
+        radius_dims = []
+        for (_, p, _), u in zip(entries, updates, strict=True):
+            R = self.state[p]["R"]
+            if R <= 0.0:
+                continue
+            params.append(p.data)
+            dirs.append(u)
+            radius_dims.append((float(R), math.sqrt(p.numel())))
+        if not params:
+            return
+
+        groups = defaultdict(list)
+        for i, p in enumerate(params):
+            key = (tuple(p.shape), p.dtype, p.device)
+            groups[key].append(i)
+
+        if len(groups) < len(params):
+            self._retract_shape_groups_(params, dirs, radius_dims, lr, groups)
+            return
+
+        foreach_groups = defaultdict(list)
+        for i, p in enumerate(params):
+            foreach_groups[(p.dtype, p.device)].append(i)
+        for indices in foreach_groups.values():
+            self._retract_foreach_(
+                [params[i] for i in indices],
+                [dirs[i] for i in indices],
+                [radius_dims[i] for i in indices],
+                lr,
+            )
+
+    def _retract_foreach_(
+        self,
+        params: list[torch.Tensor],
+        dirs: list[torch.Tensor],
+        radius_dims: list[tuple[float, float]],
+        lr: float,
+    ) -> None:
+        tiny = torch.finfo(dirs[0].dtype).tiny
+        dir_norms = torch._foreach_norm(dirs)
+        one = dir_norms[0].new_ones(())
+        step_scales = [
+            norm.new_tensor(lr * R * sqrt_d)
+            / torch.where(norm > 0, norm.clamp_min(tiny), one)
+            for norm, (R, sqrt_d) in zip(dir_norms, radius_dims, strict=True)
+        ]
+        deltas = torch._foreach_mul(dirs, step_scales)
+        candidates = torch._foreach_add(params, deltas)
+        candidate_norms = torch._foreach_norm(candidates)
+        retract_scales = [
+            norm.new_tensor(R * sqrt_d) / norm.clamp_min(tiny)
+            for norm, (R, sqrt_d) in zip(candidate_norms, radius_dims, strict=True)
+        ]
+        retracted = torch._foreach_mul(candidates, retract_scales)
+        torch._foreach_copy_(params, retracted)
+
+    def _retract_shape_groups_(
+        self,
+        params: list[torch.Tensor],
+        dirs: list[torch.Tensor],
+        radius_dims: list[tuple[float, float]],
+        lr: float,
+        groups,
+    ) -> None:
+        for indices in groups.values():
+            if len(indices) == 1:
+                i = indices[0]
+                self._retract_single_(params[i], dirs[i], radius_dims[i], lr)
+                continue
+
+            p_batch = torch.stack([params[i] for i in indices])
+            u_batch = torch.stack([dirs[i] for i in indices])
+            radii = p_batch.new_tensor([radius_dims[i][0] for i in indices])
+            sqrt_d = p_batch.new_tensor([radius_dims[i][1] for i in indices])
+            tiny = torch.finfo(u_batch.dtype).tiny
+            view = (len(indices),) + (1,) * (u_batch.ndim - 1)
+
+            u_norm = torch.linalg.vector_norm(u_batch, dim=tuple(range(1, u_batch.ndim)))
+            safe_u_norm = torch.where(
+                u_norm > 0, u_norm.clamp_min(tiny), torch.ones_like(u_norm)
+            )
+            step_scale = (lr * radii * sqrt_d / safe_u_norm).view(view)
+            candidate = p_batch + step_scale * u_batch
+            candidate_norm = torch.linalg.vector_norm(
+                candidate, dim=tuple(range(1, candidate.ndim))
+            )
+            retract_scale = (radii * sqrt_d / candidate_norm.clamp_min(tiny)).view(view)
+            retracted = retract_scale * candidate
+            torch._foreach_copy_(
+                [params[i] for i in indices],
+                list(retracted.unbind(0)),
+            )
+
+    def _retract_single_(
+        self,
+        param: torch.Tensor,
+        direction: torch.Tensor,
+        radius_dim: tuple[float, float],
+        lr: float,
+    ) -> None:
+        radius, sqrt_d = radius_dim
+        tiny = torch.finfo(direction.dtype).tiny
+        u_norm = torch.linalg.vector_norm(direction)
+        if float(u_norm) <= 0.0:
+            return
+        u_norm = u_norm.clamp_min(tiny)
+        candidate = param + direction * (lr * radius * sqrt_d / u_norm)
+        candidate_norm = torch.linalg.vector_norm(candidate).clamp_min(tiny)
+        param.copy_(candidate * (radius * sqrt_d / candidate_norm))
 
     def _updates(
         self, ulmo, entries: list[tuple[int, torch.Tensor, torch.Tensor]]
