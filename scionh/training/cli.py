@@ -318,6 +318,16 @@ def _add_sampling_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--skip-sample", action="store_true")
     parser.add_argument("--no-save", action="store_true")
     parser.add_argument(
+        "--train-state-out",
+        default="",
+        help="save full training-state checkpoints at --save-interval eval steps",
+    )
+    parser.add_argument(
+        "--resume-train-state",
+        default="",
+        help="resume model, optimizer, oracle, data RNG, and torch RNG state",
+    )
+    parser.add_argument(
         "--save-interval",
         type=int,
         default=400,

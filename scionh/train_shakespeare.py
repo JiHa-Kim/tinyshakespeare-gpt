@@ -601,6 +601,7 @@ def run_eval_step(
         eval_stats,
         logit_stats,
     )
+    save_training_state_checkpoint(args, components, progress, step, val_loss, timing)
     enforce_cuda_memory_limit(progress, args, memory)
 
 
@@ -752,6 +753,178 @@ def write_eval_metrics(
         kv_decoder=eval_stats["kv_decoder"],
         step_stats=eval_stats["opt"],
     )
+
+
+def optimizer_checkpoint_state(opt) -> dict:
+    state = opt.state_dict()
+    state["param_groups"] = [
+        {key: value for key, value in group.items() if key != "ulmo"}
+        for group in state["param_groups"]
+    ]
+    return state
+
+
+def load_optimizer_checkpoint_state(opt, state: dict) -> None:
+    ulmos = [group.get("ulmo") for group in opt.param_groups]
+    opt.load_state_dict(state)
+    for group, ulmo in zip(opt.param_groups, ulmos, strict=True):
+        group["ulmo"] = ulmo
+
+
+def ulmo_checkpoint_state(opt) -> dict:
+    out = {}
+    for group in opt.param_groups:
+        ulmo = group.get("ulmo")
+        states = getattr(ulmo, "states", None)
+        if states is None:
+            continue
+        params_by_id = {id(p): i for i, p in enumerate(group["params"])}
+        entries = []
+        for key, value in states.items():
+            param_key, shape, dtype, _device = key
+            param_index = params_by_id.get(param_key)
+            if param_index is None:
+                continue
+            entries.append(
+                {
+                    "param_index": param_index,
+                    "shape": tuple(shape),
+                    "dtype": dtype,
+                    "value": value.detach().cpu(),
+                }
+            )
+        out[group.get("name", "")] = {
+            "states": entries,
+            "stats": dict(getattr(ulmo, "stats", {})),
+        }
+    return out
+
+
+def load_ulmo_checkpoint_state(opt, state: dict) -> None:
+    for group in opt.param_groups:
+        ulmo = group.get("ulmo")
+        states = getattr(ulmo, "states", None)
+        saved = state.get(group.get("name", ""))
+        if states is None or not saved:
+            continue
+        states.clear()
+        params = group["params"]
+        for entry in saved.get("states", []):
+            param_index = int(entry["param_index"])
+            if param_index < 0 or param_index >= len(params):
+                continue
+            p = params[param_index]
+            dtype = entry["dtype"]
+            value = entry["value"].to(device=p.device, dtype=dtype)
+            key = (id(p), tuple(entry["shape"]), dtype, p.device)
+            states[key] = value
+        stats = getattr(ulmo, "stats", None)
+        if stats is not None:
+            saved_stats = saved.get("stats", {})
+            for key in tuple(stats):
+                if key in saved_stats:
+                    stats[key] = saved_stats[key]
+
+
+def training_state_payload(
+    args,
+    components: TrainingComponents,
+    progress: TrainingProgress,
+    step: int,
+    val_loss: float,
+    timing: EvalTiming,
+) -> dict:
+    payload = {
+        "step": step,
+        "next_step": step,
+        "val_loss": val_loss,
+        "args": vars(args),
+        "model": components.raw_model.state_dict(),
+        "optimizer": optimizer_checkpoint_state(components.opt),
+        "ulmo": ulmo_checkpoint_state(components.opt),
+        "source_train_generator": components.source.train_generator.get_state(),
+        "source_val_generator": components.source.val_generator.get_state(),
+        "torch_rng": torch.get_rng_state(),
+        "progress": {
+            "total_opt_steps": progress.total_opt_steps,
+            "best_val": progress.best_val,
+            "max_val": progress.max_val,
+            "last_train_loss": progress.last_train_loss,
+            "last_val_loss": progress.last_val_loss,
+            "initial_val": progress.initial_val,
+            "diverged": progress.diverged,
+            "diverge_reason": progress.diverge_reason,
+            "eval_seconds": progress.eval_seconds,
+            "elapsed_seconds": timing.elapsed,
+        },
+    }
+    if torch.cuda.is_available():
+        payload["cuda_rng_all"] = torch.cuda.get_rng_state_all()
+    return payload
+
+
+def save_training_state_checkpoint(
+    args,
+    components: TrainingComponents,
+    progress: TrainingProgress,
+    step: int,
+    val_loss: float,
+    timing: EvalTiming,
+) -> None:
+    if not args.train_state_out:
+        return
+    if args.save_interval <= 0 or step % args.save_interval != 0:
+        return
+    path = Path(args.train_state_out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out_path = path.with_name(
+        f"{path.stem}_step{step:05d}_val{val_loss:.4f}{path.suffix}"
+    )
+    torch.save(
+        training_state_payload(args, components, progress, step, val_loss, timing),
+        out_path,
+    )
+    print(f"saved_train_state {out_path}")
+
+
+def resume_training_state(
+    args,
+    components: TrainingComponents,
+    progress: TrainingProgress,
+    device: torch.device,
+) -> int:
+    if not args.resume_train_state:
+        return 0
+    checkpoint = torch.load(
+        Path(args.resume_train_state), map_location=device, weights_only=False
+    )
+    components.raw_model.load_state_dict(checkpoint["model"])
+    load_optimizer_checkpoint_state(components.opt, checkpoint["optimizer"])
+    load_ulmo_checkpoint_state(components.opt, checkpoint.get("ulmo", {}))
+    components.source.train_generator.set_state(
+        checkpoint["source_train_generator"].cpu()
+    )
+    components.source.val_generator.set_state(checkpoint["source_val_generator"].cpu())
+    torch.set_rng_state(checkpoint["torch_rng"].cpu())
+    if device.type == "cuda" and "cuda_rng_all" in checkpoint:
+        torch.cuda.set_rng_state_all([state.cpu() for state in checkpoint["cuda_rng_all"]])
+
+    saved_progress = checkpoint.get("progress", {})
+    progress.total_opt_steps = int(saved_progress.get("total_opt_steps", 0))
+    progress.best_val = float(saved_progress.get("best_val", float("inf")))
+    progress.max_val = float(saved_progress.get("max_val", float("-inf")))
+    progress.last_train_loss = float(saved_progress.get("last_train_loss", float("nan")))
+    progress.last_val_loss = float(saved_progress.get("last_val_loss", float("nan")))
+    progress.initial_val = saved_progress.get("initial_val")
+    progress.diverged = bool(saved_progress.get("diverged", False))
+    progress.diverge_reason = str(saved_progress.get("diverge_reason", ""))
+    progress.eval_seconds = float(saved_progress.get("eval_seconds", 0.0))
+    elapsed = saved_progress.get("elapsed_seconds")
+    if isinstance(elapsed, (int, float)) and math.isfinite(float(elapsed)):
+        progress.train_start = sync_now(device) - float(elapsed)
+    next_step = int(checkpoint.get("next_step", checkpoint.get("step", 0)))
+    print(f"resumed_train_state {args.resume_train_state} next_step={next_step}")
+    return next_step
 
 
 def enforce_cuda_memory_limit(
@@ -1051,7 +1224,8 @@ def train(args):
     warn_training_options(args, line_curve_scales)
 
     progress = TrainingProgress(train_start=sync_now(device))
-    for step in range(args.max_iters):
+    start_step = resume_training_state(args, components, progress, device)
+    for step in range(start_step, args.max_iters):
         rates = schedule_step_rates(
             args,
             components.opt,
