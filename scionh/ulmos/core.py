@@ -163,6 +163,13 @@ def _oriented(x: torch.Tensor, transpose: bool) -> torch.Tensor:
     return x.mT if transpose else x
 
 
+def _row_unit_frobenius(x: torch.Tensor, eps: float) -> torch.Tensor:
+    row_norm = torch.linalg.vector_norm(x, dim=-1, keepdim=True)
+    row_unit = x / row_norm.clamp_min(eps)
+    active_rows = (row_norm > eps).to(x.dtype).sum(dim=-2, keepdim=True)
+    return row_unit * torch.rsqrt(active_rows.clamp_min(1.0))
+
+
 def _spectral_atom_sq(p: torch.Tensor, input_like: bool = False) -> float:
     rows, cols = _view_shape(p)
     if rows <= 0 or cols <= 0:
@@ -346,6 +353,7 @@ def gram_newton_schulz_polar(
     refine_steps: int = _MOMENT4_REFINE_STEPS,
     feas_tol: float = _MOMENT4_FEAS_TOL,
     compile_scale: bool = True,
+    pre_normalized: bool = False,
 ) -> torch.Tensor:
     if g.ndim < 2:
         raise ValueError(
@@ -364,7 +372,8 @@ def gram_newton_schulz_polar(
     if transposed:
         x = x.mT
 
-    x = x / (torch.linalg.vector_norm(x, dim=(-2, -1), keepdim=True) + eps)
+    if not pre_normalized:
+        x = x / (torch.linalg.vector_norm(x, dim=(-2, -1), keepdim=True) + eps)
     x = x.to(_gns_work_dtype(g, work_dtype))
     if steps <= 0:
         if transposed:
@@ -749,6 +758,120 @@ class GramNewtonSchulzULMO:
 
         if any(x is None for x in out):
             raise RuntimeError("batched GramNewtonSchulzULMO missed an output")
+        return out
+
+
+class SwanULMO:
+    """
+    SWAN-style direction: shape-aware GradNorm followed by spectral whitening.
+
+    Wide tensors use row GradNorm directly.  Tall tensors use col GradNorm,
+    implemented as row GradNorm on the transposed view, then transpose the
+    direction back.  This keeps the whitening Gram on the smaller side and
+    matches the Gram-NS path used by the existing spectral ULMO.
+    """
+
+    __slots__ = (
+        "steps",
+        "eps",
+        "work_dtype",
+        "bound_safety",
+        "gns_coeffs",
+        "gns_resets",
+        "fp32_eps",
+        "refine_steps",
+        "feas_tol",
+        "geometry",
+    )
+
+    def __init__(
+        self,
+        steps: int = 5,
+        eps: float = 1e-7,
+        work_dtype: torch.dtype | None = None,
+        input_like: bool = False,
+        bound_safety: float = 1.05,
+        gns_coeffs: tuple[tuple[float, float, float], ...] = _GNS_COEFFS,
+        gns_resets: frozenset[int] = _GNS_RESETS,
+        fp32_eps: float = _FP32_EPS,
+        refine_steps: int = _MOMENT4_REFINE_STEPS,
+        feas_tol: float = _MOMENT4_FEAS_TOL,
+    ):
+        self.steps = steps
+        self.eps = eps
+        self.work_dtype = work_dtype
+        self.bound_safety = bound_safety
+        self.gns_coeffs = gns_coeffs
+        self.gns_resets = gns_resets
+        self.fp32_eps = fp32_eps
+        self.refine_steps = refine_steps
+        self.feas_tol = feas_tol
+        self.geometry = ULMOGeometry("spectral", input_like=input_like)
+
+    def _polar(self, x: torch.Tensor) -> torch.Tensor:
+        return gram_newton_schulz_polar(
+            _row_unit_frobenius(x, self.eps),
+            self.steps,
+            self.eps,
+            self.work_dtype,
+            self.bound_safety,
+            self.gns_coeffs,
+            self.gns_resets,
+            self.fp32_eps,
+            self.refine_steps,
+            self.feas_tol,
+            pre_normalized=True,
+        )
+
+    def __call__(self, v: torch.Tensor) -> torch.Tensor:
+        if v.ndim != 2:
+            raise ValueError("SwanULMO expects a 2D tensor")
+        transposed = v.size(0) > v.size(1)
+        work = v.mT if transposed else v
+        y = self._polar(work)
+        if transposed:
+            y = y.mT
+        return y.mul_(-self.geometry.scale(v))
+
+    def batch(
+        self, tensors: list[torch.Tensor], params: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        out: list[torch.Tensor | None] = [None] * len(tensors)
+        groups: dict[_GNSGroupKey, list[_GNSGroupItem]] = {}
+
+        for i, (x, _) in enumerate(zip(tensors, params, strict=True)):
+            if x.ndim != 2:
+                out[i] = self(x)
+                continue
+            transposed = x.size(0) > x.size(1)
+            work = x.mT if transposed else x
+            key = (tuple(work.shape), work.dtype, work.device)
+            groups.setdefault(key, []).append((i, x, work, transposed))
+
+        for items in groups.values():
+            work_batch = torch.stack([work for _, _, work, _ in items])
+            y_batch = gram_newton_schulz_polar(
+                _row_unit_frobenius(work_batch, self.eps),
+                self.steps,
+                self.eps,
+                self.work_dtype,
+                self.bound_safety,
+                self.gns_coeffs,
+                self.gns_resets,
+                self.fp32_eps,
+                self.refine_steps,
+                self.feas_tol,
+                pre_normalized=True,
+            )
+            scale = y_batch.new_tensor(
+                [-self.geometry.scale(x) for _, x, _, _ in items]
+            )
+            y_batch.mul_(scale.reshape(-1, 1, 1))
+            for j, (i, _, _, transposed) in enumerate(items):
+                out[i] = y_batch[j].mT if transposed else y_batch[j]
+
+        if any(x is None for x in out):
+            raise RuntimeError("batched SwanULMO missed an output")
         return out
 
 

@@ -23,6 +23,7 @@ class PlannedRun:
 
 SCREENING_ARMS = (
     Arm("hidden_gram_ns", ("--hidden-ulmo", "gram-ns")),
+    Arm("hidden_swan", ("--hidden-ulmo", "swan")),
     Arm("hidden_streaming_svd", ("--hidden-ulmo", "streaming-svd")),
     Arm("hidden_frobenius", ("--hidden-ulmo", "frobenius")),
     Arm("hidden_colnorm", ("--hidden-ulmo", "colnorm")),

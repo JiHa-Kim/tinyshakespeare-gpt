@@ -17,6 +17,7 @@ from scionh.ulmos.core import (
     RowNormULMO,
     SVDULMO,
     SignULMO,
+    SwanULMO,
 )
 from scionh.ulmos.streaming_svd import StreamingSVDULMO
 
@@ -41,6 +42,7 @@ DEFAULT_LEARNING_RATES = {
 DEFAULT_LEARNING_RATE = None  # global override; None uses group defaults
 HIDDEN_ULMO_CHOICES = (
     "gram-ns",
+    "swan",
     "streaming-svd",
     "svd",
     "blockwise-gram-ns",
@@ -56,6 +58,7 @@ EDGE_ULMO_CHOICES = (
     "rownorm",
     "frobenius",
     "gram-ns",
+    "swan",
     "svd",
     "blockwise-gram-ns",
     "blockwise-svd",
@@ -144,6 +147,10 @@ def make_matrix_ulmo(
 ):
     if kind == "gram-ns":
         return GramNewtonSchulzULMO(
+            steps=args.pe_steps, work_dtype=work_dtype, input_like=input_like
+        )
+    if kind == "swan":
+        return SwanULMO(
             steps=args.pe_steps, work_dtype=work_dtype, input_like=input_like
         )
     if kind == "streaming-svd":

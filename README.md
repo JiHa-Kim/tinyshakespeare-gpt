@@ -64,6 +64,10 @@ The active coordinates are:
 the four-moment spectral upper-bound normalization that reuses the first `G @ G`
 product already needed by the polynomial iteration.
 
+`--hidden-ulmo swan` applies shape-aware GradNorm before the same Gram
+Newton-Schulz whitening step: row GradNorm for wide matrices and col GradNorm
+for tall matrices.
+
 `--hidden-ulmo streaming-svd` keeps a per-parameter cached right-singular basis
 and applies one or more streaming subspace steps per optimizer update.
 
