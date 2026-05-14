@@ -110,21 +110,41 @@
   url = {https://kellerjordan.github.io/posts/muon/}
 }
 
-@misc{maSWANSGDNormalization2025,
-  title = {{{SWAN}}: {{SGD}} with {{Normalization}} and {{Whitening Enables Stateless LLM Training}}},
-  author = {Ma, Chao and Gong, Wenbo and Scetbon, Meyer and Meeds, Edward},
-  year = 2025,
-  month = feb,
-  number = {arXiv:2412.13148},
-  eprint = {2412.13148},
-  primaryclass = {cs},
-  publisher = {arXiv},
-  doi = {10.48550/arXiv.2412.13148},
-  url = {http://arxiv.org/abs/2412.13148},
-  urldate = {2026-05-08},
-  abstract = {Adaptive optimizers such as Adam have been central to the success of large language models. This work shows that pre-processing instantaneous stochastic gradients with normalization and whitening can enable stateless LLM training with SGD-like memory footprint and Adam-comparable performance.},
+@article{liPreconditionedStochasticGradient2018,
+  title = {Preconditioned {{Stochastic Gradient Descent}}},
+  author = {Li, Xi-Lin},
+  year = 2018,
+  month = may,
+  journal = {IEEE Transactions on Neural Networks and Learning Systems},
+  volume = {29},
+  number = {5},
+  eprint = {1512.04202},
+  primaryclass = {stat},
+  pages = {1454--1466},
+  issn = {2162-237X, 2162-2388},
+  doi = {10.1109/TNNLS.2017.2672978},
+  url = {http://arxiv.org/abs/1512.04202},
+  urldate = {2026-05-07},
+  abstract = {Stochastic gradient descent (SGD) still is the workhorse for many practical problems. However, it converges slow, and can be difficult to tune. It is possible to precondition SGD to accelerate its convergence remarkably. But many attempts in this direction either aim at solving specialized problems, or result in significantly more complicated methods than SGD. This paper proposes a new method to estimate a preconditioner such that the amplitudes of perturbations of preconditioned stochastic gradient match that of the perturbations of parameters to be optimized in a way comparable to Newton method for deterministic optimization. Unlike the preconditioners based on secant equation fitting as done in deterministic quasi-Newton methods, which assume positive definite Hessian and approximate its inverse, the new preconditioner works equally well for both convex and non-convex optimizations with exact or noisy gradients. When stochastic gradient is used, it can naturally damp the gradient noise to stabilize SGD. Efficient preconditioner estimation methods are developed, and with reasonable simplifications, they are applicable to large scaled problems. Experimental results demonstrate that equipped with the new preconditioner, without any tuning effort, preconditioned SGD can efficiently solve many challenging problems like the training of a deep neural network or a recurrent neural network requiring extremely long term memories.},
   archiveprefix = {arXiv},
-  keywords = {Computer Science - Artificial Intelligence,Computer Science - Machine Learning}
+  keywords = {Computer Science - Machine Learning,Statistics - Machine Learning}
+}
+
+@misc{liStochasticHessianFittings2025,
+  title = {Stochastic {{Hessian Fittings}} with {{Lie Groups}}},
+  author = {Li, Xi-Lin},
+  year = 2025,
+  month = nov,
+  number = {arXiv:2402.11858},
+  eprint = {2402.11858},
+  primaryclass = {stat},
+  publisher = {arXiv},
+  doi = {10.48550/arXiv.2402.11858},
+  url = {http://arxiv.org/abs/2402.11858},
+  urldate = {2026-05-07},
+  abstract = {This report investigates the fitting of the Hessian or its inverse for stochastic optimizations using a Hessian fitting criterion derived from the preconditioned stochastic gradient descent (PSGD) method. This criterion is closely related to many widely used second-order and adaptive gradient optimization methods, including BFGS, the Gauss-Newton algorithm, natural gradient descent, and AdaGrad. Our analyses reveal the efficiency and reliability differences of a broad range of preconditioner fitting methods, ranging from closed-form to iterative approaches, using Hessian-vector products or stochastic gradients only, with Hessian fittings across various geometric settings (the Euclidean space, the manifold of symmetric positive definite (SPD) matrices, and a variety of Lie groups). The most intriguing finding is that the Hessian fitting problem is strongly convex under mild conditions in certain general Lie groups. This result turns Hessian fitting into a well-behaved Lie group optimization problem and facilitates the design of highly efficient and elegant Lie group sparse preconditioner fitting methods for large-scale stochastic optimizations.},
+  archiveprefix = {arXiv},
+  keywords = {Computer Science - Machine Learning,Mathematics - Optimization and Control,Statistics - Machine Learning}
 }
 
 @misc{marekSmallBatchSize2025,
@@ -186,6 +206,33 @@
   urldate = {2026-03-22}
 }
 
+@misc{oikonomidisConstrainedStochasticSpectral2026,
+  title = {Constrained {{Stochastic Spectral Preconditioning Converges}} for {{Nonconvex Objectives}}},
+  author = {Oikonomidis, Konstantinos and Quan, Jan and Antonakopoulos, Kimon and {Silveti-Falls}, Antonio and Cevher, Volkan and Patrinos, Panagiotis},
+  year = 2026,
+  publisher = {arXiv},
+  doi = {10.48550/ARXIV.2605.11850},
+  url = {https://arxiv.org/abs/2605.11850},
+  urldate = {2026-05-14},
+  abstract = {In this work, we develop proximal preconditioned gradient methods with a focus on spectral gradient methods providing a proximal extension to the Muon and Scion optimizers. We introduce a family of stochastic algorithms that can handle a wide variety of convex and nonconvex constraints and study its convergence under heavy-tailed noise, through a novel analysis tailored to the geometry of the proposed methods. We further propose a variance-reduced version, which achieves faster convergence under standard noise assumptions. Finally, we show that the polynomial iterations used in Muon are more accurately captured by a nonlinear preconditioner than by the ideal matrix sign, leading to a convergence analysis that more faithfully reflects practical implementations.},
+  copyright = {Creative Commons Attribution Non Commercial No Derivatives 4.0 International},
+  langid = {english},
+  keywords = {FOS: Computer and information sciences,FOS: Mathematics,Machine Learning (cs.LG),Optimization and Control (math.OC)}
+}
+
+@misc{pethickOptimisticDualAveraging2026,
+  title = {Optimistic {{Dual Averaging Unifies Modern Optimizers}}},
+  author = {Pethick, Thomas and Xie, Wanyun and Machacek, Roman and Cevher, Volkan},
+  year = 2026,
+  publisher = {arXiv},
+  doi = {10.48550/ARXIV.2605.11172},
+  url = {https://arxiv.org/abs/2605.11172},
+  urldate = {2026-05-14},
+  abstract = {We introduce SODA, a generalization of Optimistic Dual Averaging, which provides a common perspective on state-of-the-art optimizers like Muon, Lion, AdEMAMix and NAdam, showing that they can all be viewed as optimistic instances of this framework. Based on this framing, we propose a practical SODA wrapper for any base optimizer that eliminates weight decay tuning through a theoreticallygrounded 1/k decay schedule. Empirical results across various scales and training horizons show that SODA consistently improves performance without any additional hyperparameter tuning.},
+  copyright = {Creative Commons Attribution 4.0 International},
+  keywords = {FOS: Computer and information sciences,Machine Learning (cs.LG)}
+}
+
 @misc{pethickTrainingDeepLearning2025a,
   title = {Training {{Deep Learning Models}} with {{Norm-Constrained LMOs}}},
   author = {Pethick, Thomas and Xie, Wanyun and Antonakopoulos, Kimon and Zhu, Zhenyu and {Silveti-Falls}, Antonio and Cevher, Volkan},
@@ -201,6 +248,23 @@
   abstract = {In this work, we study optimization methods that leverage the linear minimization oracle (LMO) over a norm-ball. We propose a new stochastic family of algorithms that uses the LMO to adapt to the geometry of the problem and, perhaps surprisingly, show that they can be applied to unconstrained problems. The resulting update rule unifies several existing optimization methods under a single framework. Furthermore, we propose an explicit choice of norm for deep architectures, which, as a side benefit, leads to the transferability of hyperparameters across model sizes. Experimentally, we demonstrate significant speedups on nanoGPT training using our algorithm, Scion, without any reliance on Adam. The proposed method is memory-efficient, requiring only one set of model weights and one set of gradients, which can be stored in half-precision. The code is available at https://github.com/LIONS-EPFL/scion .},
   archiveprefix = {arXiv},
   keywords = {Computer Science - Machine Learning,Mathematics - Optimization and Control}
+}
+
+@misc{pooladzandiCurvatureInformedSGDGeneral2024,
+  title = {Curvature-{{Informed SGD}} via {{General Purpose Lie-Group Preconditioners}}},
+  author = {Pooladzandi, Omead and Li, Xi-Lin},
+  year = 2024,
+  month = feb,
+  number = {arXiv:2402.04553},
+  eprint = {2402.04553},
+  primaryclass = {cs},
+  publisher = {arXiv},
+  doi = {10.48550/arXiv.2402.04553},
+  url = {http://arxiv.org/abs/2402.04553},
+  urldate = {2026-05-07},
+  abstract = {We present a novel approach to accelerate stochastic gradient descent (SGD) by utilizing curvature information obtained from Hessian-vector products or finite differences of parameters and gradients, similar to the BFGS algorithm. Our approach involves two preconditioners: a matrix-free preconditioner and a low-rank approximation preconditioner. We update both preconditioners online using a criterion that is robust to stochastic gradient noise and does not require line search or damping. To preserve the corresponding symmetry or invariance, our preconditioners are constrained to certain connected Lie groups. The Lie group's equivariance property simplifies the preconditioner fitting process, while its invariance property eliminates the need for damping, which is commonly required in second-order optimizers. As a result, the learning rate for parameter updating and the step size for preconditioner fitting are naturally normalized, and their default values work well in most scenarios. Our proposed approach offers a promising direction for improving the convergence of SGD with low computational overhead. We demonstrate that Preconditioned SGD (PSGD) outperforms SoTA on Vision, NLP, and RL tasks across multiple modern deep-learning architectures. We have provided code for reproducing toy and large scale experiments in this paper.},
+  archiveprefix = {arXiv},
+  keywords = {Computer Science - Machine Learning}
 }
 
 @misc{wen2025hyperball,

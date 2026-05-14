@@ -3,6 +3,8 @@ import argparse
 from scionh.optim.setup import (
     DEFAULT_HYPERBALL_UPDATE,
     DEFAULT_LEARNING_RATE,
+    DEFAULT_SODA,
+    DEFAULT_SODA_GROUPS,
     DEFAULT_STATE_HALF_LIFE,
     EDGE_ULMO_CHOICES,
     GROUP_NAMES,
@@ -25,7 +27,7 @@ def make_parser() -> argparse.ArgumentParser:
 def _add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=["train", "sample", "eval"], default="train")
     parser.add_argument("--data-path", default="data/tiny_shakespeare.txt")
-    parser.add_argument("--out-path", default="out/hyperball_shakespeare.pt")
+    parser.add_argument("--out-path", default="out/soda_hyperball_shakespeare.pt")
     parser.add_argument("--device", default="")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument(
@@ -243,6 +245,23 @@ def _add_optimizer_args(parser: argparse.ArgumentParser) -> None:
         choices=["slerp", "retract"],
         default=DEFAULT_HYPERBALL_UPDATE,
         help="fixed-radius update rule; slerp is the tangent geodesic variant",
+    )
+    parser.add_argument(
+        "--soda",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_SODA,
+        help=(
+            "use SODA initialization-anchored averaging before the Hyperball "
+            "fixed-radius retraction (arXiv:2605.11172); disable with --no-soda"
+        ),
+    )
+    parser.add_argument(
+        "--soda-groups",
+        default=DEFAULT_SODA_GROUPS,
+        help=(
+            "comma-separated SODA group names, or auto/all/none; auto applies "
+            "SODA to non-output groups (hidden+embed, hidden only when tied)"
+        ),
     )
     parser.add_argument(
         "--target-rms",

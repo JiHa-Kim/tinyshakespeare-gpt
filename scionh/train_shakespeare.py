@@ -17,11 +17,11 @@ from scionh.optim.auxiliary import (
     zero_derf_optimizers,
 )
 from scionh.optim.setup import (
-    OPTIMIZER_NAME,
     apply_scheduled_lr,
     build_optimizer,
     count_increment,
     format_optimizer_schedule,
+    optimizer_name,
     optimizer_io_label,
     optimizer_rms_state,
     resolve_hyperball_update,
@@ -384,7 +384,9 @@ def print_training_config(
         f"lr_peak={metadata.lr_peak:.6f} "
         f"state_half_life={metadata.state_half_life:.3g} "
         f"beta={metadata.beta:.6f} "
-        f"optimizer={OPTIMIZER_NAME} update={args.hyperball_update} "
+        f"optimizer={optimizer_name(args)} "
+        f"update={'soda-retract' if args.soda else args.hyperball_update} "
+        f"soda={args.soda} soda_groups={args.soda_groups} "
         f"compile_mode={args.compile_mode} "
         f"norm={args.norm_type} derf_lr={args.derf_lr:.6f} "
         f"derf_beta={metadata.derf_beta:.6f} derf_shape={args.train_derf_shape} "
@@ -436,7 +438,9 @@ def write_config_metrics(
             "fixed_eval_batches": args.fixed_eval_batches,
         },
         optimizer={
-            "name": OPTIMIZER_NAME,
+            "name": optimizer_name(args),
+            "soda": args.soda,
+            "soda_groups": args.soda_groups,
             "lr_peak": metadata.lr_peak,
             "state_half_life": metadata.state_half_life,
             "beta": metadata.beta,
@@ -446,7 +450,7 @@ def write_config_metrics(
             "derf_groups": list(derf_opts),
             "kv_decoder_lr_peak": args.kv_decoder_lr,
             "kv_decoder_beta": metadata.kv_decoder_beta,
-            "update_rule": args.hyperball_update,
+            "update_rule": "soda-retract" if args.soda else args.hyperball_update,
             "groups": metadata.group_text,
         },
         model={

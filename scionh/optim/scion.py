@@ -260,3 +260,167 @@ class Hyperball(Optimizer):
                 set_ulmo_param(p)
             updates.append(ulmo(m))
         return updates
+
+
+class SODAHyperball(Hyperball):
+    """Initialization-anchored Hyperball.
+
+    SODA contributes a schedule-independent pull toward the initialization,
+    then Hyperball retraction is applied as the final operation.  This keeps the
+    fixed-radius invariant while exposing the tangent-visible part of SODA's
+    iterate averaging.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 0.01,
+        beta: float = 0.95,
+        ulmo=None,
+        update_rule: str = "retract",
+        soda_groups: set[str] | None = None,
+    ):
+        if update_rule != "retract":
+            raise ValueError("SODAHyperball currently supports update_rule='retract'")
+        self.soda_groups = soda_groups
+        super().__init__(params, lr=lr, beta=beta, ulmo=ulmo, update_rule=update_rule)
+        for group in self.param_groups:
+            self._configure_soda_group(group)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            self._configure_soda_group(group)
+
+    def add_param_group(self, param_group: dict) -> None:
+        super().add_param_group(param_group)
+        self._configure_soda_group(self.param_groups[-1])
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            entries = self._collect_entries(group)
+            if not entries:
+                continue
+
+            lr = float(group["lr"])
+            soda_enabled = bool(group.get("soda_enabled", False))
+            if lr == 0.0 and not soda_enabled:
+                continue
+
+            if not soda_enabled:
+                updates = self._updates(group["ulmo"], entries)
+                self._retract_group_(entries, updates, lr)
+                continue
+
+            updates = self._updates(group["ulmo"], entries) if lr != 0.0 else None
+            self._soda_retract_group_(group, entries, updates, lr)
+            group["soda_step"] = int(group.get("soda_step", 0)) + 1
+
+        return loss
+
+    def _soda_retract_group_(
+        self,
+        group: dict,
+        entries: list[tuple[int, torch.Tensor, torch.Tensor]],
+        updates: list[torch.Tensor] | None,
+        lr: float,
+    ) -> None:
+        params = []
+        dirs = []
+        anchors = []
+        radius_dims = []
+        if updates is None:
+            updates_iter = [None] * len(entries)
+        else:
+            updates_iter = updates
+
+        for (_, p, _), u in zip(entries, updates_iter, strict=True):
+            R = self.state[p]["R"]
+            if R <= 0.0:
+                continue
+            params.append(p.data)
+            if u is not None:
+                dirs.append(u)
+            anchor = self._soda_anchor(p)
+            anchors.append(anchor)
+            radius_dims.append((float(R), math.sqrt(p.numel())))
+        if not params:
+            return
+
+        foreach_groups = defaultdict(list)
+        for i, p in enumerate(params):
+            foreach_groups[(p.dtype, p.device)].append(i)
+
+        step = int(group.get("soda_step", 0))
+        mu = 1.0 / (step + 2.0)
+        for indices in foreach_groups.values():
+            group_dirs = None
+            if updates is not None:
+                group_dirs = [dirs[i] for i in indices]
+            self._soda_retract_foreach_(
+                [params[i] for i in indices],
+                group_dirs,
+                [anchors[i] for i in indices],
+                [radius_dims[i] for i in indices],
+                lr,
+                mu,
+            )
+
+    def _soda_retract_foreach_(
+        self,
+        params: list[torch.Tensor],
+        dirs: list[torch.Tensor] | None,
+        anchors: list[torch.Tensor],
+        radius_dims: list[tuple[float, float]],
+        lr: float,
+        mu: float,
+    ) -> None:
+        anchor_deltas = torch._foreach_sub(anchors, params)
+        candidates = torch._foreach_add(params, anchor_deltas, alpha=mu)
+        if dirs is not None:
+            tiny = torch.finfo(dirs[0].dtype).tiny
+            dir_norms = torch._foreach_norm(dirs)
+            one = dir_norms[0].new_ones(())
+            step_scales = [
+                norm.new_tensor(lr * R * sqrt_d)
+                / torch.where(norm > 0, norm.clamp_min(tiny), one)
+                for norm, (R, sqrt_d) in zip(dir_norms, radius_dims, strict=True)
+            ]
+            deltas = torch._foreach_mul(dirs, step_scales)
+            candidates = torch._foreach_add(candidates, deltas)
+
+        tiny = torch.finfo(candidates[0].dtype).tiny
+        candidate_norms = torch._foreach_norm(candidates)
+        retract_scales = [
+            norm.new_tensor(R * sqrt_d) / norm.clamp_min(tiny)
+            for norm, (R, sqrt_d) in zip(candidate_norms, radius_dims, strict=True)
+        ]
+        retracted = torch._foreach_mul(candidates, retract_scales)
+        torch._foreach_copy_(params, retracted)
+
+    def _configure_soda_group(self, group: dict) -> None:
+        name = group.get("name", "")
+        enabled = self.soda_groups is None or name in self.soda_groups
+        group["soda_enabled"] = enabled
+        if enabled:
+            group.setdefault("soda_step", 0)
+            for p in group["params"]:
+                self._soda_anchor(p)
+
+    def _soda_anchor(self, p: torch.Tensor) -> torch.Tensor:
+        state = self.state[p]
+        anchor = state.get("soda_anchor")
+        if anchor is None:
+            anchor = p.detach().clone(memory_format=torch.preserve_format)
+            state["soda_anchor"] = anchor
+            return anchor
+        if anchor.device != p.device or anchor.dtype != p.dtype:
+            anchor = anchor.to(device=p.device, dtype=p.dtype)
+            state["soda_anchor"] = anchor
+        return anchor

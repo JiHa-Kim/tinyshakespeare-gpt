@@ -2,7 +2,7 @@
 
 A compact Tiny Shakespeare GPT research sandbox organized by category:
 
-- `scionh/optim/`: Hyperball optimizer and schedule parametrization helpers.
+- `scionh/optim/`: Hyperball, SODA-Hyperball, and schedule parametrization helpers.
 - `scionh/ulmos/`: ULMOs, Gram-NS, and streaming SVD helpers.
 - `scionh/models/`: compact GPT model and tiny Shakespeare data utilities.
 - `scionh/probes/`: convergence, line, and optimizer-step stats probes.
@@ -41,9 +41,36 @@ The active coordinates are:
 - scheduled pre-retraction learning rate $\eta_t$,
 - frozen block radius $R = \|W_0\|_{\mathrm{rms}}$.
 
+### SODA-Hyperball
+
+SODA-Hyperball is the default optimizer. It adds the SODA Algorithm 1
+initialization anchor from Pethick et al. (arXiv:2605.11172) before the
+Hyperball fixed-radius retraction:
+
+```math
+W_{k+1} \leftarrow
+\left(1 - \frac{1}{k+2}\right)W_k
++ \frac{1}{k+2}W_0
++ \operatorname{BaseUpdate}(G_k).
+```
+
+The SODA correction is not multiplied by the learning-rate schedule; scheduled
+movement remains inside the ULMO base update. The final Hyperball retraction
+preserves each block's fixed RMS radius, so the anchor acts through the
+tangent-visible component rather than as a second norm controller.
+`--soda-groups` accepts
+`auto`, `all`, `none`, or a comma-separated subset of `embed,hidden,out`.
+The default `auto` applies SODA to non-output groups: `embed,hidden` for
+untied weights, and `hidden` for tied weights. This follows the last-layer
+weight-decay note: norm control on the unembedding can bound logits when the
+final hidden state is normalized. The Frobenius-normalization note supports
+using global radius control most directly on hidden matrices whose outputs are
+scale-invariant through RMSNorm. Use `--no-soda` for the plain Hyperball
+baseline.
+
 ## Defaults
 
-- optimizer: Hyperball
+- optimizer: SODA-Hyperball
 - hidden ULMO: Gram Newton-Schulz
 - input/output ULMOs: untied ColNorm + Sign; tied Sign + Sign
 - batch size: 64
@@ -57,6 +84,7 @@ The active coordinates are:
   the schedule scales the learning rate directly
 - update rule: `retract` by default; `--hyperball-update slerp` runs the
   tangent-projected geodesic comparison
+- SODA-Hyperball: on by default; disable with `--no-soda`
 
 ## Hidden ULMOs
 
@@ -113,13 +141,13 @@ it improves validation in the small model and in a wider `d_model=128` check
 while remaining cheaper. `hidden_rownorm` is still the cheap non-spectral
 candidate, but its validation win appears width-sensitive.
 
-## Recommended Command
+## Recommended SODA-Hyperball Command
 
 ```bash
 uv run python -m scionh.train_shakespeare \
   --mode train \
-  --out-path out/hyperball_2k.pt \
-  --sample-out out/hyperball_2k_samples.md \
+  --out-path out/soda_hyperball_2k.pt \
+  --sample-out out/soda_hyperball_2k_samples.md \
   --batch-size 64 --grad-accum 1 --block-size 256 \
   --n-layer 6 --n-head 6 --d-model 384 \
   --schedule-floor 0 \
@@ -131,12 +159,14 @@ uv run python -m scionh.train_shakespeare \
   --temperature 0.8 --top-k 40 --sample-count 2
 ```
 
+To run the plain Hyperball baseline, add `--no-soda` to the same command.
+
 Evaluate the saved checkpoint with more batches:
 
 ```bash
 uv run python -m scionh.train_shakespeare \
   --mode eval \
   --device cuda \
-  --out-path out/hyperball_2k.pt \
+  --out-path out/soda_hyperball_2k.pt \
   --eval-iters 200
 ```
