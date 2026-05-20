@@ -393,8 +393,7 @@ def print_training_config(
         f"state_half_life={metadata.state_half_life:.3g} "
         f"beta={metadata.beta:.6f} "
         f"optimizer={optimizer_name(args)} "
-        f"update={'soda-retract' if args.soda else args.hyperball_update} "
-        f"soda={args.soda} soda_groups={args.soda_groups} "
+        f"update={args.hyperball_update} "
         f"schedule_free={args.schedule_free} sf_beta={args.sf_beta:g} "
         f"sf_beta_final={args.sf_beta_final if args.sf_beta_final is not None else args.sf_beta:g} "
         f"sf_beta_anneal={args.sf_beta_anneal_iters} sf_r={args.sf_r:g} "
@@ -453,8 +452,6 @@ def write_config_metrics(
         },
         optimizer={
             "name": optimizer_name(args),
-            "soda": args.soda,
-            "soda_groups": args.soda_groups,
             "schedule_free": args.schedule_free,
             "sf_beta": args.sf_beta,
             "sf_beta_final": args.sf_beta_final,
@@ -477,7 +474,7 @@ def write_config_metrics(
             "derf_groups": list(derf_opts),
             "kv_decoder_lr_peak": args.kv_decoder_lr,
             "kv_decoder_beta": metadata.kv_decoder_beta,
-            "update_rule": "soda-retract" if args.soda else args.hyperball_update,
+            "update_rule": args.hyperball_update,
             "groups": metadata.group_text,
         },
         model={
@@ -1257,8 +1254,6 @@ def final_training_result(
 
 def train(args):
     args.hyperball_update = resolve_hyperball_update(args)
-    if args.schedule_free:
-        args.soda = False
     device, amp_dtype = configure_runtime(args)
     line_curve_scales = parse_line_scales(args.line_curve_scales)
     if line_curve_scales:

@@ -31,9 +31,7 @@ y_{t+1}=\beta_t x_{t+1}+(1-\beta_t)z_{t+1}.
 ```
 
 The model tensor stores `y`; gradients are evaluated at `y`. Validation and
-checkpoint output use the paper's averaged sequence `x`. SODA is disabled for
-this variant: SODA is another initialization-anchored averaging rule, while
-Schedule-Free already defines the averaging sequence being tested.
+checkpoint output use the paper's averaged sequence `x`.
 
 ## Fixed-RMS Geometry
 

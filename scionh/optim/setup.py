@@ -8,7 +8,7 @@ from scionh.optim.parametrization import (
     schedule_at_step,
     scheduled_learning_rate,
 )
-from scionh.optim.scion import Hyperball, ScheduleFreeHyperball, SODAHyperball
+from scionh.optim.scion import Hyperball, ScheduleFreeHyperball
 from scionh.ulmos.core import (
     BlockwiseSpectralULMO,
     ColNormULMO,
@@ -29,10 +29,7 @@ DEFAULT_TARGET_RMS = {
 GROUP_NAMES = tuple(DEFAULT_TARGET_RMS)
 DEFAULT_COUNT_INCREMENT = 64 * 256
 OPTIMIZER_NAME = "hyperball"
-SODA_OPTIMIZER_NAME = "soda-hyperball"
 SCHEDULE_FREE_OPTIMIZER_NAME = "schedulefree-hyperball"
-DEFAULT_SODA = True
-DEFAULT_SODA_GROUPS = "auto"
 DEFAULT_HYPERBALL_UPDATE = "retract"
 DEFAULT_STATE_RETENTION = 0.95
 DEFAULT_STATE_HALF_LIFE = -DEFAULT_COUNT_INCREMENT / math.log2(
@@ -79,7 +76,7 @@ def resolve_hyperball_update(args) -> str:
 def optimizer_name(args) -> str:
     if getattr(args, "schedule_free", False):
         return SCHEDULE_FREE_OPTIMIZER_NAME
-    return SODA_OPTIMIZER_NAME if getattr(args, "soda", False) else OPTIMIZER_NAME
+    return OPTIMIZER_NAME
 
 
 def count_increment(args) -> int:
@@ -241,29 +238,6 @@ def optimizer_group_specs(model: GPT, args, work_dtype: torch.dtype):
     return specs
 
 
-def resolve_soda_groups(args, model: GPT, existing_groups: set[str]) -> set[str]:
-    raw = getattr(args, "soda_groups", DEFAULT_SODA_GROUPS)
-    value = (raw or DEFAULT_SODA_GROUPS).strip().lower()
-    if value == "auto":
-        enabled = {"hidden", "embed"}
-        if input_output_tied(model):
-            enabled.discard("embed")
-        return enabled & existing_groups
-    if value == "all":
-        return set(existing_groups)
-    if value in {"none", "off"}:
-        return set()
-
-    names = {item.strip().lower() for item in value.split(",") if item.strip()}
-    invalid = names - existing_groups
-    if invalid:
-        valid = ", ".join(sorted(existing_groups | {"all", "auto", "none"}))
-        raise ValueError(
-            f"invalid SODA group(s): {', '.join(sorted(invalid))}; valid: {valid}"
-        )
-    return names
-
-
 @torch.no_grad()
 def init_and_freeze_radii_(groups: list[dict]) -> None:
     """Initialize weights using geometry, then record R = ‖W‖_rms per block."""
@@ -387,22 +361,6 @@ def build_optimizer(model: GPT, args, device: torch.device):
             sf_geometry=sf_geometry,
         )
 
-    if getattr(args, "soda", False):
-        if update_rule != "retract":
-            raise ValueError("--soda currently requires --hyperball-update retract")
-        for group in groups:
-            group["base_update"] = "soda-retract"
-        soda_groups = resolve_soda_groups(
-            args, model, {group["name"] for group in groups}
-        )
-        return SODAHyperball(
-            groups,
-            lr=default_lr,
-            beta=default_beta,
-            update_rule=update_rule,
-            soda_groups=soda_groups,
-        )
-
     for group in groups:
         group["base_update"] = update_rule
     return Hyperball(
@@ -423,14 +381,10 @@ def format_optimizer_schedule(opt) -> str:
         target_rms = group.get("target_rms", float("nan"))
         update_rule = group.get("update_rule", DEFAULT_HYPERBALL_UPDATE)
         base_update = group.get("base_update", update_rule)
-        soda = group.get("soda_enabled", False)
-        soda_step = int(group.get("soda_step", 0))
         sf = group.get("base_update") == "schedule-free-retract"
         parts.append(
             f"{name}=(lr={lr:.6f},h_state={h_state:.3g},beta={beta:.6f},"
-            f"init_rms={target_rms:g},update={base_update},"
-            f"soda={'on' if soda else 'off'}"
-            + (f",soda_step={soda_step}" if soda else "")
+            f"init_rms={target_rms:g},update={base_update}"
             + (
                 f",sf_beta={float(group.get('sf_beta', float('nan'))):.3g}"
                 f"->{float(group.get('sf_beta_final', float('nan'))):.3g}"

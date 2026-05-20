@@ -353,8 +353,6 @@ def make_depth_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = make_depth_parser().parse_args()
     args.hyperball_update = resolve_hyperball_update(args)
-    if args.schedule_free:
-        args.soda = False
     device, _amp_dtype = configure_runtime(args)
     dataset = load_dataset(args)
     model = build_model(args, dataset, device)

@@ -186,8 +186,6 @@ def _profile_steps(args, components, progress, schedule, amp_dtype, device) -> s
 def main() -> None:
     args = make_perf_parser().parse_args()
     args.hyperball_update = resolve_hyperball_update(args)
-    if args.schedule_free:
-        args.soda = False
     device, amp_dtype = configure_runtime(args)
     components = build_training_components(args, device, amp_dtype)
     schedule = make_training_schedule(args)
