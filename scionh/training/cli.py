@@ -84,12 +84,12 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
         "--resid-scale",
         type=float,
         default=1.0,
-        help="Pre-LN residual branch multiplier; DeepNorm uses its own residual alpha",
+        help="Pre-LN residual branch multiplier",
     )
     parser.add_argument(
         "--block-type",
         choices=["preln", "deepnorm"],
-        default="preln",
+        default="deepnorm",
         help="Transformer block topology",
     )
     parser.add_argument(
@@ -113,82 +113,7 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
             "matches 1/sqrt(2*n_layer)"
         ),
     )
-    parser.add_argument(
-        "--lns",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="apply LayerNorm Scaling in Pre-LN blocks by scaling norm outputs by 1/sqrt(layer)",
-    )
-    parser.add_argument(
-        "--kv-cache",
-        choices=["full", "equivariant-lowrank"],
-        default="full",
-        help="KV-cache architecture used by attention",
-    )
-    parser.add_argument(
-        "--kv-key-rank",
-        type=int,
-        default=3,
-        help="complex head-mixing rank per RoPE frequency for low-rank KV",
-    )
-    parser.add_argument(
-        "--kv-value-rank",
-        type=int,
-        default=192,
-        help="shared real value-cache rank for low-rank KV",
-    )
-    parser.add_argument(
-        "--kv-decoder-lr",
-        type=float,
-        default=0.001,
-        help="peak normalized-SGD learning rate for low-rank KV decoder tensors",
-    )
     parser.add_argument("--dropout", type=float, default=0.15)
-    parser.add_argument(
-        "--attn-type",
-        choices=["softmax", "linear", "erf"],
-        default="softmax",
-        help=(
-            "attention kernel; linear is a normalized ELU+1 feature-kernel "
-            "reference, erf uses normalized 1+erf(score) weights"
-        ),
-    )
-    parser.add_argument(
-        "--norm-type",
-        choices=["rmsnorm", "rmsnorm-affine", "derf"],
-        default="rmsnorm",
-        help="activation transform used at pre-attn, pre-MLP, and final norm sites",
-    )
-    parser.add_argument(
-        "--derf-alpha",
-        type=float,
-        default=0.5,
-        help="Derf input scale alpha initialization",
-    )
-    parser.add_argument(
-        "--derf-shift",
-        type=float,
-        default=0.0,
-        help="Derf horizontal shift initialization",
-    )
-    parser.add_argument(
-        "--derf-lr",
-        type=float,
-        default=0.001,
-        help="peak normalized-SGD learning rate for Derf shape and small norm affine groups",
-    )
-    parser.add_argument(
-        "--derf-state-half-life",
-        type=float,
-        default=DEFAULT_STATE_HALF_LIFE,
-        help="momentum half-life for Derf normalized-SGD updates",
-    )
-    parser.add_argument(
-        "--train-derf-shape",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="train Derf alpha/shift; gamma/beta remain trainable when Derf is active",
-    )
     parser.add_argument(
         "--tie-weights",
         action="store_true",

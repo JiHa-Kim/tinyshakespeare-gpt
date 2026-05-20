@@ -77,17 +77,9 @@ def build_model(args, dataset: CharDataset, device: torch.device) -> GPT:
         rope_base=args.rope_base,
         dropout=args.dropout,
         tie_weights=args.tie_weights,
-        norm_type=args.norm_type,
-        derf_alpha=args.derf_alpha,
-        derf_shift=args.derf_shift,
-        attn_type=args.attn_type,
-        kv_cache=args.kv_cache,
-        kv_key_rank=args.kv_key_rank,
-        kv_value_rank=args.kv_value_rank,
         resid_scale=args.resid_scale,
         block_type=args.block_type,
         deepnorm_alpha=args.deepnorm_alpha,
         deepnorm_branch_scale=args.deepnorm_branch_scale,
-        lns=args.lns,
     )
     return GPT(cfg).to(device)

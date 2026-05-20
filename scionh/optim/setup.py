@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from scionh.models.gpt import EquivariantLowRankKV, GPT
+from scionh.models.gpt import GPT
 from scionh.optim.parametrization import (
     retention_from_half_life,
     schedule_at_step,
@@ -205,9 +205,6 @@ def make_edge_ulmo(
 
 def hidden_params(model: GPT) -> list[torch.Tensor]:
     skip = {id(model.tok_emb.weight), id(model.lm_head.weight)}
-    for module in model.modules():
-        if isinstance(module, EquivariantLowRankKV):
-            skip.update(id(p) for p in module.decoder_parameters())
     return [
         p
         for p in model.parameters()

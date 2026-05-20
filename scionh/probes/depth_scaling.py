@@ -7,7 +7,6 @@ import torch
 
 from scionh.models.deepnorm import calibrate_deepnorm_branches
 from scionh.models.gpt import BatchSource, GPT, apply_rope
-from scionh.optim.auxiliary import configure_derf_training
 from scionh.optim.setup import build_optimizer, resolve_hyperball_update
 from scionh.training.cli import make_parser
 from scionh.training.runtime import (
@@ -47,11 +46,6 @@ def _effective_rank(x: torch.Tensor) -> dict[str, float]:
 
 @torch.no_grad()
 def _attention_simplex_stats(module, x: torch.Tensor) -> dict[str, float]:
-    if module.attn_type != "softmax" or module.kv_cache != "full":
-        return {}
-    if module.qkv is None:
-        return {}
-
     bsz, seqlen, d_model = x.shape
     q, k, _v = module.qkv(x).split(d_model, dim=-1)
     q = q.view(bsz, seqlen, module.n_head, module.head_dim).transpose(1, 2)
@@ -61,7 +55,8 @@ def _attention_simplex_stats(module, x: torch.Tensor) -> dict[str, float]:
     q = apply_rope(q, cos, sin)
     k = apply_rope(k, cos, sin)
     scores = (q.float() @ k.float().transpose(-2, -1)) / math.sqrt(module.head_dim)
-    mask = module.causal_mask[:seqlen, :seqlen].view(1, 1, seqlen, seqlen)
+    mask = torch.ones(seqlen, seqlen, device=x.device, dtype=torch.bool).tril()
+    mask = mask.view(1, 1, seqlen, seqlen)
     weights = scores.masked_fill(~mask, float("-inf")).softmax(dim=-1)
     log_weights = weights.clamp_min(1e-30).log()
     entropy = -(weights * log_weights).sum(dim=-1)
@@ -94,7 +89,6 @@ def _register_depth_hooks(model: GPT, records: dict[int, dict]) -> list:
                     "output": output,
                     "block_type": module.block_type,
                     "deepnorm_alpha": module.deepnorm_alpha,
-                    "lns_scale": module.lns_scale,
                 }
             )
 
@@ -216,7 +210,6 @@ def _layer_diagnostics(model: GPT, layer: int, rec: dict) -> dict:
         "layer": layer,
         "block_type": rec["block_type"],
         "deepnorm_alpha": rec["deepnorm_alpha"],
-        "lns_scale": rec["lns_scale"],
         "input_rms": x_rms,
         "output_rms": y_rms,
         "delta_rms": delta_rms,
@@ -268,7 +261,6 @@ def _depth_summary(model: GPT, loss: float, layers: list[dict]) -> dict:
         "d_model": model.cfg.d_model,
         "block_type": model.cfg.block_type,
         "deepnorm_alpha": model.cfg.resolved_deepnorm_alpha,
-        "lns": model.cfg.lns,
         "grad_transport_geomean": _geomean(finite_transport),
         "grad_transport_min": min(finite_transport) if finite_transport else math.nan,
         "grad_transport_max": max(finite_transport) if finite_transport else math.nan,
@@ -303,7 +295,6 @@ def print_depth_scaling_report(report: dict, sample_layers: int = 8) -> None:
         f"loss={summary['loss']:.4f} block_type={summary['block_type']} "
         f"layers={summary['layers']} d_model={summary['d_model']} "
         f"deepnorm_alpha={summary['deepnorm_alpha']:.6g} "
-        f"lns={summary['lns']} "
         f"grad_transport_geomean={summary['grad_transport_geomean']:.4g} "
         f"grad_transport_min={summary['grad_transport_min']:.4g} "
         f"grad_transport_max={summary['grad_transport_max']:.4g} "
@@ -327,7 +318,6 @@ def print_depth_scaling_report(report: dict, sample_layers: int = 8) -> None:
             "depth_layer "
             f"layer={row['layer']} in_rms={row['input_rms']:.4g} "
             f"out_rms={row['output_rms']:.4g} delta_ratio={row['delta_ratio']:.4g} "
-            f"lns_scale={row['lns_scale']:.4g} "
             f"attn_branch_ratio={row['attn_branch_ratio']:.4g} "
             f"mlp_branch_ratio={row['mlp_branch_ratio']:.4g} "
             f"grad_transport={row['grad_transport']:.4g} "
@@ -356,7 +346,6 @@ def main() -> None:
     device, _amp_dtype = configure_runtime(args)
     dataset = load_dataset(args)
     model = build_model(args, dataset, device)
-    configure_derf_training(model, args)
     # Reuse the training initializer so the probe sees Scion's target RMS geometry.
     build_optimizer(model, args, device)
     source = BatchSource(

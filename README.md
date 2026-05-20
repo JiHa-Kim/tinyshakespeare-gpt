@@ -5,7 +5,7 @@ and Schedule-Free fixed-RMS variants.
 
 - `scionh/optim/`: Hyperball, Schedule-Free Hyperball, and schedule helpers.
 - `scionh/ulmos/`: ULMOs, Gram-NS, SWAN, and streaming-SVD helpers.
-- `scionh/models/`: compact GPT model and architecture switches.
+- `scionh/models/`: compact GPT model with DeepNorm default and Pre-LN baseline.
 - `scionh/probes/`: focused diagnostics and training-step performance probes.
 - `scionh/experiments/`: prediction audits and registered experiment helpers.
 - `scionh/train_shakespeare.py`: training entrypoint.
@@ -68,6 +68,8 @@ uv run python -m scionh.experiments.prediction_audit \
 ## Defaults
 
 - optimizer: Hyperball, or Schedule-Free Hyperball with `--schedule-free`
+- block type: DeepNorm by default; use `--block-type preln` for the Pre-LN
+  baseline
 - hidden ULMO: Gram Newton-Schulz
 - input/output ULMOs: untied ColNorm + Sign; tied Sign + Sign
 - batch size: 64

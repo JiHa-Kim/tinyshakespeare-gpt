@@ -47,8 +47,6 @@ def _timed_step(args, components, progress, schedule, amp_dtype, device) -> dict
     rates = schedule_step_rates(
         args,
         components.opt,
-        components.derf_opts,
-        components.kv_decoder_opt,
         progress.total_opt_steps,
         schedule,
     )
@@ -167,8 +165,6 @@ def _profile_steps(args, components, progress, schedule, amp_dtype, device) -> s
                 schedule_step_rates(
                     args,
                     components.opt,
-                    components.derf_opts,
-                    components.kv_decoder_opt,
                     progress.total_opt_steps,
                     schedule,
                 ),
@@ -195,8 +191,6 @@ def main() -> None:
         rates = schedule_step_rates(
             args,
             components.opt,
-            components.derf_opts,
-            components.kv_decoder_opt,
             step,
             schedule,
         )
@@ -234,7 +228,6 @@ def main() -> None:
             "d_model": args.d_model,
             "hidden_ulmo": args.hidden_ulmo,
             "pe_steps": args.pe_steps,
-            "gns_cudagraph": args.gns_cudagraph,
             "hyperball_update": args.hyperball_update,
             "compile": args.compile,
         },
