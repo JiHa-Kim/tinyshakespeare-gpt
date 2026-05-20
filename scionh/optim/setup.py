@@ -8,7 +8,7 @@ from scionh.optim.parametrization import (
     schedule_at_step,
     scheduled_learning_rate,
 )
-from scionh.optim.scion import Hyperball, SODAHyperball
+from scionh.optim.scion import Hyperball, ScheduleFreeHyperball, SODAHyperball
 from scionh.ulmos.core import (
     BlockwiseSpectralULMO,
     ColNormULMO,
@@ -30,6 +30,7 @@ GROUP_NAMES = tuple(DEFAULT_TARGET_RMS)
 DEFAULT_COUNT_INCREMENT = 64 * 256
 OPTIMIZER_NAME = "hyperball"
 SODA_OPTIMIZER_NAME = "soda-hyperball"
+SCHEDULE_FREE_OPTIMIZER_NAME = "schedulefree-hyperball"
 DEFAULT_SODA = True
 DEFAULT_SODA_GROUPS = "auto"
 DEFAULT_HYPERBALL_UPDATE = "retract"
@@ -76,6 +77,8 @@ def resolve_hyperball_update(args) -> str:
 
 
 def optimizer_name(args) -> str:
+    if getattr(args, "schedule_free", False):
+        return SCHEDULE_FREE_OPTIMIZER_NAME
     return SODA_OPTIMIZER_NAME if getattr(args, "soda", False) else OPTIMIZER_NAME
 
 
@@ -287,6 +290,24 @@ def current_group_rms(group: dict) -> float:
     return math.sqrt(float(sq) / total)
 
 
+def resolve_schedule_free_geometry(args) -> str:
+    return str(getattr(args, "sf_geometry", "ambient"))
+
+
+@torch.no_grad()
+def optimizer_state_tensor_rms(opt, group: dict, key: str) -> float:
+    tensors = []
+    for p in group["params"]:
+        tensor = opt.state[p].get(key)
+        if tensor is not None and tensor.numel():
+            tensors.append(tensor.detach().float())
+    total = sum(tensor.numel() for tensor in tensors)
+    if total <= 0:
+        return math.nan
+    sq = torch.stack(torch._foreach_norm(tensors)).square().sum()
+    return math.sqrt(float(sq) / total)
+
+
 @torch.no_grad()
 def build_optimizer(model: GPT, args, device: torch.device):
     delta_tau = count_increment(args)
@@ -321,6 +342,51 @@ def build_optimizer(model: GPT, args, device: torch.device):
 
     default_lr = groups[0]["lr"] if groups else 0.01
     default_beta = groups[0]["beta"] if groups else DEFAULT_STATE_RETENTION
+    if getattr(args, "schedule_free", False):
+        if update_rule != "retract":
+            raise ValueError(
+                "--schedule-free currently requires --hyperball-update retract"
+            )
+        sf_geometry = resolve_schedule_free_geometry(args)
+        for group in groups:
+            group.update(
+                {
+                    "sf_beta": args.sf_beta,
+                    "sf_beta_final": args.sf_beta_final
+                    if args.sf_beta_final is not None
+                    else args.sf_beta,
+                    "sf_beta_anneal_steps": args.sf_beta_anneal_iters,
+                    "sf_r": args.sf_r,
+                    "sf_c_warmup_steps": args.sf_c_warmup_iters,
+                    "sf_weight_lr_power": args.sf_weight_lr_power,
+                    "sf_polyak": args.sf_polyak,
+                    "sf_polyak_beta": args.sf_polyak_beta,
+                    "sf_polyak_f_star": args.sf_polyak_f_star,
+                    "sf_polyak_eps": args.sf_polyak_eps,
+                    "sf_polyak_max_scale": args.sf_polyak_max_scale,
+                    "sf_geometry": sf_geometry,
+                    "base_update": "schedule-free-retract",
+                }
+            )
+        return ScheduleFreeHyperball(
+            groups,
+            lr=default_lr,
+            beta=default_beta,
+            update_rule=update_rule,
+            sf_beta=args.sf_beta,
+            sf_beta_final=args.sf_beta_final,
+            sf_beta_anneal_steps=args.sf_beta_anneal_iters,
+            sf_r=args.sf_r,
+            sf_c_warmup_steps=args.sf_c_warmup_iters,
+            sf_weight_lr_power=args.sf_weight_lr_power,
+            sf_polyak=args.sf_polyak,
+            sf_polyak_beta=args.sf_polyak_beta,
+            sf_polyak_f_star=args.sf_polyak_f_star,
+            sf_polyak_eps=args.sf_polyak_eps,
+            sf_polyak_max_scale=args.sf_polyak_max_scale,
+            sf_geometry=sf_geometry,
+        )
+
     if getattr(args, "soda", False):
         if update_rule != "retract":
             raise ValueError("--soda currently requires --hyperball-update retract")
@@ -359,11 +425,21 @@ def format_optimizer_schedule(opt) -> str:
         base_update = group.get("base_update", update_rule)
         soda = group.get("soda_enabled", False)
         soda_step = int(group.get("soda_step", 0))
+        sf = group.get("base_update") == "schedule-free-retract"
         parts.append(
             f"{name}=(lr={lr:.6f},h_state={h_state:.3g},beta={beta:.6f},"
             f"init_rms={target_rms:g},update={base_update},"
             f"soda={'on' if soda else 'off'}"
             + (f",soda_step={soda_step}" if soda else "")
+            + (
+                f",sf_beta={float(group.get('sf_beta', float('nan'))):.3g}"
+                f"->{float(group.get('sf_beta_final', float('nan'))):.3g}"
+                f",sf_r={float(group.get('sf_r', float('nan'))):.3g}"
+                f",sf_geometry={group.get('sf_geometry', 'ambient')}"
+                f",polyak={'on' if group.get('sf_polyak', False) else 'off'}"
+                if sf
+                else ""
+            )
             + ")"
         )
     return ", ".join(parts)
@@ -373,15 +449,29 @@ def format_optimizer_schedule(opt) -> str:
 def optimizer_rms_state(opt) -> dict[str, dict[str, float]]:
     out = {}
     for group in opt.param_groups:
+        name = group.get("name", f"group{len(out)}")
         target_rms = float(group.get("target_rms", math.nan))
         current = current_group_rms(group)
-        out[group.get("name", f"group{len(out)}")] = {
+        out[name] = {
             "param_rms": current,
             "init_rms": target_rms,
             "rms_ratio": current / target_rms
             if target_rms and target_rms > 0.0
             else math.nan,
         }
+        if group.get("base_update") == "schedule-free-retract":
+            out[name].update(
+                {
+                    "sf_effective_lr": float(group.get("sf_effective_lr", group["lr"])),
+                    "sf_polyak_scale": float(group.get("sf_polyak_scale", 1.0)),
+                    "sf_polyak_slope": float(group.get("sf_polyak_slope", 0.0)),
+                    "sf_polyak_numerator": float(
+                        group.get("sf_polyak_numerator", 0.0)
+                    ),
+                    "sf_x_rms": optimizer_state_tensor_rms(opt, group, "x"),
+                    "sf_z_rms": optimizer_state_tensor_rms(opt, group, "z"),
+                }
+            )
     return out
 
 

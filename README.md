@@ -68,6 +68,24 @@ using global radius control most directly on hidden matrices whose outputs are
 scale-invariant through RMSNorm. Use `--no-soda` for the plain Hyperball
 baseline.
 
+### Schedule-Free ScionH
+
+`--schedule-free` switches to a Schedule-Free ScionH variant and disables SODA.
+It keeps the paper's three-sequence structure and replaces AdamC's raw iterate
+update with the ScionH/Hyperball retraction:
+
+- `z`: raw iterate updated by the ScionH ULMO atom and Hyperball retraction.
+- `x`: the unprojected ambient Schedule-Free average of `z`.
+- model weights: `beta*x + (1-beta)*z` for training, `x` for
+  evaluation/checkpoints.
+
+Use `--sf-c-warmup-iters` for the paper's averaging warm-start, `--sf-r 1` for
+long-run weighting, and optionally `--sf-polyak` for a ScionH-native Polyak
+step scalar based on the tangent atom-gradient support pairing.
+Use `--sf-geometry geodesic` for the fixed-RMS manifold variant where `x` and
+`y` are spherical interpolants instead of ambient linear averages. See
+`docs/schedulefree_scionh.md` for the derivation.
+
 ## Defaults
 
 - optimizer: SODA-Hyperball
@@ -140,6 +158,32 @@ confidence intervals for the validation-loss delta. In the current screens,
 it improves validation in the small model and in a wider `d_model=128` check
 while remaining cheaper. `hidden_rownorm` is still the cheap non-spectral
 candidate, but its validation win appears width-sensitive.
+
+Audit inverse-square-root validation-loss extrapolations, matching the
+Schedule-Free+ paper's 5%-to-15% fit window:
+
+```bash
+uv run python -m scionh.experiments.prediction_audit _local/oracle_lab/runs
+```
+
+The audit fits `val_loss = a / sqrt(t + b) + c` on early eval points and
+reports held-out RMSE plus final-loss error. Use this before trusting early
+loss-curve predictions for ScionH variants, especially when the run still uses
+WSD decay rather than a schedule-free averaged iterate.
+For Schedule-Free warm-starts, prefer absolute audit windows with
+`--fit-start-x` and `--fit-end-x` so the fit starts after `--sf-c-warmup-iters`.
+
+For the Schedule-Free ScionH variant, fit only after LR warmup and
+`--sf-c-warmup-iters` are outside the fit window:
+
+```bash
+uv run python -m scionh.train_shakespeare \
+  --mode train --schedule-free --no-soda \
+  --warmup-iters 100 --sf-c-warmup-iters 200 \
+  --decay-iters 0 --sf-beta 0.9 --sf-r 0 \
+  --metrics-jsonl _local/prediction_probe/sf_scionh.jsonl \
+  --no-save --skip-sample
+```
 
 ## Recommended SODA-Hyperball Command
 

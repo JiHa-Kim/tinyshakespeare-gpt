@@ -264,6 +264,93 @@ def _add_optimizer_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--schedule-free",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "use Schedule-Free Hyperball; disable SODA and evaluate the paper's "
+            "averaged x sequence"
+        ),
+    )
+    parser.add_argument(
+        "--sf-beta",
+        type=float,
+        default=0.9,
+        help="Schedule-Free interpolation beta for y = beta*x + (1-beta)*z",
+    )
+    parser.add_argument(
+        "--sf-beta-final",
+        type=float,
+        default=None,
+        help="optional final Schedule-Free beta for geometric beta annealing",
+    )
+    parser.add_argument(
+        "--sf-beta-anneal-iters",
+        type=int,
+        default=0,
+        help="optimizer steps over which to anneal Schedule-Free beta",
+    )
+    parser.add_argument(
+        "--sf-r",
+        type=float,
+        default=0.0,
+        help="power r for Schedule-Free averaging weights",
+    )
+    parser.add_argument(
+        "--sf-c-warmup-iters",
+        type=int,
+        default=0,
+        help="optimizer steps with c=1 before Schedule-Free averaging starts",
+    )
+    parser.add_argument(
+        "--sf-weight-lr-power",
+        type=float,
+        default=2.0,
+        help="power on max learning rate in Schedule-Free averaging weights",
+    )
+    parser.add_argument(
+        "--sf-geometry",
+        choices=["ambient", "geodesic"],
+        default="ambient",
+        help=(
+            "Schedule-Free x/y geometry: ambient follows the paper; geodesic "
+            "keeps x/y on the RMS sphere by spherical interpolation"
+        ),
+    )
+    parser.add_argument(
+        "--sf-polyak",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "scale Schedule-Free ScionH steps by a Polyak scalar using the "
+            "ScionH tangent atom-gradient support pairing"
+        ),
+    )
+    parser.add_argument(
+        "--sf-polyak-beta",
+        type=float,
+        default=0.9,
+        help="EMA beta for the ScionH Polyak support denominator",
+    )
+    parser.add_argument(
+        "--sf-polyak-f-star",
+        type=float,
+        default=0.0,
+        help="loss floor subtracted in the ScionH Polyak numerator",
+    )
+    parser.add_argument(
+        "--sf-polyak-eps",
+        type=float,
+        default=1e-12,
+        help="numerical floor for the ScionH Polyak denominator",
+    )
+    parser.add_argument(
+        "--sf-polyak-max-scale",
+        type=float,
+        default=0.0,
+        help="optional cap for the Polyak multiplier; 0 disables the cap",
+    )
+    parser.add_argument(
         "--target-rms",
         dest="target_rms",
         type=float,

@@ -17,6 +17,7 @@ from scionh.train_shakespeare import (
     make_training_schedule,
     run_training_step,
     schedule_step_rates,
+    set_optimizer_polyak_loss,
     step_training_optimizers,
     zero_training_optimizers,
 )
@@ -75,7 +76,11 @@ def _timed_step(args, components, progress, schedule, amp_dtype, device) -> dict
     consume_training_step_stats(args, progress.step_stat_accum, stat_snapshot, False)
     t5 = sync_now(device)
 
-    step_training_optimizers(components)
+    set_optimizer_polyak_loss(components.opt, progress.last_train_loss)
+    try:
+        step_training_optimizers(components)
+    finally:
+        set_optimizer_polyak_loss(components.opt, None)
     progress.total_opt_steps += 1
     t6 = sync_now(device)
 
@@ -181,6 +186,8 @@ def _profile_steps(args, components, progress, schedule, amp_dtype, device) -> s
 def main() -> None:
     args = make_perf_parser().parse_args()
     args.hyperball_update = resolve_hyperball_update(args)
+    if args.schedule_free:
+        args.soda = False
     device, amp_dtype = configure_runtime(args)
     components = build_training_components(args, device, amp_dtype)
     schedule = make_training_schedule(args)

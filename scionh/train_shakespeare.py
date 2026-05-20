@@ -25,6 +25,7 @@ from scionh.optim.setup import (
     optimizer_io_label,
     optimizer_rms_state,
     resolve_hyperball_update,
+    resolve_schedule_free_geometry,
     rms_state_text,
 )
 from scionh.models.deepnorm import (
@@ -127,9 +128,15 @@ def resolve_training_schedule(args) -> tuple[int, int, int]:
         if args.warmup_iters >= 0
         else round(args.warmup_frac * args.max_iters)
     )
+    default_decay_frac = 0.15
     decay_steps = (
         args.decay_iters
         if args.decay_iters >= 0
+        else 0
+        if (
+            getattr(args, "schedule_free", False)
+            and args.decay_frac == default_decay_frac
+        )
         else round(args.decay_frac * args.max_iters)
     )
     return resolve_schedule(args.max_iters, warmup_steps, decay_steps)
@@ -376,6 +383,7 @@ def print_training_config(
 ) -> None:
     kv_info = metadata.kv_info
     params_info = metadata.params_info
+    sf_geometry = resolve_schedule_free_geometry(args)
     print(
         "schedule "
         f"warmup_steps={schedule.warmup_steps} "
@@ -387,6 +395,11 @@ def print_training_config(
         f"optimizer={optimizer_name(args)} "
         f"update={'soda-retract' if args.soda else args.hyperball_update} "
         f"soda={args.soda} soda_groups={args.soda_groups} "
+        f"schedule_free={args.schedule_free} sf_beta={args.sf_beta:g} "
+        f"sf_beta_final={args.sf_beta_final if args.sf_beta_final is not None else args.sf_beta:g} "
+        f"sf_beta_anneal={args.sf_beta_anneal_iters} sf_r={args.sf_r:g} "
+        f"sf_c_warmup={args.sf_c_warmup_iters} sf_polyak={args.sf_polyak} "
+        f"sf_geometry={sf_geometry} "
         f"compile_mode={args.compile_mode} "
         f"norm={args.norm_type} derf_lr={args.derf_lr:.6f} "
         f"derf_beta={metadata.derf_beta:.6f} derf_shape={args.train_derf_shape} "
@@ -423,6 +436,7 @@ def write_config_metrics(
     deepnorm_calibration: dict,
     derf_opts: dict,
 ) -> None:
+    sf_geometry = resolve_schedule_free_geometry(args)
     metrics.write(
         "config",
         args=vars(args),
@@ -441,6 +455,19 @@ def write_config_metrics(
             "name": optimizer_name(args),
             "soda": args.soda,
             "soda_groups": args.soda_groups,
+            "schedule_free": args.schedule_free,
+            "sf_beta": args.sf_beta,
+            "sf_beta_final": args.sf_beta_final,
+            "sf_beta_anneal_iters": args.sf_beta_anneal_iters,
+            "sf_r": args.sf_r,
+            "sf_c_warmup_iters": args.sf_c_warmup_iters,
+            "sf_weight_lr_power": args.sf_weight_lr_power,
+            "sf_polyak": args.sf_polyak,
+            "sf_polyak_beta": args.sf_polyak_beta,
+            "sf_polyak_f_star": args.sf_polyak_f_star,
+            "sf_polyak_eps": args.sf_polyak_eps,
+            "sf_polyak_max_scale": args.sf_polyak_max_scale,
+            "sf_geometry": sf_geometry,
             "lr_peak": metadata.lr_peak,
             "state_half_life": metadata.state_half_life,
             "beta": metadata.beta,
@@ -514,6 +541,24 @@ def schedule_step_rates(
     )
 
 
+def set_optimizer_eval_parameters(opt) -> None:
+    swap = getattr(opt, "eval_parameters_", None)
+    if swap is not None:
+        swap()
+
+
+def set_optimizer_train_parameters(opt) -> None:
+    swap = getattr(opt, "train_parameters_", None)
+    if swap is not None:
+        swap()
+
+
+def set_optimizer_polyak_loss(opt, loss: float | None) -> None:
+    set_loss = getattr(opt, "set_polyak_loss_", None)
+    if set_loss is not None:
+        set_loss(loss)
+
+
 def schedule_derf_lr(
     args, derf_opts: dict, step: int, schedule: TrainingSchedule
 ) -> float:
@@ -563,50 +608,54 @@ def run_eval_step(
     device: torch.device,
 ) -> None:
     eval_start = sync_now(device)
-    train_loss = float(progress.last_train_loss)
-    val_loss, logit_stats = estimate_val_metrics(
-        components.model,
-        components.source,
-        args.eval_iters,
-        amp_dtype,
-        args.track_logit_stats,
-        components.eval_batches["val"] if components.eval_batches is not None else None,
-    )
-    progress.last_val_loss = val_loss
-    eval_stats = collect_eval_stats(args, components, progress)
-    update_eval_tracking(progress, args, step, val_loss, components)
+    set_optimizer_eval_parameters(components.opt)
+    try:
+        train_loss = float(progress.last_train_loss)
+        val_loss, logit_stats = estimate_val_metrics(
+            components.model,
+            components.source,
+            args.eval_iters,
+            amp_dtype,
+            args.track_logit_stats,
+            components.eval_batches["val"] if components.eval_batches is not None else None,
+        )
+        progress.last_val_loss = val_loss
+        eval_stats = collect_eval_stats(args, components, progress)
+        update_eval_tracking(progress, args, step, val_loss, components)
 
-    now = sync_now(device)
-    progress.eval_seconds += now - eval_start
-    timing = current_eval_timing(progress, schedule, now)
-    print_eval_status(
-        step,
-        train_loss,
-        val_loss,
-        timing,
-        rates,
-        metadata,
-        eval_stats,
-        logit_stats,
-        device,
-        progress,
-    )
-    memory = cuda_memory_stats(device)
-    write_eval_metrics(
-        components.metrics,
-        step,
-        train_loss,
-        val_loss,
-        timing,
-        rates,
-        metadata,
-        progress,
-        memory,
-        eval_stats,
-        logit_stats,
-    )
-    save_training_state_checkpoint(args, components, progress, step, val_loss, timing)
-    enforce_cuda_memory_limit(progress, args, memory)
+        now = sync_now(device)
+        progress.eval_seconds += now - eval_start
+        timing = current_eval_timing(progress, schedule, now)
+        print_eval_status(
+            step,
+            train_loss,
+            val_loss,
+            timing,
+            rates,
+            metadata,
+            eval_stats,
+            logit_stats,
+            device,
+            progress,
+        )
+        memory = cuda_memory_stats(device)
+        write_eval_metrics(
+            components.metrics,
+            step,
+            train_loss,
+            val_loss,
+            timing,
+            rates,
+            metadata,
+            progress,
+            memory,
+            eval_stats,
+            logit_stats,
+        )
+        save_training_state_checkpoint(args, components, progress, step, val_loss, timing)
+        enforce_cuda_memory_limit(progress, args, memory)
+    finally:
+        set_optimizer_train_parameters(components.opt)
 
 
 def collect_eval_stats(
@@ -912,6 +961,7 @@ def resume_training_state(
     torch.set_rng_state(checkpoint["torch_rng"].cpu())
     if device.type == "cuda" and "cuda_rng_all" in checkpoint:
         torch.cuda.set_rng_state_all([state.cpu() for state in checkpoint["cuda_rng_all"]])
+    set_optimizer_train_parameters(components.opt)
 
     saved_progress = checkpoint.get("progress", {})
     progress.total_opt_steps = int(saved_progress.get("total_opt_steps", 0))
@@ -980,7 +1030,11 @@ def run_training_step(
         line_context.params_before = capture_params(components.raw_model.parameters())
 
     stat_snapshot = capture_training_step_stats(args, components.opt, line_active)
-    step_training_optimizers(components)
+    set_optimizer_polyak_loss(components.opt, progress.last_train_loss)
+    try:
+        step_training_optimizers(components)
+    finally:
+        set_optimizer_polyak_loss(components.opt, None)
     line_stats = consume_training_step_stats(
         args, progress.step_stat_accum, stat_snapshot, line_active
     )
@@ -1203,6 +1257,8 @@ def final_training_result(
 
 def train(args):
     args.hyperball_update = resolve_hyperball_update(args)
+    if args.schedule_free:
+        args.soda = False
     device, amp_dtype = configure_runtime(args)
     line_curve_scales = parse_line_scales(args.line_curve_scales)
     if line_curve_scales:
@@ -1264,13 +1320,17 @@ def train(args):
             device,
         )
 
-    maybe_generate_samples(
-        args,
-        components.raw_model,
-        components.dataset,
-        device,
-        progress.diverged,
-    )
+    set_optimizer_eval_parameters(components.opt)
+    try:
+        maybe_generate_samples(
+            args,
+            components.raw_model,
+            components.dataset,
+            device,
+            progress.diverged,
+        )
+    finally:
+        set_optimizer_train_parameters(components.opt)
     ulmo_stats = print_ulmo_stats(components.opt)
     result = final_training_result(
         progress,
